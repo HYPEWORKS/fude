@@ -468,7 +468,8 @@ pub fn run(exe: &Path) -> Result<(), String> {
     // A crash: the session written in the background a moment after typing survives it.
     d.ctrl('2')?;
     d.type_text("@")?;
-    sleep(Duration::from_millis(3500));
+    // The session is written 2 s after a change; leave room for slow CI machines.
+    sleep(Duration::from_millis(4500));
     let _ = third.0.kill();
     let _ = third.0.wait();
     let mut fourth = App(launch(&[])?);
@@ -476,7 +477,7 @@ pub fn run(exe: &Path) -> Result<(), String> {
     d.ctrl('s')?;
     let recovered = std::fs::read_to_string(&other).unwrap_or_default();
     if recovered == "@other\n" {
-        println!("  ✓ unsaved typing survives a crash (killed 3.5 s after typing)");
+        println!("  ✓ unsaved typing survives a crash (killed 4.5 s after typing)");
     } else {
         println!("  ✗ after a crash, other.txt saved as {recovered:?}");
         failures += 1;

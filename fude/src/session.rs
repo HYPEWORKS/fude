@@ -2,8 +2,10 @@
 //! never has to ask (hot exit) and a crash loses at most a few seconds of typing.
 //!
 //! `session.toml` lists the tabs; each document with unsaved changes has its text in
-//! `backups/<name>`, written with the same safe save as documents (temporary file, then
-//! rename), so a backup is never half-written.
+//! `backups/<name>`. Both are written to a temporary file and renamed into place, so they
+//! are never half-written. Unlike saving a document, they aren't flushed to disk with
+//! fsync: a crashed or killed process loses nothing the OS already has, and fsync can
+//! take long enough on slow disks to miss the moment before a crash.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -60,14 +62,29 @@ pub fn new_backup_name() -> String {
 pub fn write_backup(state: &Path, name: &str, text: &Rope) -> io::Result<()> {
     let dir = backup_dir(state);
     std::fs::create_dir_all(&dir)?;
-    let raw = Format {
-        encoding: encoding_utf8(),
-        bom: false,
-        line_ending: LineEnding::Lf,
-    };
-    fude_buffer::save(&dir.join(name), text, &raw)
-        .map(|_| ())
-        .map_err(|e| io::Error::other(e.to_string()))
+    write_replacing(&dir.join(name), |out| text.write_to(out))
+}
+
+/// Writes a file by writing a temporary file next to it and renaming it into place.
+fn write_replacing(
+    path: &Path,
+    write: impl FnOnce(&mut io::BufWriter<std::fs::File>) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let result = (|| {
+        let mut out = io::BufWriter::new(std::fs::File::create(&tmp)?);
+        write(&mut out)?;
+        out.flush()?;
+        drop(out);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub fn read_backup(state: &Path, name: &str) -> io::Result<Rope> {
@@ -149,14 +166,10 @@ impl Session {
             out.push_str(&format!("cursor = {}\n", tab.cursor));
             out.push_str(&format!("scroll = {:.3}\n", tab.scroll));
         }
-        let raw = Format {
-            encoding: encoding_utf8(),
-            bom: false,
-            line_ending: LineEnding::Lf,
-        };
-        fude_buffer::save(&state.join("session.toml"), &Rope::from(out.as_str()), &raw)
-            .map(|_| ())
-            .map_err(|e| io::Error::other(e.to_string()))
+        write_replacing(&state.join("session.toml"), |w| {
+            use std::io::Write;
+            w.write_all(out.as_bytes())
+        })
     }
 }
 
