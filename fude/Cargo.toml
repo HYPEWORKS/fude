@@ -12,6 +12,8 @@ fude-buffer.workspace = true
 fude-render.workspace = true
 fude-text.workspace = true
 fude-platform.workspace = true
+fude-editor.workspace = true
+fude-ui.workspace = true
 
 [lints]
 workspace = true

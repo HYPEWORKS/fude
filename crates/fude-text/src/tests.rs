@@ -165,3 +165,94 @@ fn glyph_bitmaps_do_not_bleed_into_each_other() {
     let after_others = ink(&mut warmed, "l", &style);
     assert_eq!(alone, after_others);
 }
+
+#[test]
+fn chips_take_a_box_sized_advance() {
+    let mut ts = TextSystem::new();
+    let style = TextStyle::new(FontId::MONO, 14.0);
+    let esc = Chip::Control(0x1B).encode();
+    let text = format!("a{esc}b");
+    let l = layout(&mut ts, &text, &style);
+    assert_eq!(l.glyphs.len(), 3);
+    assert_eq!(l.glyphs[1].font, FontId::CHIP);
+    assert_eq!(
+        Chip::decode(char::from_u32(l.glyphs[1].glyph).unwrap()),
+        Some(Chip::Control(0x1B))
+    );
+    let g = ts.chip_geometry(Chip::Control(0x1B), &style);
+    let advance = l.glyphs[2].x - l.glyphs[1].x;
+    assert!((advance - (g.width + 2.0 * g.margin)).abs() < 0.01);
+    assert_eq!(
+        l.glyphs[2].cluster as usize,
+        1 + esc.len_utf8(),
+        "clusters index the text"
+    );
+    assert_eq!(Chip::Byte(0xFF).label(), "FF");
+    assert_eq!(Chip::Control(0).label(), "NUL");
+    assert_eq!(Chip::for_char('\t'), None);
+}
+
+#[test]
+fn combining_marks_stay_with_their_base_font() {
+    let mut ts = TextSystem::new();
+    let style = TextStyle::new(FontId::MONO, 14.0);
+    let l = layout(&mut ts, "e\u{301}x", &style);
+    assert!(l.glyphs.iter().all(|g| g.font == FontId::MONO));
+}
+
+/// Needs a system font with CJK and emoji coverage to check much; CI runners may have
+/// none, in which case the characters fall back to the bundled font's empty box.
+#[test]
+fn missing_characters_come_from_system_fonts() {
+    let mut ts = TextSystem::new();
+    let style = TextStyle::new(FontId::MONO, 14.0);
+    let start = std::time::Instant::now();
+    let l = layout(&mut ts, "a筆😀", &style);
+    let first = start.elapsed();
+    assert_eq!(l.glyphs[0].font, FontId::MONO);
+    for g in &l.glyphs[1..] {
+        if g.font != FontId::MONO {
+            assert_ne!(
+                g.glyph, 0,
+                "a fallback font is only chosen if it has the glyph"
+            );
+        }
+    }
+    eprintln!(
+        "fallback: {:?} (first lookup {first:?}, {} faces loaded)",
+        l.glyphs.iter().map(|g| g.font.0).collect::<Vec<_>>(),
+        ts.face_count()
+    );
+    // Cached: the second time costs nothing like the first.
+    let start = std::time::Instant::now();
+    layout(&mut ts, "筆😀", &style);
+    assert!(start.elapsed() < first / 2 || first.as_micros() < 200);
+}
+
+#[test]
+fn emoji_draw_something_when_a_font_has_them() {
+    let mut ts = TextSystem::new();
+    let style = TextStyle::new(FontId::MONO, 14.0);
+    let l = layout(&mut ts, "😀", &style);
+    if l.glyphs[0].font == FontId::MONO {
+        return; // no emoji font on this machine
+    }
+    let mut images = ImageStore::new();
+    let mut list = fude_render::DrawList::new();
+    let white = fude_render::Color::rgb(0xFFFFFF);
+    ts.draw_line(
+        &l,
+        &style,
+        0.0,
+        20,
+        white,
+        (0.0, 100.0),
+        &mut list,
+        &mut images,
+    );
+    assert_eq!(
+        list.commands().len(),
+        1,
+        "the chosen emoji font renders the glyph"
+    );
+}

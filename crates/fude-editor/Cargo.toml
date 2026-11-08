@@ -1,0 +1,18 @@
+[package]
+name = "fude-editor"
+description = "Selections, cursor movement and editing commands, independent of any UI"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fude-buffer.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

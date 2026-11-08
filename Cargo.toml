@@ -13,18 +13,24 @@ repository = "https://github.com/HYPEWORKS/fude"
 
 [workspace.dependencies]
 fude-buffer = { path = "crates/fude-buffer" }
+fude-editor = { path = "crates/fude-editor" }
 fude-render = { path = "crates/fude-render" }
 fude-text = { path = "crates/fude-text" }
 fude-platform = { path = "crates/fude-platform" }
+fude-ui = { path = "crates/fude-ui" }
 
 winit = "0.30.13"
 softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 swash = "0.2.10"
 harfrust = "0.15.0"
 rustc-hash = "2"
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
+rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal", "wayland"] }
+fontique = { version = "0.12.0", features = ["fontconfig-dlopen"] }
 encoding_rs = "0.8.44"
 chardetng = "1.0.0"
 memchr = "2.8.3"
+unicode-segmentation = "1.13.3"
 
 # Tests only.
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }

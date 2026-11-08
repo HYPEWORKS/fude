@@ -1,5 +1,5 @@
-use crate::TextStyle;
 use crate::face::Face;
+use crate::{FontId, TextStyle};
 use fude_render::{Image, ImageFormat, ImageId, ImageStore};
 use rustc_hash::FxHashMap;
 use swash::scale::image::{Content, Image as SwashImage};
@@ -54,13 +54,14 @@ impl GlyphCache {
     pub(crate) fn get(
         &mut self,
         face: &Face,
+        font: FontId,
         style: &TextStyle,
         glyph: u32,
         subpixel: u8,
         images: &mut ImageStore,
     ) -> Option<CachedGlyph> {
         let key = GlyphKey {
-            font: style.font.0,
+            font: font.0,
             glyph,
             px_bits: style.px.to_bits(),
             subpixel,
@@ -72,6 +73,26 @@ impl GlyphCache {
         let entry = self.rasterize(face, style, glyph, subpixel, images);
         self.map.insert(key, entry);
         entry
+    }
+
+    /// Whether `glyph` draws anything. Some fonts have glyphs swash can't render (COLRv1
+    /// color emoji have no plain outline), which fallback should skip.
+    pub(crate) fn has_ink(&mut self, face: &Face, glyph: u32) -> bool {
+        let Ok(glyph) = u16::try_from(glyph) else {
+            return false;
+        };
+        let mut scaler = self
+            .scale
+            .builder(face.swash())
+            .size(16.0)
+            .normalized_coords(&face.coords)
+            .build();
+        self.scratch.clear();
+        Render::new(SOURCES).format(Format::Alpha).render_into(
+            &mut scaler,
+            glyph,
+            &mut self.scratch,
+        ) && self.scratch.placement.width > 0
     }
 
     fn rasterize(

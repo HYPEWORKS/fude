@@ -4,7 +4,7 @@
 
 A cross-platform text editor that sits between Notepad and Notepad++. It should start instantly, respond instantly at any file size, use little memory, and look and feel polished on every platform.
 
-> Status: phase 1 (the buffer) done. Next: phase 2, a basic editor. Last updated 2026-11-08.
+> Status: phase 2 (a basic editor) done. Next: phase 3, core features. Last updated 2026-11-08.
 
 ---
 
@@ -31,17 +31,17 @@ A cross-platform text editor that sits between Notepad and Notepad++. It should 
 
 | Metric | Target | Measured |
 |---|---|---|
-| Launch → first frame, warm cache | < 40 ms | 11.4 ms median (Linux, X11) |
+| Launch → first frame, warm cache | < 40 ms | 10.5 ms median (Linux, X11) |
 | Launch → first frame, cold | < 150 ms | |
 | Open a 500 MB file → first screen | < 100 ms | 190 ms, loading synchronously (background loading is phase 4) |
 | Open a 500 MB file → fully loaded and editable | < 1 s (SSD or warm cache) | 141 ms |
-| Keypress → frame submitted | < 4 ms of fude's own work | buffer edit 1.3 µs (worst 0.2 ms) in a 500 MB file, with undo history |
-| Idle RAM, empty document, 1080p | < 30 MB | 12.7 MB (Linux, X11) |
+| Keypress → frame submitted | < 4 ms of fude's own work | 0.6 ms at 1080p, 1.4 ms at 4K (edit plus a full redraw); the same in a 500 MB file |
+| Idle RAM, empty document, 1080p | < 30 MB | 13.1 MB (Linux, X11) |
 | RAM for an open, unedited file | ≈ 1.1 × file size | 1.04 × |
-| Idle CPU | 0 % | 0 % (event-driven) |
-| Release binary | < 10 MB | 5.3 MB (Linux x86-64; the encoding tables added 0.3 MB in phase 1) |
+| Idle CPU | 0 % | 0 CPU ticks over 5 s once the caret stops blinking (10 s after input) |
+| Release binary | < 10 MB | 6.4 MB (Linux x86-64; encodings added 0.3 MB in phase 1, font fallback, clipboard and file dialogs 1.1 MB in phase 2) |
 
-Measurements are from a fast desktop (32 threads, NVMe, warm page cache): startup with `cargo xtask bench-startup` under Xvfb, the buffer with `cargo run --release -p fude-buffer --example bench` on a generated 500 MB log. They are a best case; laptops and Wayland/Windows/macOS numbers come next.
+Measurements are from a fast desktop (32 threads, NVMe, warm page cache): startup with `cargo xtask bench-startup` under Xvfb, the buffer with `cargo run --release -p fude-buffer --example bench` on a generated 500 MB log, keystrokes with `fude --bench-typing`. They are a best case; laptops and Wayland/Windows/macOS numbers come next.
 
 **Buffer (phase 1),** 500 MB log, 5.8 M lines: line → byte 1.1 µs and byte → line 0.8 µs at random positions (mostly cache misses); the 60 visible lines of a screen, found and copied out, 5.7 µs; snapshot 8 ns; undo history 7.6 KB per step; save including fsync 180 ms.
 
@@ -126,16 +126,17 @@ Most of an editor's UI is the text view, and no general-purpose toolkit has a te
 - **Windowing and input:** `winit` (Windows, macOS, X11, Wayland, BSD; DPI; IME). It lives in `fude-platform` and is translated into fude's own event types, so it can be replaced with per-OS code if it ever becomes a limitation.
 - **Renderer:** draws into a CPU framebuffer shown with `softbuffer`. Only damaged regions are redrawn; scrolling moves existing pixels and draws only the exposed strip. GPU device setup often costs 100 ms or more and tens of MB of driver memory, which by itself breaks the budgets. CPU output is also deterministic, so the renderer can have pixel snapshot tests.
 - **Draw list:** the UI produces a flat list of rectangles and glyph instances from an atlas, which is also what a GPU backend would consume. If CPU rendering can't keep up (most likely on 5K Retina at 120 Hz), a Metal or Direct3D 11 backend can be added behind the same interface without touching the UI.
-- **Native pieces:** file dialogs and message boxes (`rfd`, using the XDG portal on Linux, so no GTK) and the macOS menu bar. Menus on other platforms are drawn in-window, so theming is consistent.
+- **Native pieces:** file dialogs (`rfd`, using the XDG portal on Linux, so no GTK) and the macOS menu bar. Questions like "Save changes?" are drawn in the window, like menus on other platforms, so they look the same everywhere and need no helper programs.
 - **Every text input is an editor.** The find box, go-to-line and the command palette reuse `fude-editor`, so they get IME, undo, selection and clipboard for free.
 - **Accessibility:** the widget tree carries roles and labels from the start, so AccessKit can be wired up in v1.x without restructuring.
 
 ## 7. Text stack (`fude-text`)
 
 - **Default font:** JetBrains Mono is bundled (OFL; two variable font files, about 380 KB, covering regular, bold and italic), so the first frame needs no font discovery and looks the same on every platform.
-- **Font discovery and fallback:** resolve system fonts (user-chosen fonts, CJK, emoji) only when needed. Candidate: `fontique`, which uses fontconfig, CoreText and DirectWrite under the hood.
+- **Font fallback:** characters JetBrains Mono lacks (CJK, emoji, most scripts) come from system fonts via `fontique` (fontconfig, CoreText, DirectWrite). The system font collection opens only when the first such character appears (about 20 ms, once; fontconfig is loaded at runtime, not linked), and the font chosen is cached per character. Candidates are the emoji font for emoji, then monospace fonts, then the system's fallbacks for the character's script (with the user's locale, so Han characters get Japanese or Chinese forms as appropriate). Combining marks and joiners stay in their base character's font.
+- **Chips:** control characters and bytes that aren't valid UTF-8 are laid out as small labeled boxes (`NUL`, `ESC`, `FF`), so they're visible and take one cursor step. They travel through layout as private-use code points, so tab stops and hit testing just work.
 - **Shaping:** `harfrust` (pure-Rust HarfBuzz port). Simple runs skip shaping and map characters straight to glyphs, which is correct for monospace fonts without ligatures, so most lines never touch the shaper.
-- **Rasterization:** `swash` renders alpha masks (and color emoji) into an LRU glyph atlas keyed by font, glyph, size and ¼-pixel horizontal offset. Shaped lines are cached by content.
+- **Rasterization:** `swash` renders alpha masks (and color emoji) into an LRU glyph atlas keyed by font, glyph, size and ¼-pixel horizontal offset. Shaped lines are cached by content. swash draws bitmap (CBDT, sbix) and COLRv0 color emoji but not COLRv1; where the only color emoji font is COLRv1 (Fedora's Noto Color Emoji), fallback skips it for a monochrome emoji font.
 - **Escape hatch:** rasterization sits behind a trait so a DirectWrite backend can be added on Windows if swash's output doesn't match ClearType expectations.
 
 ## 8. Buffer (`fude-buffer`)
@@ -214,9 +215,12 @@ UI thread (winit event loop)                         Worker pool
 ## 11. Editing model
 
 - **Multiple selections from day one.** Selections are a sorted, non-overlapping list of `{anchor, head, goal_x}`; a single cursor is a list of one. Column (box) selection builds on this.
-- **Edits are transactions:** a list of range replacements applied atomically. All selections are mapped through each edit. Undo groups typing by pauses and word boundaries.
+- **Edits are transactions:** a list of range replacements applied atomically. All selections are mapped through each edit.
+- **Undo steps:** consecutive typing is one step per word (a new step starts when a word follows whitespace) or until a 1 s pause; consecutive backspaces or deletes are one step; anything else (paste, cut, Enter, word deletion) is its own step. Moving the cursor, undo, redo and saving end the current step.
+- **Clipboard:** copy or cut with nothing selected takes the whole line, and pasting that inserts it above the cursor's line. Pasted line breaks become the document's style. Invalid bytes copy as U+FFFD.
+- **Motions follow the platform:** Ctrl+Right moves to the start of the next word on Windows and Linux, Option+Right to the end of the word on macOS; Cmd+arrows go to line and document ends on macOS. Home toggles between the first non-blank character and the line start. Enter keeps the line's indentation.
 - **Everything is a named command** (`edit.duplicate_line`, `view.toggle_wrap`, …). Keybindings, menus and the command palette are front-ends that invoke commands with arguments.
-- **Fault isolation:** commands run inside `catch_unwind`. A bug in a feature shows an error instead of losing unsaved text.
+- **Fault isolation:** event handling runs inside `catch_unwind`. A bug in a feature shows an error in the status bar instead of losing unsaved text.
 - **Hot exit and crash recovery:** unsaved documents are backed up to a session directory in the background and restored on next launch along with tabs and cursor positions.
 - **Unicode:** cursor movement steps over grapheme clusters; an invalid byte is one step.
 
@@ -275,6 +279,8 @@ Single instance: opening a file while fude is running sends it to the existing w
 - **RAM:** peak and idle RSS measured for an empty document and for the large-file corpus.
 - **Large-file corpus,** generated by a script rather than committed: a 500 MB log, a 100 MB single-line JSON file, UTF-16 and Shift-JIS files, invalid UTF-8, mixed line endings.
 - **Micro benchmarks** for rope edits, line lookups, layout and search.
+- **UI test:** `cargo xtask ui-test` drives the real window through X11 (XTest) under Xvfb: typing, mouse selection, clipboard, undo, saving and the unsaved-changes prompt, checking the file each step saves. Runs in CI on every push.
+- **Keystroke latency:** `fude --bench-typing` times an edit plus a full frame per key, without a window.
 - **CI:** Windows, macOS and Linux; a FreeBSD build in a VM. Budget regressions fail the build.
 
 Release profile:
@@ -368,3 +374,9 @@ Each is evaluated for startup, RAM and binary size when introduced, and pinned t
 | 2026-11-08 | Saving a character the encoding can't represent fails (encoding_rs would write HTML entities). |
 | 2026-11-08 | When a rename would break hard links or lose the owner, save copies over the original in place, after the new contents are safely in a temporary file. |
 | 2026-11-08 | Tests and fuzzing use tiny nodes (`small-nodes` feature, fuzz crate in its own workspace) to reach deep trees with short inputs. |
+| 2026-11-08 | `fude-editor` takes horizontal geometry through a `Layout` trait, so editing is tested without fonts; the view implements it with the text system. |
+| 2026-11-08 | `fontique` for font fallback, with fontconfig loaded at runtime (`fontconfig-dlopen`), so it isn't linked and costs nothing until a character needs it. |
+| 2026-11-08 | `arboard` for the clipboard (data-control on Wayland, X11 otherwise) and `rfd` for file dialogs, both created on first use. |
+| 2026-11-08 | "Save changes?" and similar questions are drawn in the window, not native message boxes: consistent look, keyboard-first, no zenity/kdialog dependency on Linux. |
+| 2026-11-08 | The caret blinks for 10 s after input, then stays solid, so an idle window sets no timers. |
+| 2026-11-08 | Full redraws every frame for now: 0.6 ms at 1080p, 1.4 ms at 4K including the edit. Damage tracking waits until something needs it. |

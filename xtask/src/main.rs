@@ -1,5 +1,8 @@
 //! Development tasks. Run with `cargo xtask <task>`.
 
+#[cfg(all(unix, not(target_os = "macos")))]
+mod ui_test;
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
@@ -17,12 +20,18 @@ Tasks:
       --warmup <N>      Unmeasured runs first, to warm caches [default: 3]
       --budget-ms <MS>  Median budget for launch to first frame [default: 40]
       --check           Exit with an error if the median is over budget
-      --no-build        Use the existing target/release/fude";
+      --no-build        Use the existing target/release/fude
+
+  ui-test [--no-build]
+      Drive the release build through X11 (typing, mouse, clipboard, saving, the
+      unsaved-changes prompt) and check what it saves. Linux and BSD; run it on an X
+      server without a window manager, such as Xvfb.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("bench-startup") => bench_startup(&args[1..]),
+        Some("ui-test") => ui_test(&args[1..]),
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -79,6 +88,28 @@ fn bench_startup(args: &[String]) -> Result<(), String> {
         }
     }
 
+    let exe = release_exe(build)?;
+
+    for _ in 0..warmup {
+        run_once(&exe, &fude_args)?;
+    }
+    let mut results = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        results.push(run_once(&exe, &fude_args)?);
+    }
+    report(&results, warmup, budget);
+
+    let median = percentile(results.iter().map(|r| r.external_ms).collect(), 0.5);
+    if check && median > budget {
+        return Err(format!(
+            "median {median:.1} ms is over the {budget} ms budget"
+        ));
+    }
+    Ok(())
+}
+
+/// The release build of fude, building it first unless `build` is false.
+fn release_exe(build: bool) -> Result<PathBuf, String> {
     let root = workspace_root();
     if build {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
@@ -100,23 +131,27 @@ fn bench_startup(args: &[String]) -> Result<(), String> {
             exe.display()
         ));
     }
+    Ok(exe)
+}
 
-    for _ in 0..warmup {
-        run_once(&exe, &fude_args)?;
+fn ui_test(args: &[String]) -> Result<(), String> {
+    let build = match args {
+        [] => true,
+        [flag] if flag == "--no-build" => false,
+        _ => {
+            return Err(format!(
+                "usage: cargo xtask ui-test [--no-build]\n\n{USAGE}"
+            ));
+        }
+    };
+    let exe = release_exe(build)?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    return ui_test::run(&exe);
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = exe;
+        Err("ui-test drives the app through X11, so it runs on Linux and the BSDs".into())
     }
-    let mut results = Vec::with_capacity(runs);
-    for _ in 0..runs {
-        results.push(run_once(&exe, &fude_args)?);
-    }
-    report(&results, warmup, budget);
-
-    let median = percentile(results.iter().map(|r| r.external_ms).collect(), 0.5);
-    if check && median > budget {
-        return Err(format!(
-            "median {median:.1} ms is over the {budget} ms budget"
-        ));
-    }
-    Ok(())
 }
 
 fn run_once(exe: &PathBuf, extra: &[String]) -> Result<Run, String> {

@@ -1,20 +1,28 @@
 //! Windowing, input and OS integration.
 //!
-//! This is the only crate that knows about `winit` and `softbuffer`. Everything above it
-//! sees fude's own [`Event`] types and draws into a [`Canvas`], so the windowing layer
-//! can be replaced per OS later without touching the editor (`ARCHITECTURE.md` §6).
+//! This is the only crate that knows about `winit`, `softbuffer`, the clipboard and file
+//! dialogs. Everything above it sees fude's own [`Event`] types and draws into a
+//! [`Canvas`], so the windowing layer can be replaced per OS later without touching the
+//! editor (`ARCHITECTURE.md` §6).
+//!
+//! The loop is event-driven: it sleeps until input arrives, a timer the app set comes
+//! due ([`Ctx::set_timer`]), or another thread calls [`Waker::wake`].
 
 mod input;
 mod memory;
 
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{
+    ElementState, MouseButton as WButton, MouseScrollDelta, StartCause, WindowEvent,
+};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::window::{Cursor, CursorIcon, Window, WindowId};
 
 pub use fude_render::Canvas;
 pub use input::{Key, KeyInput, Modifiers};
@@ -36,6 +44,27 @@ pub enum ScrollUnit {
     Pixels,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    Other,
+}
+
+/// Input method (IME) composition, for languages typed in several keystrokes.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Ime {
+    Enabled,
+    /// Text being composed, not yet in the document, and the byte range of the IME's
+    /// cursor in it. Empty text ends the composition.
+    Preedit(String, Option<(usize, usize)>),
+    /// Composed text to insert.
+    Commit(String),
+    Disabled,
+}
+
+/// Positions are physical pixels from the window's top left.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Event {
     CloseRequested,
@@ -47,12 +76,46 @@ pub enum Event {
     ScaleChanged(f64),
     Focused(bool),
     Key(KeyInput),
+    Ime(Ime),
     /// Positive `dy` scrolls the content down (towards the end of the document).
     Scroll {
         dx: f32,
         dy: f32,
         unit: ScrollUnit,
+        modifiers: Modifiers,
     },
+    MouseMove {
+        x: f32,
+        y: f32,
+        modifiers: Modifiers,
+    },
+    /// `clicks` counts rapid clicks in one place: 1, 2 (double), 3 (triple), then 1 again.
+    MouseDown {
+        x: f32,
+        y: f32,
+        button: MouseButton,
+        clicks: u8,
+        modifiers: Modifiers,
+    },
+    MouseUp {
+        x: f32,
+        y: f32,
+        button: MouseButton,
+        modifiers: Modifiers,
+    },
+    MouseLeave,
+    /// The time passed to [`Ctx::set_timer`] has come.
+    Timer,
+    /// Another thread called [`Waker::wake`].
+    Wake,
+}
+
+/// Mouse pointer shapes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CursorShape {
+    Default,
+    Text,
+    Pointer,
 }
 
 /// Startup milestones reported to [`App::startup_mark`].
@@ -63,10 +126,40 @@ pub enum StartupMark {
     SurfaceCreated,
 }
 
+/// Wakes the event loop from another thread, delivering [`Event::Wake`].
+#[derive(Clone)]
+pub struct Waker(EventLoopProxy<()>);
+
+impl Waker {
+    pub fn wake(&self) {
+        // Fails only if the loop has exited, when there's nothing left to wake.
+        let _ = self.0.send_event(());
+    }
+}
+
+/// A file dialog's options.
+#[derive(Clone, Debug, Default)]
+pub struct FileDialog<'a> {
+    pub title: &'a str,
+    pub directory: Option<&'a Path>,
+    /// Suggested name (save dialogs).
+    pub file_name: Option<&'a str>,
+}
+
+/// State the platform keeps for the app between events.
+struct Shared {
+    proxy: EventLoopProxy<()>,
+    timer: Option<Instant>,
+    cursor: CursorShape,
+    /// Created on first use, so startup doesn't pay for it.
+    clipboard: Option<arboard::Clipboard>,
+}
+
 /// Lets an [`App`] talk back to the platform.
 pub struct Ctx<'a> {
     event_loop: &'a ActiveEventLoop,
     window: &'a Window,
+    shared: &'a mut Shared,
 }
 
 impl Ctx<'_> {
@@ -84,6 +177,85 @@ impl Ctx<'_> {
 
     pub fn set_title(&self, title: &str) {
         self.window.set_title(title);
+    }
+
+    /// Delivers [`Event::Timer`] at `at` (replacing any earlier request), or cancels.
+    pub fn set_timer(&mut self, at: Option<Instant>) {
+        self.shared.timer = at;
+    }
+
+    pub fn waker(&self) -> Waker {
+        Waker(self.shared.proxy.clone())
+    }
+
+    pub fn set_cursor(&mut self, shape: CursorShape) {
+        if self.shared.cursor == shape {
+            return;
+        }
+        self.shared.cursor = shape;
+        let icon = match shape {
+            CursorShape::Default => CursorIcon::Default,
+            CursorShape::Text => CursorIcon::Text,
+            CursorShape::Pointer => CursorIcon::Pointer,
+        };
+        self.window.set_cursor(Cursor::Icon(icon));
+    }
+
+    /// Where the text cursor is (physical pixels), so the IME places its candidate
+    /// window next to it.
+    pub fn set_ime_area(&self, x: f32, y: f32, width: f32, height: f32) {
+        self.window.set_ime_cursor_area(
+            PhysicalPosition::new(x, y),
+            PhysicalSize::new(width.max(1.0), height.max(1.0)),
+        );
+    }
+
+    pub fn clipboard_text(&mut self) -> Option<String> {
+        self.clipboard()?.get_text().ok()
+    }
+
+    pub fn set_clipboard_text(&mut self, text: String) {
+        if let Some(clipboard) = self.clipboard()
+            && let Err(e) = clipboard.set_text(text)
+        {
+            eprintln!("fude: couldn't set the clipboard: {e}");
+        }
+    }
+
+    fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
+        if self.shared.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.shared.clipboard = Some(c),
+                Err(e) => {
+                    eprintln!("fude: no clipboard: {e}");
+                    return None;
+                }
+            }
+        }
+        self.shared.clipboard.as_mut()
+    }
+
+    /// Shows the system's open dialog. Blocks until it closes.
+    pub fn open_file_dialog(&self, options: &FileDialog<'_>) -> Option<PathBuf> {
+        self.dialog(options).pick_file()
+    }
+
+    /// Shows the system's save dialog. Blocks until it closes.
+    pub fn save_file_dialog(&self, options: &FileDialog<'_>) -> Option<PathBuf> {
+        self.dialog(options).save_file()
+    }
+
+    fn dialog(&self, options: &FileDialog<'_>) -> rfd::FileDialog {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(options.title)
+            .set_parent(self.window);
+        if let Some(dir) = options.directory {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(name) = options.file_name {
+            dialog = dialog.set_file_name(name);
+        }
+        dialog
     }
 }
 
@@ -117,7 +289,9 @@ fn err(context: &str, e: impl std::fmt::Display) -> PlatformError {
 
 /// Opens a window and runs `app` until it calls [`Ctx::exit`].
 pub fn run<A: App>(options: WindowOptions, app: A) -> Result<(), PlatformError> {
-    let event_loop = EventLoop::new().map_err(|e| err("creating event loop", e))?;
+    let event_loop = EventLoop::with_user_event()
+        .build()
+        .map_err(|e| err("creating event loop", e))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut runner = Runner {
         app,
@@ -125,6 +299,14 @@ pub fn run<A: App>(options: WindowOptions, app: A) -> Result<(), PlatformError> 
         win: None,
         error: None,
         modifiers: Modifiers::default(),
+        mouse: (0.0, 0.0),
+        last_click: None,
+        shared: Shared {
+            proxy: event_loop.create_proxy(),
+            timer: None,
+            cursor: CursorShape::Default,
+            clipboard: None,
+        },
     };
     runner.app.startup_mark(StartupMark::EventLoopCreated);
     event_loop
@@ -144,25 +326,42 @@ struct WinState {
     surface_size: (u32, u32),
 }
 
+/// Rapid clicks within this time and distance count as a double or triple click.
+const MULTI_CLICK_TIME: Duration = Duration::from_millis(500);
+const MULTI_CLICK_DISTANCE: f64 = 4.0;
+
+struct Click {
+    at: Instant,
+    pos: (f64, f64),
+    button: MouseButton,
+    count: u8,
+}
+
 struct Runner<A> {
     app: A,
     options: WindowOptions,
     win: Option<WinState>,
     error: Option<PlatformError>,
     modifiers: Modifiers,
+    /// Last mouse position, physical pixels.
+    mouse: (f64, f64),
+    last_click: Option<Click>,
+    shared: Shared,
 }
 
 impl<A: App> Runner<A> {
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<WinState, PlatformError> {
         let attrs = Window::default_attributes()
             .with_title(self.options.title.clone())
-            .with_inner_size(LogicalSize::new(self.options.width, self.options.height));
+            .with_inner_size(LogicalSize::new(self.options.width, self.options.height))
+            .with_min_inner_size(LogicalSize::new(320.0, 200.0));
         let window = Rc::new(
             event_loop
                 .create_window(attrs)
                 .map_err(|e| err("creating window", e))?,
         );
         self.app.startup_mark(StartupMark::WindowCreated);
+        window.set_ime_allowed(true);
         let context = softbuffer::Context::new(window.clone())
             .map_err(|e| err("creating draw context", e))?;
         let surface = softbuffer::Surface::new(&context, window.clone())
@@ -182,6 +381,7 @@ impl<A: App> Runner<A> {
         let mut ctx = Ctx {
             event_loop,
             window: &window,
+            shared: &mut self.shared,
         };
         self.app.event(&mut ctx, event);
     }
@@ -215,12 +415,74 @@ impl<A: App> Runner<A> {
         self.app.presented(&mut Ctx {
             event_loop,
             window: &window,
+            shared: &mut self.shared,
         });
         Ok(())
+    }
+
+    fn mouse_button(&mut self, event_loop: &ActiveEventLoop, state: ElementState, button: WButton) {
+        let button = match button {
+            WButton::Left => MouseButton::Left,
+            WButton::Middle => MouseButton::Middle,
+            WButton::Right => MouseButton::Right,
+            _ => MouseButton::Other,
+        };
+        let (x, y) = (self.mouse.0 as f32, self.mouse.1 as f32);
+        let modifiers = self.modifiers;
+        let event = match state {
+            ElementState::Pressed => {
+                let now = Instant::now();
+                let count = match &self.last_click {
+                    Some(c)
+                        if c.button == button
+                            && now.duration_since(c.at) < MULTI_CLICK_TIME
+                            && (c.pos.0 - self.mouse.0).abs() <= MULTI_CLICK_DISTANCE
+                            && (c.pos.1 - self.mouse.1).abs() <= MULTI_CLICK_DISTANCE =>
+                    {
+                        c.count % 3 + 1
+                    }
+                    _ => 1,
+                };
+                self.last_click = Some(Click {
+                    at: now,
+                    pos: self.mouse,
+                    button,
+                    count,
+                });
+                Event::MouseDown {
+                    x,
+                    y,
+                    button,
+                    clicks: count,
+                    modifiers,
+                }
+            }
+            ElementState::Released => Event::MouseUp {
+                x,
+                y,
+                button,
+                modifiers,
+            },
+        };
+        self.dispatch(event_loop, event);
+    }
+
+    /// Delivers the timer if it's due.
+    fn check_timer(&mut self, event_loop: &ActiveEventLoop) {
+        if self.shared.timer.is_some_and(|t| t <= Instant::now()) {
+            self.shared.timer = None;
+            self.dispatch(event_loop, Event::Timer);
+        }
     }
 }
 
 impl<A: App> ApplicationHandler for Runner<A> {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached { .. } = cause {
+            self.check_timer(event_loop);
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.win.is_some() {
             return;
@@ -235,6 +497,10 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 event_loop.exit();
             }
         }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
+        self.dispatch(event_loop, Event::Wake);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -267,24 +533,60 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 let key = input::key_input(&event, self.modifiers);
                 self.dispatch(event_loop, Event::Key(key));
             }
+            WindowEvent::Ime(ime) => {
+                let ime = match ime {
+                    winit::event::Ime::Enabled => Ime::Enabled,
+                    winit::event::Ime::Preedit(text, cursor) => Ime::Preedit(text, cursor),
+                    winit::event::Ime::Commit(text) => Ime::Commit(text),
+                    winit::event::Ime::Disabled => Ime::Disabled,
+                };
+                self.dispatch(event_loop, Event::Ime(ime));
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse = (position.x, position.y);
+                let modifiers = self.modifiers;
+                self.dispatch(
+                    event_loop,
+                    Event::MouseMove {
+                        x: position.x as f32,
+                        y: position.y as f32,
+                        modifiers,
+                    },
+                );
+            }
+            WindowEvent::CursorLeft { .. } => self.dispatch(event_loop, Event::MouseLeave),
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.mouse_button(event_loop, state, button);
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 // winit reports positive y when content should move down (scroll up);
                 // fude's convention is positive = towards the end of the document.
+                let modifiers = self.modifiers;
                 let event = match delta {
                     MouseScrollDelta::LineDelta(x, y) => Event::Scroll {
                         dx: -x,
                         dy: -y,
                         unit: ScrollUnit::Lines,
+                        modifiers,
                     },
                     MouseScrollDelta::PixelDelta(p) => Event::Scroll {
                         dx: -p.x as f32,
                         dy: -p.y as f32,
                         unit: ScrollUnit::Pixels,
+                        modifiers,
                     },
                 };
                 self.dispatch(event_loop, event);
             }
             _ => {}
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.check_timer(event_loop);
+        event_loop.set_control_flow(match self.shared.timer {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        });
     }
 }

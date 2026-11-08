@@ -4,20 +4,19 @@
 // inherited pipes, which is what `cargo xtask bench-startup` uses.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod app;
 mod args;
-mod theme;
-mod view;
+mod welcome;
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use app::{Doc, Fude};
 use args::{Args, Mode, USAGE};
 use fude_buffer::{Format, Rope};
-use fude_platform::{
-    App, Canvas, Ctx, Event, Key, KeyInput, ScrollUnit, StartupMark, WindowOptions,
-};
-use view::View;
+use fude_editor::Motion;
+use fude_platform::{App, Canvas, Ctx, Event, StartupMark, WindowOptions};
 
 fn main() -> ExitCode {
     let started = Instant::now();
@@ -40,6 +39,7 @@ fn main() -> ExitCode {
         Mode::Window => run_window(&args, started),
         Mode::Screenshot(path) => screenshot(&args, path),
         Mode::BenchRender => bench_render(&args),
+        Mode::BenchTyping => bench_typing(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -50,27 +50,28 @@ fn main() -> ExitCode {
     }
 }
 
-fn load_view(args: &Args) -> Result<View, String> {
+/// The document to start with: the file given (new if it doesn't exist yet), or an
+/// empty one. `demo` shows the welcome text instead of an empty document.
+fn initial_doc(args: &Args, demo: bool) -> Result<Doc, String> {
     match &args.file {
-        None => Ok(View::new(
-            "Welcome".into(),
-            Rope::from(view::welcome_text().as_str()),
+        Some(path) => match fude_buffer::load(path) {
+            Ok(loaded) => Ok(Doc::loaded(loaded, path.clone())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Doc::new(Rope::new(), Format::default(), Some(path.clone())))
+            }
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        },
+        None if demo => Ok(Doc::new(
+            Rope::from(welcome::text().as_str()),
             Format::default(),
+            None,
         )),
-        Some(path) => {
-            // Loads on the UI thread for now; background loading is phase 4.
-            let loaded = fude_buffer::load(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let name = path.file_name().map_or_else(
-                || path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            Ok(View::new(name, loaded.text, loaded.format))
-        }
+        None => Ok(Doc::untitled()),
     }
 }
 
-struct Fude {
-    view: View,
+struct Window {
+    app: Fude,
     bench: Option<StartupBench>,
 }
 
@@ -101,19 +102,19 @@ fn run_window(args: &Args, started: Instant) -> Result<(), String> {
         started,
         marks: vec![],
     });
-    let view = load_view(args)?;
+    let app = Fude::new(initial_doc(args, false)?);
     if let Some(b) = &mut bench {
         b.mark("view-ready");
     }
     let options = WindowOptions {
-        title: format!("{} · fude", view.title()),
+        title: app.window_title(),
         width: 1100.0,
         height: 720.0,
     };
-    fude_platform::run(options, Fude { view, bench }).map_err(|e| e.to_string())
+    fude_platform::run(options, Window { app, bench }).map_err(|e| e.to_string())
 }
 
-impl App for Fude {
+impl App for Window {
     fn startup_mark(&mut self, mark: StartupMark) {
         if let Some(b) = &mut self.bench {
             b.mark(match mark {
@@ -124,79 +125,47 @@ impl App for Fude {
         }
     }
 
+    fn event(&mut self, ctx: &mut Ctx<'_>, event: Event) {
+        // A bug in a command shouldn't take unsaved text down with it: report it and keep
+        // going, so the user can still save (ARCHITECTURE.md §11).
+        let app = &mut self.app;
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.event(ctx, event)));
+        if let Err(payload) = result {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown error".to_owned());
+            self.app.recover(ctx, &message);
+        }
+    }
+
     fn draw(&mut self, canvas: &mut Canvas<'_>, scale: f32) {
-        self.view.draw(canvas, scale);
+        self.app.draw(canvas, scale, Instant::now());
         if let Some(b) = &mut self.bench {
             b.mark("first-draw");
         }
     }
 
     fn presented(&mut self, ctx: &mut Ctx<'_>) {
+        self.app.presented(ctx);
         if let Some(b) = &mut self.bench {
             b.mark("first-present");
             b.report();
             ctx.exit();
         }
     }
-
-    fn event(&mut self, ctx: &mut Ctx<'_>, event: Event) {
-        let scale = ctx.scale_factor() as f32;
-        match event {
-            Event::CloseRequested => ctx.exit(),
-            Event::Scroll { dy, unit, .. } => {
-                let lines = match unit {
-                    ScrollUnit::Lines => dy * 3.0,
-                    ScrollUnit::Pixels => self.view.pixels_to_lines(dy, scale),
-                };
-                self.view.scroll_by(lines);
-                ctx.request_redraw();
-            }
-            Event::Key(key) if key.pressed => {
-                if self.key(&key, ctx) {
-                    ctx.request_redraw();
-                }
-            }
-            Event::ScaleChanged(_) | Event::Resized { .. } => ctx.request_redraw(),
-            _ => {}
-        }
-    }
-}
-
-impl Fude {
-    /// Handles a key press; returns whether the view changed.
-    fn key(&mut self, key: &KeyInput, ctx: &Ctx<'_>) -> bool {
-        let primary = key.modifiers.primary();
-        let page = (self.view.page_lines() - 1.0).max(1.0).floor();
-        match &key.key {
-            Key::Character(c) if primary => match c.as_str() {
-                "=" | "+" => self.view.zoom(1.0),
-                "-" => self.view.zoom(-1.0),
-                "0" => self.view.reset_zoom(),
-                "q" | "w" => {
-                    ctx.exit();
-                    return false;
-                }
-                _ => return false,
-            },
-            Key::Up => self.view.scroll_by(-1.0),
-            Key::Down => self.view.scroll_by(1.0),
-            Key::PageUp => self.view.scroll_by(-page),
-            Key::PageDown => self.view.scroll_by(page),
-            Key::Home => self.view.scroll_to(0.0),
-            Key::End => self.view.scroll_to(self.view.line_count() as f32),
-            _ => return false,
-        }
-        true
-    }
 }
 
 fn screenshot(args: &Args, path: &Path) -> Result<(), String> {
-    let mut view = load_view(args)?;
+    let mut app = Fude::new(initial_doc(args, true)?);
     let (w, h) = args.size;
     let mut pixels = vec![0u32; w as usize * h as usize];
-    view.draw(
+    app.draw(
         &mut Canvas::new(&mut pixels, w as usize, h as usize),
         args.scale,
+        Instant::now(),
     );
     let png = fude_render::png::encode_rgb(w, h, &pixels);
     std::fs::write(path, png).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -204,50 +173,125 @@ fn screenshot(args: &Args, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// Sorted durations: min, median, p95, max.
+fn summary(times: &mut [Duration]) -> String {
+    times.sort();
+    let n = times.len();
+    format!(
+        "min {:.2}  median {:.2}  p95 {:.2}  max {:.2} ms",
+        ms(times[0]),
+        ms(times[n / 2]),
+        ms(times[n * 95 / 100]),
+        ms(times[n - 1])
+    )
+}
+
 /// Full-frame redraws without a window: what the CPU renderer costs per frame, worst case
 /// (no damage tracking, every pixel drawn).
 fn bench_render(args: &Args) -> Result<(), String> {
-    let mut view = load_view(args)?;
+    let mut app = Fude::new(initial_doc(args, true)?);
     let (w, h) = args.size;
     let mut pixels = vec![0u32; w as usize * h as usize];
-
-    let cold = Instant::now();
-    view.draw(
-        &mut Canvas::new(&mut pixels, w as usize, h as usize),
-        args.scale,
-    );
-    let cold = cold.elapsed();
-
+    let mut draw = |app: &mut Fude| {
+        app.draw(
+            &mut Canvas::new(&mut pixels, w as usize, h as usize),
+            args.scale,
+            Instant::now(),
+        );
+        app.last_frame
+    };
+    let cold = draw(&mut app);
     const FRAMES: usize = 120;
     let mut times = Vec::with_capacity(FRAMES);
     for _ in 0..FRAMES {
-        view.scroll_by(1.0);
-        view.draw(
-            &mut Canvas::new(&mut pixels, w as usize, h as usize),
-            args.scale,
+        app.doc.view.scroll(
+            0.0,
+            1.0,
+            fude_platform::ScrollUnit::Lines,
+            Default::default(),
         );
-        times.push(view.last_frame());
+        times.push(draw(&mut app));
     }
-    times.sort();
-    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-    let mean = times.iter().map(|d| ms(*d)).sum::<f64>() / FRAMES as f64;
-    let (glyphs, glyph_bytes) = view.cache_stats();
     println!(
         "fude render benchmark: {w}x{h} @{}x, {FRAMES} full-frame redraws",
         args.scale
     );
     println!("  first frame (cold glyph cache): {:>7.2} ms", ms(cold));
+    println!("  warm frames: {}", summary(&mut times));
+    Ok(())
+}
+
+/// Keystroke latency without a window: each step is an edit (or move) followed by a full
+/// frame, so it measures fude's whole share of "key pressed → frame ready".
+fn bench_typing(args: &Args) -> Result<(), String> {
+    let mut app = Fude::new(initial_doc(args, true)?);
+    let (w, h) = args.size;
+    let mut pixels = vec![0u32; w as usize * h as usize];
+    let mut draw = |app: &mut Fude| {
+        app.draw(
+            &mut Canvas::new(&mut pixels, w as usize, h as usize),
+            args.scale,
+            Instant::now(),
+        );
+    };
+    draw(&mut app);
+    // Start in the middle of the document.
+    let middle = {
+        let text = app.doc.view.editor.text();
+        text.line_to_byte(text.line_count() / 2)
+    };
+    let view = &mut app.doc.view;
+    view.editor.set_selections(fude_editor::Selections::single(
+        fude_editor::Selection::cursor(middle),
+    ));
+    view.changed(Instant::now());
+    draw(&mut app);
+
+    const KEYS: usize = 300;
+    let mut typing = Vec::with_capacity(KEYS);
+    let mut moving = Vec::with_capacity(KEYS);
+    let mut deleting = Vec::with_capacity(KEYS);
+    let mut layout = fude_editor::MonoLayout { tab_width: 4 };
+    for i in 0..KEYS {
+        let start = Instant::now();
+        let now = Instant::now();
+        app.doc
+            .view
+            .editor
+            .insert(if i % 7 == 6 { " " } else { "x" }, now);
+        app.doc.view.changed(now);
+        draw(&mut app);
+        typing.push(start.elapsed());
+
+        let start = Instant::now();
+        app.doc
+            .view
+            .editor
+            .move_cursors(Motion::Down, false, &mut layout);
+        app.doc.view.changed(now);
+        draw(&mut app);
+        moving.push(start.elapsed());
+    }
+    for _ in 0..KEYS {
+        let start = Instant::now();
+        let now = Instant::now();
+        app.doc.view.editor.backspace(now);
+        app.doc.view.changed(now);
+        draw(&mut app);
+        deleting.push(start.elapsed());
+    }
+    let size = app.doc.view.editor.text().len();
     println!(
-        "  warm frames: min {:.2}  median {:.2}  mean {:.2}  p95 {:.2}  max {:.2} ms",
-        ms(times[0]),
-        ms(times[FRAMES / 2]),
-        mean,
-        ms(times[FRAMES * 95 / 100]),
-        ms(times[FRAMES - 1])
+        "fude typing benchmark: {w}x{h} @{}x, {:.1} MB document, edit + full frame per key",
+        args.scale,
+        size as f64 / 1e6
     );
-    println!(
-        "  glyph cache: {glyphs} glyphs, {:.1} KB",
-        glyph_bytes as f64 / 1024.0
-    );
+    println!("  type a character: {}", summary(&mut typing));
+    println!("  move down a line: {}", summary(&mut moving));
+    println!("  backspace:        {}", summary(&mut deleting));
     Ok(())
 }

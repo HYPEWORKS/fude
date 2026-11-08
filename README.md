@@ -4,7 +4,7 @@
 
 A cross-platform text editor somewhere between Notepad and Notepad++: instant startup, instant response at any file size, low memory use. Windows, macOS and Linux, with BSD as a bonus.
 
-> **Status: early.** Phases 0 and 1 are done: a window, CPU renderer and text stack, and the buffer (rope, snapshots, undo, encoding detection, safe saving). The window shows files read-only; editing arrives in phase 2. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design, roadmap and measurements.
+> **Status: early.** Phases 0–2 are done: fude edits one file at a time, like a fast Notepad: typing, selection with keyboard and mouse, undo, clipboard, IME, encodings, safe saving. Tabs, find/replace and syntax highlighting come in phase 3. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design, roadmap and measurements.
 
 ## Building
 
@@ -15,7 +15,13 @@ cargo run --release                 # welcome view
 cargo run --release -- some/file.txt
 ```
 
-For now the view is read-only: scroll with the wheel, trackpad or arrow keys, zoom with Ctrl+= / Ctrl+- / Ctrl+0 (Cmd on macOS), quit with Ctrl+Q.
+| | Keys (Cmd instead of Ctrl on macOS) |
+|---|---|
+| Move | arrows, Home / End, PageUp / PageDown, Ctrl+arrows by word, Ctrl+Home / End |
+| Select | Shift + any move, drag, double-click a word, triple-click a line, click the gutter |
+| Edit | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) undo and redo, Ctrl+X / C / V, Ctrl+A |
+| Files | Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+Q quit |
+| View | Ctrl+= / Ctrl+- / Ctrl+0 zoom, Shift+wheel scrolls sideways |
 
 ## Development
 
@@ -25,6 +31,7 @@ cargo clippy --workspace --all-targets
 
 cargo xtask bench-startup           # launch → first frame, RSS (opens and closes a window repeatedly)
 fude --bench-render --size 3840x2160 --scale 2   # CPU renderer cost per full frame, no window
+fude --bench-typing some/file.txt                 # edit + full frame per keystroke, no window
 fude --screenshot out.png --size 2200x1440 --scale 2   # render one frame to PNG, no window
 cargo run --release -p fude-buffer --example bench   # buffer on a generated 500 MB log (writes it to target/)
 ```
@@ -36,10 +43,11 @@ cd fuzz
 cargo +nightly fuzz run -O rope_edits    # also: decode, history
 ```
 
-On Linux you can run the startup benchmark off-screen with Xvfb:
+On Linux, the startup benchmark and the UI test (which types, clicks and saves through the real window) run off-screen with Xvfb:
 
 ```sh
 env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1920x1080x24 -noreset" cargo xtask bench-startup
+env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1920x1080x24 -noreset" cargo xtask ui-test
 ```
 
 ## Layout
@@ -47,9 +55,11 @@ env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1920x1080x24 -noreset" cargo xt
 | Crate | Purpose |
 |---|---|
 | `crates/fude-buffer` | Rope, snapshots, undo, encodings, line endings, loading and saving |
+| `crates/fude-editor` | Selections, cursor movement and editing commands, without UI |
+| `crates/fude-ui` | Editor view, tab strip, status bar, dialogs, theme |
 | `crates/fude-render` | Draw list and CPU rasterizer |
-| `crates/fude-text` | Fonts, shaping and glyph cache |
-| `crates/fude-platform` | Windowing and input (the only crate that knows about winit) |
+| `crates/fude-text` | Fonts, fallback, shaping and glyph cache |
+| `crates/fude-platform` | Windowing, input, clipboard, file dialogs (the only crate that knows about winit) |
 | `fude` | The application |
 | `xtask` | Development tasks (`cargo xtask`) |
 | `fuzz` | Fuzz targets for the buffer (separate workspace) |

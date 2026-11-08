@@ -12,6 +12,7 @@ fude-render.workspace = true
 swash.workspace = true
 harfrust.workspace = true
 rustc-hash.workspace = true
+fontique.workspace = true
 
 [lints]
 workspace = true

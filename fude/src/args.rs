@@ -14,9 +14,11 @@ Development:
   --bench-startup        Exit after the first frame is presented and print timings
   --screenshot <PATH>    Render one frame without a window, save it as PNG, and exit
   --bench-render         Render frames without a window and print timings
-  --size <WxH>           Canvas size in physical pixels for --screenshot and
-                         --bench-render [default: 1280x800]
-  --scale <FACTOR>       Scale factor for --screenshot and --bench-render [default: 1]";
+  --bench-typing         Type into the document without a window: time per keystroke,
+                         from edit to finished frame
+  --size <WxH>           Canvas size in physical pixels for the modes without a
+                         window [default: 1280x800]
+  --scale <FACTOR>       Scale factor for the modes without a window [default: 1]";
 
 #[derive(Debug, PartialEq)]
 pub enum Mode {
@@ -25,6 +27,7 @@ pub enum Mode {
     Version,
     Screenshot(PathBuf),
     BenchRender,
+    BenchTyping,
 }
 
 #[derive(Debug, PartialEq)]
@@ -54,6 +57,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
             Some("-V" | "--version") => out.mode = Mode::Version,
             Some("--bench-startup") => out.bench_startup = true,
             Some("--bench-render") => out.mode = Mode::BenchRender,
+            Some("--bench-typing") => out.mode = Mode::BenchTyping,
             Some("--screenshot") => out.mode = Mode::Screenshot(value("--screenshot")?.into()),
             Some("--size") => {
                 let v = value("--size")?;

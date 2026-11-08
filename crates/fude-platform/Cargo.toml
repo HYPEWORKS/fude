@@ -11,6 +11,8 @@ repository.workspace = true
 fude-render.workspace = true
 winit.workspace = true
 softbuffer.workspace = true
+arboard.workspace = true
+rfd.workspace = true
 
 [lints]
 workspace = true
