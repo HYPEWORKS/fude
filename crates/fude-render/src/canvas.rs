@@ -98,11 +98,10 @@ impl<'a> Canvas<'a> {
                     let src = &img.data[((sy0 + row) * iw + sx0) * 4..][..w * 4];
                     let start = (dst.y as usize + row) * self.width + dst.x as usize;
                     let out = &mut self.pixels[start..start + w];
-                    for (d, s) in out.iter_mut().zip(src.chunks_exact(4)) {
-                        let a = s[3] as u32;
+                    for (d, &[r, g, b, a]) in out.iter_mut().zip(src.as_chunks::<4>().0) {
                         if a != 0 {
-                            let p = (s[0] as u32) << 16 | (s[1] as u32) << 8 | s[2] as u32;
-                            *d = blend_premul(*d, p, a);
+                            let p = (r as u32) << 16 | (g as u32) << 8 | b as u32;
+                            *d = blend_premul(*d, p, a as u32);
                         }
                     }
                 }

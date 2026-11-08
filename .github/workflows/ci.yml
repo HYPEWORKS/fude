@@ -18,7 +18,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -38,7 +38,7 @@ jobs:
           ./target/release/fude --bench-render --size 1920x1080
           ./target/release/fude --bench-render --size 3840x2160 --scale 2
           ./target/release/fude --screenshot screenshot-${{ matrix.os }}.png --size 2200x1440 --scale 2
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: screenshot-${{ matrix.os }}
           path: screenshot-*.png
@@ -47,7 +47,7 @@ jobs:
     name: startup budget (Linux, X11)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install X server and runtime libraries
@@ -62,7 +62,7 @@ jobs:
     name: FreeBSD
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: vmactions/freebsd-vm@v1
         with:
           usesh: true

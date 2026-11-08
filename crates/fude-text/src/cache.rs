@@ -107,7 +107,13 @@ impl GlyphCache {
             // We request alpha masks, so subpixel masks shouldn't appear; reduce to alpha.
             Content::SubpixelMask => (
                 ImageFormat::Alpha,
-                self.scratch.data.chunks_exact(4).map(|c| c[1]).collect(),
+                self.scratch
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| c[1])
+                    .collect(),
                 false,
             ),
         };
@@ -128,11 +134,12 @@ impl GlyphCache {
 
 /// swash produces straight-alpha RGBA; the renderer wants premultiplied.
 fn premultiply(rgba: &[u8]) -> Vec<u8> {
-    rgba.chunks_exact(4)
-        .flat_map(|c| {
-            let a = c[3] as u32;
-            let m = |v: u8| ((v as u32 * a + 127) / 255) as u8;
-            [m(c[0]), m(c[1]), m(c[2]), c[3]]
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b, a]| {
+            let m = |v: u8| ((v as u32 * a as u32 + 127) / 255) as u8;
+            [m(r), m(g), m(b), a]
         })
         .collect()
 }
