@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "fude", "xtask"]
+exclude = ["fuzz"]
 default-members = ["fude"]
 
 [workspace.package]
@@ -11,6 +12,7 @@ license = "Apache-2.0"
 repository = "https://github.com/HYPEWORKS/fude"
 
 [workspace.dependencies]
+fude-buffer = { path = "crates/fude-buffer" }
 fude-render = { path = "crates/fude-render" }
 fude-text = { path = "crates/fude-text" }
 fude-platform = { path = "crates/fude-platform" }
@@ -20,6 +22,12 @@ softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "
 swash = "0.2.10"
 harfrust = "0.15.0"
 rustc-hash = "2"
+encoding_rs = "0.8.44"
+chardetng = "1.0.0"
+memchr = "2.8.3"
+
+# Tests only.
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

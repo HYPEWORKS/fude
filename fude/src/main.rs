@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use args::{Args, Mode, USAGE};
+use fude_buffer::{Format, Rope};
 use fude_platform::{
     App, Canvas, Ctx, Event, Key, KeyInput, ScrollUnit, StartupMark, WindowOptions,
 };
@@ -51,15 +52,19 @@ fn main() -> ExitCode {
 
 fn load_view(args: &Args) -> Result<View, String> {
     match &args.file {
-        None => Ok(View::new("Welcome".into(), &view::welcome_text())),
+        None => Ok(View::new(
+            "Welcome".into(),
+            Rope::from(view::welcome_text().as_str()),
+            Format::default(),
+        )),
         Some(path) => {
-            // Phase 0 stand-in for the real loader (fude-buffer, phase 1).
-            let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            // Loads on the UI thread for now; background loading is phase 4.
+            let loaded = fude_buffer::load(path).map_err(|e| format!("{}: {e}", path.display()))?;
             let name = path.file_name().map_or_else(
                 || path.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             );
-            Ok(View::new(name, &String::from_utf8_lossy(&bytes)))
+            Ok(View::new(name, loaded.text, loaded.format))
         }
     }
 }

@@ -4,7 +4,7 @@
 
 A cross-platform text editor that sits between Notepad and Notepad++. It should start instantly, respond instantly at any file size, use little memory, and look and feel polished on every platform.
 
-> Status: phase 0 (skeleton and budgets) done. Next: phase 1, the buffer. Last updated 2026-11-07.
+> Status: phase 1 (the buffer) done. Next: phase 2, a basic editor. Last updated 2026-11-08.
 
 ---
 
@@ -29,19 +29,21 @@ A cross-platform text editor that sits between Notepad and Notepad++. It should 
 
 ## 3. Performance budgets
 
-| Metric | Target | Measured (phase 0) |
+| Metric | Target | Measured |
 |---|---|---|
 | Launch → first frame, warm cache | < 40 ms | 11.4 ms median (Linux, X11) |
 | Launch → first frame, cold | < 150 ms | |
-| Open a 500 MB file → first screen | < 100 ms | |
-| Open a 500 MB file → fully loaded and editable | < 1 s (SSD or warm cache) | |
-| Keypress → frame submitted | < 4 ms of fude's own work | |
+| Open a 500 MB file → first screen | < 100 ms | 190 ms, loading synchronously (background loading is phase 4) |
+| Open a 500 MB file → fully loaded and editable | < 1 s (SSD or warm cache) | 141 ms |
+| Keypress → frame submitted | < 4 ms of fude's own work | buffer edit 1.3 µs (worst 0.2 ms) in a 500 MB file, with undo history |
 | Idle RAM, empty document, 1080p | < 30 MB | 12.7 MB (Linux, X11) |
-| RAM for an open, unedited file | ≈ 1.1 × file size | |
+| RAM for an open, unedited file | ≈ 1.1 × file size | 1.04 × |
 | Idle CPU | 0 % | 0 % (event-driven) |
-| Release binary | < 10 MB | 5.0 MB (Linux x86-64) |
+| Release binary | < 10 MB | 5.3 MB (Linux x86-64; the encoding tables added 0.3 MB in phase 1) |
 
-Phase 0 measurements were taken on a fast desktop (32 threads) with `cargo xtask bench-startup` under Xvfb, so they are a best case; laptops and Wayland/Windows/macOS numbers come next.
+Measurements are from a fast desktop (32 threads, NVMe, warm page cache): startup with `cargo xtask bench-startup` under Xvfb, the buffer with `cargo run --release -p fude-buffer --example bench` on a generated 500 MB log. They are a best case; laptops and Wayland/Windows/macOS numbers come next.
+
+**Buffer (phase 1),** 500 MB log, 5.8 M lines: line → byte 1.1 µs and byte → line 0.8 µs at random positions (mostly cache misses); the 60 visible lines of a screen, found and copied out, 5.7 µs; snapshot 8 ns; undo history 7.6 KB per step; save including fsync 180 ms.
 
 **CPU rendering go/no-go (phase 0):** full-frame redraws with no damage tracking, single thread, `fude --bench-render`:
 
@@ -96,7 +98,7 @@ Dependencies point downward only. `fude-buffer`, `fude-editor` and `fude-syntax`
 ```
 Cargo.toml        workspace
 crates/
-  fude-buffer/
+  fude-buffer/    (examples/bench.rs: large-file benchmark)
   fude-editor/
   fude-syntax/
   fude-text/
@@ -104,8 +106,8 @@ crates/
   fude-ui/
   fude-platform/
 fude/             binary crate
-benches/          startup, RAM, large-file and micro benchmarks
-fuzz/             cargo-fuzz targets
+xtask/            cargo xtask: startup benchmark
+fuzz/             cargo-fuzz targets (a separate workspace)
 ```
 
 ## 6. Rendering and UI
@@ -146,16 +148,29 @@ A custom persistent B-tree rope. No existing crate gives us exact byte preservat
      [leaf "…"]     [leaf "fn ma…"]    [leaf "…"]      leaves hold ~1–4 KB of bytes
 ```
 
-- **Summaries:** each node caches its byte length and line-break count, so converting between byte offsets and line numbers is O(log n).
-- **Shared, copy-on-write nodes.** An edit copies O(log n) nodes. A snapshot is a clone of the root pointer, O(1). This is what makes the threading model (§10) work: the highlighter, search and save each work from an immutable snapshot and never take a lock.
-- **Undo** is a stack of previous roots plus selections. Structural sharing makes it nearly free in memory. "Is the document unsaved?" is "is the current root the saved root?" (compared by version ID).
-- **Positions are byte offsets.** Line and column are derived from them.
-- **Line endings:** LF, CRLF and CR are stored as-is. A CRLF split across two leaves still counts as one line break. The dominant style is detected and used for new lines; conversion is a command.
-- **Encodings:** BOM sniffing, then `chardetng` (Firefox's detector, which handles Shift-JIS and friends). UTF-8 files are stored raw; invalid bytes render as `<FF>`-style chips and round-trip untouched. UTF-16 and legacy encodings are transcoded to UTF-8 on load (`encoding_rs`) and back on save.
+- **Shape:** leaves hold 1–4 KB of raw bytes (filled to 3.5 KB on load, leaving room to type); internal nodes have 8–16 children. All leaves are at the same depth.
+- **Summaries:** parents store a summary per child, inline, so a descent reads one array per level: byte length, LF / CRLF / CR counts, and whether the bytes start with `\n` or end with `\r`. Joining two summaries pairs a `\r` at the end of one with a `\n` at the start of the next, so a CRLF split across leaves still counts as one break, and the status bar's line ending counts are O(1). Byte ↔ line conversion is O(log n), plus a SIMD scan of one leaf.
+- **Shared, copy-on-write nodes.** A snapshot is a clone of the root pointer, O(1). This is what makes the threading model (§10) work: the highlighter, search and save each work from an immutable snapshot and never take a lock. A small edit inside one leaf mutates the path in place (copying only nodes a snapshot still shares); anything else splits the tree and concatenates the pieces, O(log n).
+- **Undo** is a list of previous trees plus the caller's state (selections). Every state has a version number; undo returns to an earlier number, so "modified?" is "is the current version the saved one?", and work done on a snapshot is valid exactly when the versions match. Measured cost: 7.6 KB per undo step in a 500 MB file. Typing merges into the open step until the editor seals it (pause, word boundary, cursor move); undo, redo and saving seal it too.
+- **Transactions:** a list of non-overlapping range replacements in the coordinates of the text before it, applied atomically as one step. `map_offset` moves other positions (other cursors, bookmarks) through it.
+- **Positions are byte offsets.** Line and column are derived from them. Leaf boundaries may fall inside a UTF-8 sequence or a CRLF pair (the builder avoids it, but nothing relies on it).
+- **Line endings:** LF, CRLF and CR are stored as-is. The dominant style is detected and used for new lines; conversion is a whole-document edit (one undo step).
+- **Encodings:** see §9.
 - **Future-proofing:** the leaf type is an enum. v1 only has owned-byte leaves; a file-span leaf for paged mode (§9) can be added later without changing the public API.
-- **Testing:** property tests against a naive `Vec<u8>` model, plus `cargo-fuzz` targets for edits, line indexing and encoding round-trips.
+- **Testing:** property tests against a naive `Vec<u8>` model, run with tiny nodes (16-byte leaves, 2–4 children) so short inputs build deep trees; planted bugs in the CRLF seam and the size limits are caught. Integration tests use the real sizes. Three `cargo-fuzz` targets (edits, decoding round trips, undo history) run in CI for a short smoke test.
 
 ## 9. Opening and saving files
+
+### Encodings
+
+Detection order:
+
+1. A byte order mark (UTF-8, UTF-16LE/BE).
+2. UTF-16 without a BOM: mostly-ASCII UTF-16 has a zero in every other byte.
+3. UTF-8, checked as the file streams in. A file that is mostly valid UTF-8 with some damage (at least 4 valid multi-byte sequences per invalid one, e.g. a log with stray bytes) stays UTF-8, as does anything with zero bytes near the start (binary).
+4. Otherwise `chardetng` (Firefox's detector) guesses a legacy encoding from up to 1 MB of the text, starting where UTF-8 first failed.
+
+UTF-8 is stored raw, so invalid bytes round-trip untouched (they will render as `<FF>`-style chips). Other encodings are decoded to UTF-8 with `encoding_rs` and encoded back on save; UTF-16 is encoded by fude, since `encoding_rs` only decodes it. After decoding a legacy encoding, fude re-encodes it and compares with the file. If it doesn't match (malformed bytes, or encodings like Shift_JIS with two byte sequences for one character), the document is flagged as not exact, so the UI can warn before a save changes bytes the user didn't touch. Saving a character the encoding can't represent is an error naming the character and its position; fude never writes replacement characters or HTML entities silently.
 
 ### v1: in memory, loaded in the background
 
@@ -172,7 +187,9 @@ Why `pread` rather than `mmap`: on Unix, a mapped file crashes the process (SIGB
 
 ### Saving
 
-Saves run on a snapshot in a worker, so the UI stays responsive. fude writes a temporary file in the same directory, flushes it to disk, then renames it over the original (`ReplaceFile` on Windows). It preserves permissions, follows symlinks, and never truncates the original in place.
+Saves run on a snapshot in a worker, so the UI stays responsive. fude writes a temporary file in the same directory, flushes it to disk, then renames it over the original (`ReplaceFileW` on Windows, which keeps attributes and ACLs) and flushes the directory. It copies permissions and owner, follows symlinks (a dangling link creates its target), and refuses read-only files.
+
+When a rename would change what the file is (it has other hard links, or its owner can't be kept), or the directory isn't writable, fude still writes and flushes the new contents to a temporary file first, then copies them over the original in place. If that copy fails, the error names the temporary file holding the new contents. Any other failure leaves the original untouched and removes the temporary file.
 
 ### External changes
 
@@ -345,3 +362,9 @@ Each is evaluated for startup, RAM and binary size when introduced, and pinned t
 | 2026-11-07 | CPU rendering confirmed by phase 0 measurements (§3). |
 | 2026-11-07 | Shaping and glyph metrics come from harfrust (which also drives the ASCII fast path, so both paths agree); swash only rasterizes. |
 | 2026-11-07 | Apache-2.0 license. |
+| 2026-11-08 | Undo keeps whole trees (sharing unchanged nodes) rather than inverse edits: O(1) undo and redo, trivially correct, "modified?" is a version comparison. Measured at 7.6 KB per step. |
+| 2026-11-08 | Leaf boundaries may split CRLF pairs and UTF-8 sequences; summaries handle CRLF across the seam, so nothing has to maintain a boundary invariant through edits. |
+| 2026-11-08 | Mostly-valid UTF-8 stays raw UTF-8 instead of going to the legacy-encoding detector, so a log with a few bad bytes doesn't turn into mojibake. |
+| 2026-11-08 | Saving a character the encoding can't represent fails (encoding_rs would write HTML entities). |
+| 2026-11-08 | When a rename would break hard links or lose the owner, save copies over the original in place, after the new contents are safely in a temporary file. |
+| 2026-11-08 | Tests and fuzzing use tiny nodes (`small-nodes` feature, fuzz crate in its own workspace) to reach deep trees with short inputs. |

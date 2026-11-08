@@ -1,0 +1,43 @@
+[package]
+name = "fude-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+encoding_rs = "0.8.44"
+# Tiny nodes, so short inputs build deep trees.
+fude-buffer = { path = "../crates/fude-buffer", features = ["small-nodes"] }
+
+# Separate from the main workspace, so `small-nodes` never reaches normal builds.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "rope_edits"
+path = "fuzz_targets/rope_edits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "history"
+path = "fuzz_targets/history.rs"
+test = false
+doc = false
+bench = false

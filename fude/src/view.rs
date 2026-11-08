@@ -1,9 +1,10 @@
-//! Phase 0 demo view: a read-only text view laid out like the real editor (tab strip,
-//! gutter, text, status bar). It exists to measure the rendering and text stack; the real
-//! editor view arrives in phase 2 on top of `fude-buffer` and `fude-editor`.
+//! Read-only demo view, laid out like the real editor (tab strip, gutter, text, status
+//! bar). It draws straight from a `fude-buffer` rope, touching only the visible lines.
+//! The real editor view arrives in phase 2 with `fude-editor`.
 
 use std::time::{Duration, Instant};
 
+use fude_buffer::{Format, LineSpan, Rope};
 use fude_render::{Canvas, DrawList, ImageStore, Rect, rasterize};
 use fude_text::{FontId, LineLayout, LineMetrics, TextStyle, TextSystem};
 
@@ -14,8 +15,10 @@ const MAX_DISPLAY_BYTES: usize = 4096;
 
 pub struct View {
     title: String,
-    lines: Vec<String>,
-    byte_len: usize,
+    doc: Rope,
+    format: Format,
+    /// Raw bytes of the line being drawn.
+    line_buf: Vec<u8>,
     text: TextSystem,
     images: ImageStore,
     list: DrawList,
@@ -33,15 +36,12 @@ pub struct View {
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
 impl View {
-    pub fn new(title: String, contents: &str) -> View {
-        let lines: Vec<String> = contents
-            .split('\n')
-            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_owned())
-            .collect();
+    pub fn new(title: String, doc: Rope, format: Format) -> View {
         View {
             title,
-            byte_len: contents.len(),
-            lines,
+            doc,
+            format,
+            line_buf: Vec::new(),
             text: TextSystem::new(),
             images: ImageStore::new(),
             list: DrawList::new(),
@@ -63,12 +63,12 @@ impl View {
     }
 
     pub fn line_count(&self) -> usize {
-        self.lines.len()
+        self.doc.line_count()
     }
 
     /// Scrolls by `lines`, clamped to the document.
     pub fn scroll_by(&mut self, lines: f32) {
-        let max = (self.lines.len() as f32 - 1.0).max(0.0);
+        let max = (self.line_count() as f32 - 1.0).max(0.0);
         self.scroll = (self.scroll + lines).clamp(0.0, max);
     }
 
@@ -155,10 +155,16 @@ impl View {
             t.chrome_text,
             w,
         );
+        let line_endings = if self.doc.line_ending_counts().is_mixed() {
+            "Mixed"
+        } else {
+            self.format.line_ending.name()
+        };
         let right = format!(
-            "{} lines · {}   UTF-8   LF   Plain Text   {:.2} ms",
-            self.lines.len(),
-            human_bytes(self.byte_len),
+            "{} lines · {}   {}   {line_endings}   Plain Text   {:.2} ms",
+            self.line_count(),
+            human_bytes(self.doc.len()),
+            self.format.encoding_label(),
             self.last_frame.as_secs_f64() * 1000.0
         );
         let right_w = self.measure(&right, &chrome_style);
@@ -176,7 +182,7 @@ impl View {
         let area = Rect::new(0, tab_h, w, (status_y - tab_h).max(0));
         self.list.rect(area, t.editor_bg);
         self.page_lines = area.h as f32 / line_h as f32;
-        let digits = self.lines.len().max(1).ilog10() as f32 + 1.0;
+        let digits = self.line_count().ilog10() as f32 + 1.0;
         let gutter_w = ((digits.max(3.0)) * m.space_advance).ceil() as i32 + px(24.0);
         let text_x = (gutter_w + px(8.0)) as f32;
         let top_pad = px(6.0);
@@ -187,9 +193,10 @@ impl View {
         let cursor_line = first; // the demo cursor sits on the top visible line
 
         self.list.push_clip(area);
+        let visible = ((area.bottom() - y0) / line_h.max(1) + 1).max(0) as usize;
+        let spans: Vec<LineSpan> = self.doc.lines_from(first).take(visible).collect();
         let mut y = y0;
-        let mut i = first;
-        while y < area.bottom() && i < self.lines.len() {
+        for (i, span) in (first..).zip(spans) {
             let baseline = center_baseline(y, line_h, &m);
             if i == cursor_line {
                 self.list.rect(Rect::new(0, y, w, line_h), t.line_highlight);
@@ -204,13 +211,21 @@ impl View {
             let num_x = (gutter_w - px(12.0)) as f32 - num_w;
             self.text_at(&num, &style, num_x, baseline, num_color, w);
 
-            let line = std::mem::take(&mut self.lines[i]);
-            let shown = truncate(&line, MAX_DISPLAY_BYTES);
+            // Invalid UTF-8 shows as U+FFFD for now; phase 2 draws it as byte chips.
+            let mut raw = std::mem::take(&mut self.line_buf);
+            raw.clear();
+            let end = span.end.min(span.start + MAX_DISPLAY_BYTES);
+            self.doc.copy_range(span.start..end, &mut raw);
+            if end < span.end {
+                raw.truncate(complete_utf8_prefix(&raw));
+            }
+            let shown = String::from_utf8_lossy(&raw);
             self.list
                 .push_clip(Rect::new(gutter_w, area.y, w - gutter_w, area.h));
-            self.text_at(shown, &style, text_x, baseline, t.text, w);
+            self.text_at(&shown, &style, text_x, baseline, t.text, w);
             self.list.pop_clip();
-            self.lines[i] = line;
+            drop(shown);
+            self.line_buf = raw;
 
             if i == cursor_line {
                 let ch = (m.ascent + m.descent).round() as i32;
@@ -225,7 +240,6 @@ impl View {
                 );
             }
             y += line_h;
-            i += 1;
         }
         self.list.pop_clip();
 
@@ -277,15 +291,12 @@ fn center_baseline(top: i32, height: i32, m: &LineMetrics) -> i32 {
     top + ((height as f32 - content) / 2.0 + m.ascent).round() as i32
 }
 
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
+/// `bytes` without a UTF-8 sequence cut off at the end.
+fn complete_utf8_prefix(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        _ => bytes.len(),
     }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 fn human_bytes(n: usize) -> String {
@@ -307,9 +318,9 @@ pub const WELCOME: &str = "\
 fude 筆: Fast, Uncomplicated Document Editor
 ===========================================
 
-This is the phase 0 skeleton: a window, a CPU renderer and the text stack
-(harfrust shaping with an ASCII fast path, swash rasterization, a glyph cache).
-There is no editing yet.
+This is the phase 1 build: a window, a CPU renderer, the text stack, and the
+buffer (a rope with snapshots and undo, encoding detection, safe saving).
+There is no editing yet: this view draws straight from the rope, read-only.
 
   Scroll           mouse wheel, trackpad, arrows, PageUp / PageDown, Home / End
   Zoom             Ctrl+= / Ctrl+- / Ctrl+0  (Cmd on macOS)

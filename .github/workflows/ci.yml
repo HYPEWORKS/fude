@@ -73,3 +73,24 @@ jobs:
             . "$HOME/.cargo/env"
             cargo build --workspace --locked
             cargo test --workspace --locked
+
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: curl -fsSL https://github.com/rust-fuzz/cargo-fuzz/releases/download/0.13.2/cargo-fuzz-0.13.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C ~/.cargo/bin
+      # A short run per target catches regressions; long runs happen locally.
+      - name: Fuzz
+        working-directory: fuzz
+        env:
+          RUSTFLAGS: ""
+        run: |
+          for target in rope_edits decode history; do
+            cargo fuzz run -O "$target" -- -max_total_time=45
+          done
