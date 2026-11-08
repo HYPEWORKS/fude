@@ -1,0 +1,17 @@
+[package]
+name = "fude-text"
+description = "Fonts, shaping and glyph cache"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fude-render.workspace = true
+swash.workspace = true
+harfrust.workspace = true
+rustc-hash.workspace = true
+
+[lints]
+workspace = true

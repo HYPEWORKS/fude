@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "fude", "xtask"]
+default-members = ["fude"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+repository = "https://github.com/HYPEWORKS/fude"
+
+[workspace.dependencies]
+fude-render = { path = "crates/fude-render" }
+fude-text = { path = "crates/fude-text" }
+fude-platform = { path = "crates/fude-platform" }
+
+winit = "0.30.13"
+softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+swash = "0.2.10"
+harfrust = "0.15.0"
+rustc-hash = "2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind" # commands will run under catch_unwind (ARCHITECTURE.md §11)
+
+# Keep debug builds usable: rasterization and shaping are slow unoptimized.
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Release build
+        run: cargo build --release --locked -p fude
+      - name: Render benchmark (no window needed)
+        shell: bash
+        run: |
+          ./target/release/fude --bench-render --size 1920x1080
+          ./target/release/fude --bench-render --size 3840x2160 --scale 2
+          ./target/release/fude --screenshot screenshot-${{ matrix.os }}.png --size 2200x1440 --scale 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-${{ matrix.os }}
+          path: screenshot-*.png
+
+  startup:
+    name: startup budget (Linux, X11)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install X server and runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y xvfb libxkbcommon-x11-0 libxcursor1 libx11-xcb1
+      # Report-only until we have a baseline for runner noise; then add --check.
+      # -noreset: by default Xvfb resets whenever its last client exits, which would add
+      # ~30 ms to every launch after the first.
+      - name: Measure startup
+        run: xvfb-run -a -s "-screen 0 1920x1080x24 -noreset" cargo xtask bench-startup --runs 20
+
+  freebsd:
+    name: FreeBSD
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y curl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            . "$HOME/.cargo/env"
+            cargo build --workspace --locked
+            cargo test --workspace --locked
