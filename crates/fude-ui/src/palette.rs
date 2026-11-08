@@ -8,7 +8,7 @@ use fude_render::Rect;
 use fude_text::LineLayout;
 
 use crate::fuzzy;
-use crate::input::{InputKey, TextInput};
+use crate::input::{ImeChange, InputKey, TextInput};
 use crate::painter::Painter;
 
 pub struct PaletteItem {
@@ -161,10 +161,10 @@ impl Palette {
     }
 
     pub fn ime(&mut self, ime: Ime, now: Instant) -> Option<PaletteAction> {
-        if self.input.ime(ime, now) {
-            Some(self.after_edit())
-        } else {
-            Some(PaletteAction::Redraw)
+        match self.input.ime(ime, now) {
+            ImeChange::Nothing => None,
+            ImeChange::Preedit => Some(PaletteAction::Redraw),
+            ImeChange::Text => Some(self.after_edit()),
         }
     }
 

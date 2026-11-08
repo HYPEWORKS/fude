@@ -98,6 +98,8 @@ pub struct Fude {
     session_writing: Arc<AtomicBool>,
     /// Files are being dragged over the window.
     drop_hover: bool,
+    /// The caret area last given to the input method.
+    ime_area: Option<Rect>,
     os_theme: Option<OsTheme>,
     /// Zoom steps from the configured font size, for every document.
     zoom: f32,
@@ -132,6 +134,7 @@ impl Fude {
             backed_up: HashMap::new(),
             session_writing: Arc::new(AtomicBool::new(false)),
             drop_hover: false,
+            ime_area: None,
             os_theme: None,
             zoom: 0.0,
             last_frame: Duration::ZERO,
@@ -488,25 +491,35 @@ impl Fude {
             Event::Focused(focused) => {
                 self.doc_mut().view.set_focused(focused, now);
                 if focused {
+                    // Tell the input method again where the caret is.
+                    self.ime_area = None;
                     self.check_disk();
                 }
                 true
             }
             Event::Key(key) => self.key(ctx, &key, now),
             Event::Ime(ime) => {
+                // Only real changes redraw: an empty update redrawing would send the
+                // caret area again, which KWin answers with another empty update.
                 if self.prompt.is_some() {
+                    false
                 } else if self.focus == Focus::Palette {
                     if let Some(action) = self.palette.ime(ime, now) {
                         self.palette_action(ctx, action, now);
+                        true
+                    } else {
+                        false
                     }
                 } else if self.focus == Focus::Find {
                     if let Some(action) = self.find.ime(ime, now) {
                         self.find_action(action, now);
+                        true
+                    } else {
+                        false
                     }
                 } else {
-                    self.doc_mut().view.ime(ime, now);
+                    self.doc_mut().view.ime(ime, now)
                 }
-                true
             }
             Event::Scroll {
                 dx,
@@ -649,7 +662,11 @@ impl Fude {
             Focus::Palette => self.palette.caret_rect(),
             Focus::Editor => self.doc().view.caret_rect(),
         };
-        if let Some(r) = caret {
+        // Only when it moved: on Wayland each update is a round trip to the compositor.
+        if let Some(r) = caret
+            && self.ime_area != Some(r)
+        {
+            self.ime_area = Some(r);
             ctx.set_ime_area(r.x as f32, r.y as f32, r.w as f32, r.h as f32);
         }
     }

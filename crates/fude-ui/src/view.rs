@@ -629,16 +629,26 @@ impl EditorView {
         true
     }
 
-    pub fn ime(&mut self, ime: Ime, now: Instant) {
+    /// Handles input method composition. Returns whether anything changed: input methods
+    /// send empty updates freely (KWin answers every caret move with one), and those
+    /// mustn't redraw or bring the caret back into view while the user scrolls.
+    pub fn ime(&mut self, ime: Ime, now: Instant) -> bool {
         match ime {
-            Ime::Preedit(text, cursor) if !text.is_empty() => self.preedit = Some((text, cursor)),
-            Ime::Commit(text) => {
+            Ime::Preedit(text, cursor) if !text.is_empty() => {
+                let preedit = Some((text, cursor));
+                if self.preedit == preedit {
+                    return false;
+                }
+                self.preedit = preedit;
+            }
+            Ime::Commit(text) if !text.is_empty() => {
                 self.preedit = None;
                 self.editor.insert(&text, now);
             }
-            _ => self.preedit = None,
+            _ => return self.preedit.take().is_some(),
         }
         self.touched(now);
+        true
     }
 
     /// Scrolls by wheel or trackpad input. Shift turns vertical wheel motion horizontal.
@@ -1377,4 +1387,48 @@ impl EditorView {
 fn line_range(doc: &Rope, at: usize) -> Range<usize> {
     let span = doc.line_span(doc.byte_to_line(at));
     span.start..span.next
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::SUMI;
+    use fude_buffer::Format;
+
+    /// Input methods send empty updates freely (KWin answers every caret move with one).
+    /// They mustn't pull a scrolled view back to the caret, or ask for a redraw.
+    #[test]
+    fn empty_ime_updates_leave_the_scroll_alone() {
+        let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let editor = Editor::new(Rope::from(text.as_bytes()), Format::default());
+        let mut view = EditorView::new(editor);
+        let mut p = Painter::new(&SUMI);
+        let (area, now) = (Rect::new(0, 0, 800, 600), Instant::now());
+        p.begin(1.0);
+        view.draw(&mut p, area, now);
+        let none = Modifiers::default();
+        view.scroll(&mut p, 0.0, 30.0, ScrollUnit::Lines, none);
+        let scrolled = view.scroll_position();
+        assert!(scrolled.0 > 50.0, "scrolled well past the caret: {scrolled:?}");
+
+        for ime in [
+            Ime::Enabled,
+            Ime::Preedit(String::new(), None),
+            Ime::Commit(String::new()),
+            Ime::Disabled,
+        ] {
+            assert!(!view.ime(ime, now), "nothing to redraw");
+            p.begin(1.0);
+            view.draw(&mut p, area, now);
+            assert_eq!(view.scroll_position(), scrolled);
+        }
+
+        // Composing does bring the caret back, like typing.
+        assert!(view.ime(Ime::Preedit("か".into(), None), now));
+        assert!(!view.ime(Ime::Preedit("か".into(), None), now), "the same again");
+        p.begin(1.0);
+        view.draw(&mut p, area, now);
+        assert_eq!(view.scroll_position().0, 0.0);
+        assert!(view.ime(Ime::Preedit(String::new(), None), now), "composition ends");
+    }
 }

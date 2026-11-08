@@ -24,6 +24,18 @@ pub enum InputKey {
     Ignored,
 }
 
+/// What an input method event did to a text field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImeChange {
+    /// Nothing: input methods send empty updates freely (KWin answers every caret move
+    /// with one).
+    Nothing,
+    /// The composition shown at the caret changed.
+    Preedit,
+    /// Text was committed into the field.
+    Text,
+}
+
 pub struct TextInput {
     pub editor: Editor,
     scroll_x: f32,
@@ -159,21 +171,22 @@ impl TextInput {
         }
     }
 
-    pub fn ime(&mut self, ime: Ime, now: Instant) -> bool {
+    pub fn ime(&mut self, ime: Ime, now: Instant) -> ImeChange {
         match ime {
             Ime::Preedit(text, _) if !text.is_empty() => {
+                if self.preedit.as_ref() == Some(&text) {
+                    return ImeChange::Nothing;
+                }
                 self.preedit = Some(text);
-                false
+                ImeChange::Preedit
             }
-            Ime::Commit(text) => {
+            Ime::Commit(text) if !text.is_empty() => {
                 self.preedit = None;
                 self.paste(&text, now);
-                true
+                ImeChange::Text
             }
-            _ => {
-                self.preedit = None;
-                false
-            }
+            _ if self.preedit.take().is_some() => ImeChange::Preedit,
+            _ => ImeChange::Nothing,
         }
     }
 

@@ -11,7 +11,7 @@ use fude_editor::Query;
 use fude_platform::{Ime, Key, KeyInput, Modifiers};
 use fude_render::Rect;
 
-use crate::input::{InputKey, TextInput, button};
+use crate::input::{ImeChange, InputKey, TextInput, button};
 use crate::painter::Painter;
 
 /// What the bar asks the app to do.
@@ -204,12 +204,11 @@ impl FindBar {
 
     pub fn ime(&mut self, ime: Ime, now: Instant) -> Option<FindAction> {
         let field = self.focus;
-        let changed = self.focused_input().ime(ime, now);
-        Some(if changed && field == FindField::Find {
-            FindAction::QueryChanged
-        } else {
-            FindAction::Redraw
-        })
+        match self.focused_input().ime(ime, now) {
+            ImeChange::Nothing => None,
+            ImeChange::Text if field == FindField::Find => Some(FindAction::QueryChanged),
+            _ => Some(FindAction::Redraw),
+        }
     }
 
     pub fn paste(&mut self, text: &str, now: Instant) -> FindAction {
