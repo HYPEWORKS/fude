@@ -4,7 +4,7 @@
 
 A cross-platform text editor that sits between Notepad and Notepad++. It should start instantly, respond instantly at any file size, use little memory, and look and feel polished on every platform.
 
-> Status: phase 2 (a basic editor) done. Next: phase 3, core features. Last updated 2026-11-08.
+> Status: phase 3 (core features) done. Next: phase 4, large files. Last updated 2026-11-08.
 
 ---
 
@@ -31,15 +31,15 @@ A cross-platform text editor that sits between Notepad and Notepad++. It should 
 
 | Metric | Target | Measured |
 |---|---|---|
-| Launch → first frame, warm cache | < 40 ms | 10.5 ms median (Linux, X11) |
+| Launch → first frame, warm cache | < 40 ms | 10.6 ms median (Linux, X11); a launch that hands its files to a running fude exits in under 10 ms |
 | Launch → first frame, cold | < 150 ms | |
 | Open a 500 MB file → first screen | < 100 ms | 190 ms, loading synchronously (background loading is phase 4) |
 | Open a 500 MB file → fully loaded and editable | < 1 s (SSD or warm cache) | 141 ms |
-| Keypress → frame submitted | < 4 ms of fude's own work | 0.6 ms at 1080p, 1.4 ms at 4K (edit plus a full redraw); the same in a 500 MB file |
-| Idle RAM, empty document, 1080p | < 30 MB | 13.1 MB (Linux, X11) |
+| Keypress → frame submitted | < 4 ms of fude's own work | 0.3 ms at 1080p, 1.1 ms at 4K (edit plus a full redraw, with syntax colors); file size doesn't change it |
+| Idle RAM, empty document, 1080p | < 30 MB | 14.5 MB (Linux, X11) |
 | RAM for an open, unedited file | ≈ 1.1 × file size | 1.04 × |
 | Idle CPU | 0 % | 0 CPU ticks over 5 s once the caret stops blinking (10 s after input) |
-| Release binary | < 10 MB | 6.4 MB (Linux x86-64; encodings added 0.3 MB in phase 1, font fallback, clipboard and file dialogs 1.1 MB in phase 2) |
+| Release binary | < 10 MB | 9.2 MB (Linux x86-64): encodings added 0.3 MB in phase 1; font fallback, clipboard and file dialogs 1.1 MB in phase 2; syntax highlighting (syntect and its grammars) 2.4 MB and search 0.4 MB in phase 3. Little room is left. |
 
 Measurements are from a fast desktop (32 threads, NVMe, warm page cache): startup with `cargo xtask bench-startup` under Xvfb, the buffer with `cargo run --release -p fude-buffer --example bench` on a generated 500 MB log, keystrokes with `fude --bench-typing`. They are a best case; laptops and Wayland/Windows/macOS numbers come next.
 
@@ -221,21 +221,22 @@ UI thread (winit event loop)                         Worker pool
 - **Motions follow the platform:** Ctrl+Right moves to the start of the next word on Windows and Linux, Option+Right to the end of the word on macOS; Cmd+arrows go to line and document ends on macOS. Home toggles between the first non-blank character and the line start. Enter keeps the line's indentation.
 - **Everything is a named command** (`edit.duplicate_line`, `view.toggle_wrap`, …). Keybindings, menus and the command palette are front-ends that invoke commands with arguments.
 - **Fault isolation:** event handling runs inside `catch_unwind`. A bug in a feature shows an error in the status bar instead of losing unsaved text.
-- **Hot exit and crash recovery:** unsaved documents are backed up to a session directory in the background and restored on next launch along with tabs and cursor positions.
+- **Hot exit and crash recovery:** two seconds after anything changes, a worker writes the session (`session.toml`: tabs, files, cursors, scroll positions, formats) to the state directory, plus the text of each document with unsaved changes (`backups/`, only those whose version changed, with the same safe save as documents). With hot exit on (the default), quitting writes it right away and exits without asking; the next launch restores everything, unsaved changes included. After a crash, the last write (at most two seconds old) is restored the same way.
 - **Unicode:** cursor movement steps over grapheme clusters; an invalid byte is one step.
 
 ## 12. Syntax highlighting (`fude-syntax`)
 
-- **Line-state model** (like Sublime and Scintilla): the lexer state is saved every ~128 lines. Highlighting starts from the nearest checkpoint above the viewport. After an edit, re-lex until the state matches the old checkpoint, then stop.
-- **Engine:** `syntect` (Sublime syntax definitions, wide language coverage, pure Rust via `fancy-regex`). Grammars are precompiled into the binary and loaded lazily per language.
+- **On a worker:** the UI sends a snapshot and the lines it shows (plus a 60-line margin) whenever its colors are missing or stale, draws plain text meanwhile, and redraws when the worker's reply wakes it (usually within a frame). Requests that pile up for one document collapse to the newest. The UI never lexes.
+- **Line-state model** (like Sublime and Scintilla): the lexer state is saved every 64 lines. Highlighting starts from the nearest checkpoint above the viewport. An edit drops the checkpoints below the first changed line; undo and redo drop all of them (re-lexed in the background).
+- **Engine:** `syntect` with its 75 bundled Sublime grammars, pure Rust via `fancy-regex`. Grammars load on the worker at first use (0.3 ms) and compile their regexes per language. Lexing runs at about 23,000 lines/s, so a screen is about 2.6 ms: fine on a worker, not on the UI thread. The grammar is chosen by file extension, then by the first line (shebangs). Scopes map to a dozen styles (comment, string, keyword, function, type…) that each theme colors.
 - **Jumping deep into a large file:** lex from a guessed resync point ~1,000 lines above the viewport for colors that are immediately (usually) right; a background pass corrects them.
-- **Size thresholds:** above a configurable size, highlighting covers only the viewport; above a higher one, it is off.
+- **Size thresholds:** files up to 16 MB get a background pass that lexes the whole file into exact checkpoints; larger ones are highlighted around the viewport only (from a resync point when needed). Lines over 10 KB, or that aren't valid UTF-8, aren't highlighted.
 - **Why not tree-sitter:** it parses the whole file up front, and each grammar adds hundreds of KB to several MB to the binary. The `Highlighter` trait leaves room to add it later for structure features like folding.
 
 ## 13. Search
 
-- **Engine:** the `regex` crate (linear time, so no pathological pattern can hang the editor), run directly over rope chunks through `regex-cursor`'s cursor trait. Replace supports `$1`-style groups. Patterns that need lookaround or backreferences can fall back to `fancy-regex`.
-- **Incremental:** the viewport is searched first; the rest of the document streams from a worker and can be cancelled. The match count fills in progressively.
+- **Engine:** the `regex` crate (linear time, so no pathological pattern can hang the editor), run over the rope through `regex-cursor`. The engine needs chunks that never split a UTF-8 character, which rope leaves don't promise, so the cursor serves 64 KB windows whose edges move back onto character starts. Queries are literal unless regex is on, case-insensitive unless asked, with `^`/`$` at line breaks (CRLF-aware). Whole word adds `\b` at word-character edges. Replace expands `$1`-style groups for regex queries.
+- **Incremental:** typing in the find bar jumps to the first match from where the search started, and the visible matches are highlighted every frame (searching only the visible range). Counting all matches ("3 of 120") runs on a worker over a snapshot; a new query cancels it at its next window, and edits recount, one count at a time. Replace All computes every replacement on a worker and applies them as one undo step if the document hasn't changed meanwhile.
 - **Find in files (v1.x):** ripgrep's `ignore` and `grep-searcher` crates.
 
 ## 14. Extensibility
@@ -263,13 +264,17 @@ No plugin API in v1. Extensibility comes in three layers:
 
 | | Windows | macOS | Linux | BSD |
 |---|---|---|---|---|
-| Window and input | winit | winit | winit (X11 + Wayland, loaded at runtime) | winit |
+| Window and input | winit | winit | winit (X11 + Wayland, loaded at runtime); file drops on Wayland by fude | winit |
 | Font lookup | DirectWrite | CoreText | fontconfig | fontconfig |
 | File dialogs | IFileDialog | NSOpenPanel | XDG portal, with fallback | XDG portal, with fallback |
 | Menus | in-window | native menu bar | in-window | in-window |
-| Single instance | named pipe | OS open-file events | Unix socket | Unix socket |
+| Single instance | loopback TCP + token | loopback TCP + token (Finder open events: later) | loopback TCP + token | loopback TCP + token |
 
-Single instance: opening a file while fude is running sends it to the existing window as a new tab, so no second process starts.
+Launching from a terminal (stdin is one, on Unix) starts the window as a background process in its own process group, with its output in `fude.log` in the state directory, and returns the terminal at once, like `code`. `--wait` keeps it in the foreground (and in a new instance) for tools that wait for the editor to exit, such as git.
+
+File drops: winit handles them on X11, Windows and macOS but not on Wayland, so fude listens itself there: it opens its own event queue on winit's Wayland connection, binds the seat's data device, accepts drags offering `text/uri-list` as copies, and reads the list on a helper thread. It's the one place fude shares a pointer with winit (`unsafe`, in one module).
+
+Single instance: opening a file while fude is running sends it to the existing window as a new tab, and the new process exits before creating a window. The running instance listens on a loopback port and writes the port and a random token to a file in the state directory that only the user can read; a launch connects, sends the token and its files' absolute paths (as hex of their native bytes, so any path survives), and exits on the acknowledgement. If nothing answers, it becomes the instance. One mechanism, standard library only, on every platform. `--new-instance` opts out.
 
 ## 16. Testing and benchmarks
 
@@ -279,7 +284,7 @@ Single instance: opening a file while fude is running sends it to the existing w
 - **RAM:** peak and idle RSS measured for an empty document and for the large-file corpus.
 - **Large-file corpus,** generated by a script rather than committed: a 500 MB log, a 100 MB single-line JSON file, UTF-16 and Shift-JIS files, invalid UTF-8, mixed line endings.
 - **Micro benchmarks** for rope edits, line lookups, layout and search.
-- **UI test:** `cargo xtask ui-test` drives the real window through X11 (XTest) under Xvfb: typing, mouse selection, clipboard, undo, saving and the unsaved-changes prompt, checking the file each step saves. Runs in CI on every push.
+- **UI test:** `cargo xtask ui-test` drives the real window through X11 (XTest) under Xvfb and checks the files it saves: typing, mouse selection, clipboard, undo, the unsaved-changes prompt, find and replace, tabs, go to line, the command palette, word wrap, hot exit, single instance, and recovery after the process is killed (17 checks). It uses its own settings and state directories. Runs in CI on every push.
 - **Keystroke latency:** `fude --bench-typing` times an edit plus a full frame per key, without a window.
 - **CI:** Windows, macOS and Linux; a FreeBSD build in a VM. Budget regressions fail the build.
 
@@ -379,4 +384,12 @@ Each is evaluated for startup, RAM and binary size when introduced, and pinned t
 | 2026-11-08 | `arboard` for the clipboard (data-control on Wayland, X11 otherwise) and `rfd` for file dialogs, both created on first use. |
 | 2026-11-08 | "Save changes?" and similar questions are drawn in the window, not native message boxes: consistent look, keyboard-first, no zenity/kdialog dependency on Linux. |
 | 2026-11-08 | The caret blinks for 10 s after input, then stays solid, so an idle window sets no timers. |
+| 2026-11-08 | Syntax highlighting on a worker thread only; the UI draws plain text until colors arrive. syntect with `fancy-regex` (pure Rust) over Oniguruma, which is faster but adds a C dependency to every platform's build. |
+| 2026-11-08 | Search windows of 64 KB moved onto character boundaries, so `regex-cursor` gets UTF-8-safe chunks (and Unicode word boundaries work) without the rope having to guarantee them. |
+| 2026-11-08 | Single instance over loopback TCP with a token file, on every platform, instead of a named pipe, Unix socket and Apple events: one code path, standard library only. |
+| 2026-11-08 | Hot exit on by default; the session is written two seconds after changes, so it doubles as crash recovery. |
+| 2026-11-08 | Word wrap keeps the scroll position as a line plus a fraction of its rows, so scrolling only lays out the lines it passes; the scrollbar stays line-based. Continuation rows keep the line's indentation. |
+| 2026-11-08 | Find bar docked at the bottom of the editor (like Sublime), so it never covers the text being searched. |
+| 2026-11-08 | Launching from a terminal detaches (new process group, output to a log) and returns the terminal; `--wait` opts out, for git. |
+| 2026-11-08 | Wayland file drops through the core data device protocol on winit's own connection, until winit supports them. |
 | 2026-11-08 | Full redraws every frame for now: 0.6 ms at 1080p, 1.4 ms at 4K including the edit. Damage tracking waits until something needs it. |

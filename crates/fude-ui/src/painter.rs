@@ -82,6 +82,22 @@ impl Painter {
         w
     }
 
+    /// `s`, cut short with an ellipsis if it is wider than `max_w`.
+    pub fn fit(&mut self, s: &str, style: &TextStyle, max_w: f32) -> String {
+        if self.measure(s, style) <= max_w {
+            return s.to_owned();
+        }
+        let mut chars: Vec<char> = s.chars().collect();
+        while !chars.is_empty() {
+            chars.pop();
+            let candidate: String = chars.iter().collect::<String>() + "…";
+            if self.measure(&candidate, style) <= max_w {
+                return candidate;
+            }
+        }
+        "…".to_owned()
+    }
+
     /// The baseline that vertically centers `style`'s line box in `height` pixels at `top`.
     pub fn center_baseline(&self, top: i32, height: i32, style: &TextStyle) -> i32 {
         let m = self.metrics(style);

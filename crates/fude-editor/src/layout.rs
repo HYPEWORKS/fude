@@ -9,6 +9,29 @@ pub trait Layout {
     fn x_of(&mut self, text: &Rope, line: usize, at: usize) -> f32;
     /// The grapheme boundary on `line` nearest to `x`.
     fn offset_at(&mut self, text: &Rope, line: usize, x: f32) -> usize;
+
+    /// Moves `rows` rows down (up if negative) from `at`, aiming for `goal_x` (or `at`'s
+    /// own x). Returns the new offset and the goal to keep. Past the first row the result
+    /// is the start of the text; past the last, the end. The default treats every line as
+    /// one row; a view that wraps lines overrides it.
+    fn vertical(
+        &mut self,
+        text: &Rope,
+        at: usize,
+        goal_x: Option<f32>,
+        rows: isize,
+    ) -> (usize, Option<f32>) {
+        let line = text.byte_to_line(at);
+        let goal = goal_x.unwrap_or_else(|| self.x_of(text, line, at));
+        let to = line as isize + rows;
+        if to < 0 {
+            (0, None)
+        } else if to as usize >= text.line_count() {
+            (text.len(), None)
+        } else {
+            (self.offset_at(text, to as usize, goal), Some(goal))
+        }
+    }
 }
 
 /// One unit per grapheme cluster or invalid byte, with tab stops: for tests and anything

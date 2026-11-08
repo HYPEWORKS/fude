@@ -33,6 +33,9 @@ const HOME: u32 = 0xff50;
 const END: u32 = 0xff57;
 const SHIFT: u32 = 0xffe1;
 const CONTROL: u32 = 0xffe3;
+const ALT: u32 = 0xffe9;
+const TAB: u32 = 0xff09;
+const DOWN: u32 = 0xff54;
 
 /// Layout at scale 1 with a 14 px font: where line `n` (0-based) and column `c` are.
 const TAB_STRIP: i16 = 36;
@@ -145,6 +148,32 @@ fn shot(window: Window, name: &str) {
     }
 }
 
+/// Waits up to 10 s for a window whose title mentions `name`.
+fn wait_window(conn: &RustConnection, root: Window, name: &str) -> Option<Window> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(w) = find_window(conn, root, name) {
+            return Some(w);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits up to 3 s for a process to exit; returns whether it did.
+fn exits(child: &mut Child) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return true;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 struct App(Child);
 
 impl Drop for App {
@@ -160,11 +189,25 @@ pub fn run(exe: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let file: PathBuf = dir.join("ui-test.txt");
     std::fs::write(&file, "first line\nsecond line\n").map_err(|e| e.to_string())?;
+    // One long line, for word wrap.
+    let wrap_file: PathBuf = dir.join("wrap-test.txt");
+    let long_line = "word ".repeat(60);
+    std::fs::write(&wrap_file, &long_line).map_err(|e| e.to_string())?;
+
+    // Phase 1 tests the unsaved-changes prompt, so hot exit is off.
+    let config_dir = dir.join("config").join("fude");
+    std::fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
+    std::fs::write(config_dir.join("fude.toml"), "hot_exit = false\n")
+        .map_err(|e| e.to_string())?;
 
     let (conn, screen) = x11rb::connect(None).map_err(|e| format!("no X server: {e}"))?;
     let root = conn.setup().roots[screen].root;
     let mut app = App(Command::new(exe)
+        .arg(&wrap_file)
         .arg(&file)
+        // Its own settings and session, so the user's don't change what's tested.
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_STATE_HOME", dir.join("state"))
         .spawn()
         .map_err(|e| format!("launching {}: {e}", exe.display()))?);
 
@@ -277,6 +320,64 @@ pub fn run(exe: &Path) -> Result<(), String> {
         "first\nX line\nadded line",
     ));
 
+    d.ctrl('h')?;
+    d.type_text("line")?;
+    d.key(&[], TAB)?;
+    d.type_text("row")?;
+    shot(window, "find");
+    d.key(&[CONTROL, ALT], RETURN)?;
+    sleep(Duration::from_millis(300));
+    d.key(&[], ESCAPE)?;
+    d.ctrl('s')?;
+    failures += usize::from(!check("replace all (Ctrl+H)", "first\nX row\nadded row"));
+
+    d.ctrl('n')?;
+    d.type_text("scratch")?;
+    d.ctrl('w')?;
+    sleep(Duration::from_millis(200));
+    d.type_text("d")?;
+    d.key(&[CONTROL], END)?;
+    d.type_text("!")?;
+    d.ctrl('s')?;
+    failures += usize::from(!check(
+        "a new tab closes without saving, back to the file's tab",
+        "first\nX row\nadded row!",
+    ));
+
+    d.ctrl('g')?;
+    d.type_text("2")?;
+    d.key(&[], RETURN)?;
+    d.type_text("Z")?;
+    d.ctrl('s')?;
+    failures += usize::from(!check("go to line (Ctrl+G)", "first\nZX row\nadded row!"));
+
+    d.key(&[CONTROL, SHIFT], 'p' as u32)?;
+    d.type_text("sel all")?;
+    shot(window, "palette");
+    d.key(&[], RETURN)?;
+    d.type_text("fin")?;
+    d.ctrl('s')?;
+    failures += usize::from(!check("command palette: Select All, then type", "fin"));
+
+    // Word wrap: Down from the start of a long line stays in it, on its second row.
+    d.ctrl('1')?;
+    d.key(&[ALT], 'z' as u32)?;
+    d.key(&[CONTROL], HOME)?;
+    d.key(&[], DOWN)?;
+    d.type_text("X")?;
+    d.ctrl('s')?;
+    let wrapped = std::fs::read_to_string(&wrap_file).unwrap_or_default();
+    let x = wrapped.find('X');
+    let ok = x.is_some_and(|i| i > 0 && i + 1 < wrapped.len() && wrapped[..i].ends_with(' '))
+        && wrapped.replace('X', "") == long_line;
+    if ok {
+        println!("  ✓ word wrap (Alt+Z): Down moves to the next row of a long line");
+    } else {
+        println!("  ✗ word wrap: X landed at {x:?} in {wrapped:?}");
+        failures += 1;
+    }
+    d.ctrl('2')?;
+
     d.key(&[], RETURN)?;
     d.type_text("unsaved")?;
     d.ctrl('q')?;
@@ -309,10 +410,82 @@ pub fn run(exe: &Path) -> Result<(), String> {
         println!("  ✗ the app didn't quit after \"Don't Save\"");
         failures += 1;
     }
-    failures += usize::from(!check(
-        "the unsaved edit was not written",
-        "first\nX line\nadded line",
-    ));
+    failures += usize::from(!check("the unsaved edit was not written", "fin"));
+
+    // Phase 2: hot exit and single instance, with a fresh session.
+    std::fs::write(config_dir.join("fude.toml"), "hot_exit = true\n").map_err(|e| e.to_string())?;
+    let launch = |args: &[&Path]| -> Result<Child, String> {
+        Command::new(exe)
+            .args(args)
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("XDG_STATE_HOME", dir.join("state2"))
+            .spawn()
+            .map_err(|e| format!("launching {}: {e}", exe.display()))
+    };
+    let mut d = d;
+    let focus = |d: &mut Driver, name: &str| -> Result<(), String> {
+        let w = wait_window(&d.conn, d.root, name).ok_or(format!("no window for {name}"))?;
+        sleep(Duration::from_millis(300));
+        d.window = w;
+        d.conn
+            .set_input_focus(x11rb::protocol::xproto::InputFocus::PARENT, w, 0u32)
+            .map_err(|e| e.to_string())?;
+        d.sync()
+    };
+    let mut second = App(launch(&[&file])?);
+    focus(&mut d, "ui-test.txt")?;
+    d.key(&[CONTROL], END)?;
+    d.type_text("#")?;
+    d.ctrl('q')?;
+    if exits(&mut second.0) {
+        println!("  ✓ with hot exit, quitting doesn't ask");
+    } else {
+        println!("  ✗ with hot exit, the app didn't quit");
+        failures += 1;
+    }
+
+    let mut third = App(launch(&[])?);
+    focus(&mut d, "ui-test.txt")?;
+    let other = dir.join("other.txt");
+    std::fs::write(&other, "other\n").map_err(|e| e.to_string())?;
+    let mut handed = launch(&[&other])?;
+    let handed_ok = exits(&mut handed) && handed.wait().is_ok_and(|s| s.success());
+    let switched = wait_window(&d.conn, d.root, "other.txt").is_some();
+    if handed_ok && switched {
+        println!("  ✓ a second launch hands its file to the running window and exits");
+    } else {
+        println!(
+            "  ✗ single instance: second launch exited {handed_ok}, window switched {switched}"
+        );
+        failures += 1;
+    }
+    // Back to the restored file, which should still have its unsaved edit; save it.
+    focus(&mut d, "other.txt")?;
+    d.key(&[CONTROL, SHIFT], TAB)?;
+    d.ctrl('s')?;
+    failures += usize::from(!check("unsaved changes come back after hot exit", "fin#"));
+
+    // A crash: the session written in the background a moment after typing survives it.
+    d.ctrl('2')?;
+    d.type_text("@")?;
+    sleep(Duration::from_millis(3500));
+    let _ = third.0.kill();
+    let _ = third.0.wait();
+    let mut fourth = App(launch(&[])?);
+    focus(&mut d, "other.txt")?;
+    d.ctrl('s')?;
+    let recovered = std::fs::read_to_string(&other).unwrap_or_default();
+    if recovered == "@other\n" {
+        println!("  ✓ unsaved typing survives a crash (killed 3.5 s after typing)");
+    } else {
+        println!("  ✗ after a crash, other.txt saved as {recovered:?}");
+        failures += 1;
+    }
+    d.ctrl('q')?;
+    if !exits(&mut fourth.0) {
+        println!("  ✗ the recovered app didn't quit");
+        failures += 1;
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
     if failures > 0 {

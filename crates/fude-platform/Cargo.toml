@@ -14,5 +14,10 @@ softbuffer.workspace = true
 arboard.workspace = true
 rfd.workspace = true
 
+# Drag and drop on Wayland, which winit doesn't do: shares winit's connection.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wayland-client = "0.31.15"
+wayland-backend = { version = "0.3.17", default-features = false, features = ["client_system", "dlopen"] }
+
 [lints]
 workspace = true

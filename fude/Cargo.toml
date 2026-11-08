@@ -14,6 +14,8 @@ fude-text.workspace = true
 fude-platform.workspace = true
 fude-editor.workspace = true
 fude-ui.workspace = true
+fude-syntax.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

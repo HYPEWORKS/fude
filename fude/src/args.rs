@@ -4,9 +4,12 @@ use std::path::PathBuf;
 pub const USAGE: &str = "\
 fude: Fast, Uncomplicated Document Editor
 
-Usage: fude [OPTIONS] [FILE]
+Usage: fude [OPTIONS] [FILE]...
 
 Options:
+  -w, --wait             Stay in the terminal until the window closes, in a window of its
+                         own (for git: core.editor = 'fude --wait')
+  -n, --new-instance     Open a new window instead of handing the files to a running fude
   -h, --help             Print help
   -V, --version          Print version
 
@@ -33,8 +36,13 @@ pub enum Mode {
 #[derive(Debug, PartialEq)]
 pub struct Args {
     pub mode: Mode,
-    pub file: Option<PathBuf>,
+    pub files: Vec<PathBuf>,
     pub bench_startup: bool,
+    pub new_instance: bool,
+    /// Stay in the foreground (don't detach from the terminal), in a new instance.
+    pub wait: bool,
+    /// Internal: this process was started detached by a launch from a terminal.
+    pub detached: bool,
     pub size: (u32, u32),
     pub scale: f32,
 }
@@ -42,8 +50,11 @@ pub struct Args {
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
     let mut out = Args {
         mode: Mode::Window,
-        file: None,
+        files: Vec::new(),
         bench_startup: false,
+        new_instance: false,
+        wait: false,
+        detached: false,
         size: (1280, 800),
         scale: 1.0,
     };
@@ -56,6 +67,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
             Some("-h" | "--help") => out.mode = Mode::Help,
             Some("-V" | "--version") => out.mode = Mode::Version,
             Some("--bench-startup") => out.bench_startup = true,
+            Some("-n" | "--new-instance") => out.new_instance = true,
+            Some("-w" | "--wait") => out.wait = true,
+            Some("--detached") => out.detached = true,
             Some("--bench-render") => out.mode = Mode::BenchRender,
             Some("--bench-typing") => out.mode = Mode::BenchTyping,
             Some("--screenshot") => out.mode = Mode::Screenshot(value("--screenshot")?.into()),
@@ -78,12 +92,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
             Some(f) if f.starts_with('-') && f.len() > 1 => {
                 return Err(format!("unknown option {f}"));
             }
-            _ => {
-                if out.file.is_some() {
-                    return Err("only one file can be opened for now".into());
-                }
-                out.file = Some(arg.into());
-            }
+            _ => out.files.push(arg.into()),
         }
     }
     Ok(out)
@@ -108,7 +117,7 @@ mod tests {
         let a = p(&[]).unwrap();
         assert_eq!(a.mode, Mode::Window);
         assert_eq!(a.size, (1280, 800));
-        assert_eq!(a.file, None);
+        assert!(a.files.is_empty());
     }
 
     #[test]
@@ -125,14 +134,14 @@ mod tests {
         assert_eq!(a.size, (3840, 2160));
         assert_eq!(a.scale, 2.0);
         assert!(a.bench_startup);
-        assert_eq!(a.file, Some(PathBuf::from("notes.txt")));
+        assert_eq!(a.files, [PathBuf::from("notes.txt")]);
     }
 
     #[test]
     fn double_dash_allows_dash_filenames() {
         assert_eq!(
-            p(&["--", "-weird.txt"]).unwrap().file,
-            Some(PathBuf::from("-weird.txt"))
+            p(&["--", "-weird.txt", "b.txt"]).unwrap().files,
+            [PathBuf::from("-weird.txt"), PathBuf::from("b.txt")]
         );
     }
 
@@ -141,6 +150,5 @@ mod tests {
         assert!(p(&["--size", "big"]).is_err());
         assert!(p(&["--scale"]).is_err());
         assert!(p(&["--nope"]).is_err());
-        assert!(p(&["a.txt", "b.txt"]).is_err());
     }
 }

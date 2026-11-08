@@ -10,6 +10,13 @@ use crate::{Format, Rope};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Version(u64);
 
+impl Version {
+    /// The number behind the version, for tagging work sent to other threads.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// An immutable copy of a buffer's state, cheap to make (O(1)) and to send to a worker.
 #[derive(Clone, Debug)]
 pub struct Snapshot {

@@ -4,11 +4,13 @@
 
 mod editor;
 mod layout;
+pub mod search;
 mod selection;
 pub mod text;
 
 pub use editor::{Editor, Motion, Settings};
 pub use layout::{Layout, MonoLayout, nearest};
+pub use search::{Query, Searcher};
 pub use selection::{Selection, Selections};
 pub use text::WordStop;
 

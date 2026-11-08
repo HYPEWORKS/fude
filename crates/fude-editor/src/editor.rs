@@ -3,7 +3,7 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use fude_buffer::{Buffer, Edit, Format, LineEnding, Rope, Version};
+use fude_buffer::{Bias, Buffer, Edit, Format, LineEnding, Rope, Version, map_offset};
 
 use crate::layout::Layout;
 use crate::selection::{Selection, Selections};
@@ -80,6 +80,8 @@ pub struct Editor {
     /// What the last copy of whole lines (copy with nothing selected) put on the clipboard,
     /// so pasting it inserts whole lines.
     line_copy: Option<String>,
+    /// The earliest offset changed since [`Editor::take_changed`] was last called.
+    changed_from: Option<usize>,
     pub settings: Settings,
 }
 
@@ -90,6 +92,7 @@ impl Editor {
             selections: Selections::single(Selection::cursor(0)),
             last_edit: None,
             line_copy: None,
+            changed_from: None,
             settings: Settings::default(),
         }
     }
@@ -126,7 +129,18 @@ impl Editor {
         });
         self.buffer.set_content(text, format, before, after.clone());
         self.selections = after;
+        self.mark_changed(0);
         self.seal();
+    }
+
+    /// The earliest byte offset changed since the last call (for re-highlighting from
+    /// there), or `None` if nothing changed.
+    pub fn take_changed(&mut self) -> Option<usize> {
+        self.changed_from.take()
+    }
+
+    fn mark_changed(&mut self, from: usize) {
+        self.changed_from = Some(self.changed_from.map_or(from, |c| c.min(from)));
     }
 
     /// Replaces the selections (mouse selection, select all). Ends the current undo step.
@@ -139,6 +153,35 @@ impl Editor {
     pub fn seal(&mut self) {
         self.last_edit = None;
         self.buffer.seal();
+    }
+
+    /// Selects `range` (a single selection, with the cursor at its end).
+    pub fn select(&mut self, range: Range<usize>) {
+        self.set_selections(Selections::single(Selection::new(range.start, range.end)));
+    }
+
+    /// Applies replacements (sorted, non-overlapping, in the current text's coordinates)
+    /// as one undo step. Selections follow the text around them.
+    pub fn apply_edits(&mut self, edits: &[(Range<usize>, Vec<u8>)]) {
+        if edits.is_empty() {
+            return;
+        }
+        let edits: Vec<Edit<'_>> = edits
+            .iter()
+            .map(|(r, t)| Edit::replace(r.clone(), t))
+            .collect();
+        let after = self.selections.map(|s| {
+            Selection::new(
+                map_offset(&edits, s.anchor, Bias::Before),
+                map_offset(&edits, s.head, Bias::After),
+            )
+        });
+        let from = edits[0].range.start;
+        self.buffer
+            .edit(&edits, self.selections.clone(), after.clone(), false);
+        self.selections = after;
+        self.mark_changed(from);
+        self.seal();
     }
 
     pub fn select_all(&mut self) {
@@ -279,6 +322,7 @@ impl Editor {
         match self.buffer.undo() {
             Some(selections) => {
                 self.selections = selections.clone();
+                self.mark_changed(0);
                 true
             }
             None => false,
@@ -290,6 +334,7 @@ impl Editor {
         match self.buffer.redo() {
             Some(selections) => {
                 self.selections = selections.clone();
+                self.mark_changed(0);
                 true
             }
             None => false,
@@ -474,6 +519,9 @@ impl Editor {
             .map(|r| Edit::replace(r.range.clone(), &r.text))
             .collect();
         let after = Selections::new(cursors, primary);
+        if let Some(first) = merged.first() {
+            self.mark_changed(first.range.start);
+        }
         self.buffer
             .edit(&edits, self.selections.clone(), after.clone(), merge);
         self.selections = after;
@@ -503,17 +551,8 @@ fn target(
     let head = s.head;
     let line = text.byte_to_line(head);
     let collapse = !extend && !s.is_empty();
-    let vertical = |layout: &mut dyn Layout, lines: isize| {
-        let goal = s.goal_x.unwrap_or_else(|| layout.x_of(text, line, head));
-        let to = line as isize + lines;
-        if to < 0 {
-            (0, None)
-        } else if to as usize >= text.line_count() {
-            (text.len(), None)
-        } else {
-            (layout.offset_at(text, to as usize, goal), Some(goal))
-        }
-    };
+    let vertical =
+        |layout: &mut dyn Layout, rows: isize| layout.vertical(text, head, s.goal_x, rows);
     match motion {
         Motion::Left if collapse => (s.start(), None),
         Motion::Right if collapse => (s.end(), None),

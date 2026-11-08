@@ -299,6 +299,15 @@ fn paste_converts_line_breaks() {
 }
 
 #[test]
+fn applying_many_edits_is_one_step() {
+    let mut e = editor("a-b-c|");
+    e.apply_edits(&[(1..2, b"+".to_vec()), (3..4, b"+".to_vec())]);
+    assert_eq!(show(&e), "a+b+c|");
+    e.undo();
+    assert_eq!(show(&e), "a-b-c|");
+}
+
+#[test]
 fn line_and_column() {
     let e = editor("ab\n\tc|d");
     assert_eq!(e.cursor_line_col(), (2, 6));

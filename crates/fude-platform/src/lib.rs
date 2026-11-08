@@ -10,6 +10,8 @@
 
 mod input;
 mod memory;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod wayland_dnd;
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -64,6 +66,20 @@ pub enum Ime {
     Disabled,
 }
 
+/// The OS's light or dark appearance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OsTheme {
+    Light,
+    Dark,
+}
+
+fn os_theme(theme: winit::window::Theme) -> OsTheme {
+    match theme {
+        winit::window::Theme::Light => OsTheme::Light,
+        winit::window::Theme::Dark => OsTheme::Dark,
+    }
+}
+
 /// Positions are physical pixels from the window's top left.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Event {
@@ -108,6 +124,11 @@ pub enum Event {
     Timer,
     /// Another thread called [`Waker::wake`].
     Wake,
+    ThemeChanged(OsTheme),
+    /// A file was dropped on the window.
+    DroppedFile(PathBuf),
+    /// Files are being dragged over the window (true), or the drag left or ended (false).
+    FileHover(bool),
 }
 
 /// Mouse pointer shapes.
@@ -177,6 +198,17 @@ impl Ctx<'_> {
 
     pub fn set_title(&self, title: &str) {
         self.window.set_title(title);
+    }
+
+    /// The OS's light or dark appearance, where the platform reports it.
+    pub fn os_theme(&self) -> Option<OsTheme> {
+        self.window.theme().map(os_theme)
+    }
+
+    /// Brings the window to the front (for example when another launch hands it a file).
+    pub fn focus_window(&self) {
+        self.window.set_minimized(false);
+        self.window.focus_window();
     }
 
     /// Delivers [`Event::Timer`] at `at` (replacing any earlier request), or cancels.
@@ -294,6 +326,9 @@ pub fn run<A: App>(options: WindowOptions, app: A) -> Result<(), PlatformError> 
         .map_err(|e| err("creating event loop", e))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut runner = Runner {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        dnd: None,
+        drops: std::sync::mpsc::channel(),
         app,
         options,
         win: None,
@@ -338,6 +373,14 @@ struct Click {
 }
 
 struct Runner<A> {
+    /// Wayland drag and drop (winit has none there). Dropped before the event loop ends.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    dnd: Option<wayland_dnd::WaylandDrop>,
+    /// Paths dropped on the window under Wayland, read on a helper thread.
+    drops: (
+        std::sync::mpsc::Sender<Vec<PathBuf>>,
+        std::sync::mpsc::Receiver<Vec<PathBuf>>,
+    ),
     app: A,
     options: WindowOptions,
     win: Option<WinState>,
@@ -373,6 +416,32 @@ impl<A: App> Runner<A> {
             window,
             surface_size: (0, 0),
         })
+    }
+
+    /// Listens for file drops under Wayland, sharing winit's connection.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn start_wayland_dnd(&mut self, window: &Window) {
+        use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+        let Ok(handle) = window.display_handle() else {
+            return;
+        };
+        let RawDisplayHandle::Wayland(wayland) = handle.as_raw() else {
+            return;
+        };
+        let proxy = self.shared.proxy.clone();
+        let proxy = std::sync::Mutex::new(proxy);
+        let wake = move || {
+            if let Ok(p) = proxy.lock() {
+                let _ = p.send_event(());
+            }
+        };
+        // SAFETY: the display is the event loop's own and lives until the loop ends; the
+        // drop handler is dropped in `exiting`, before that.
+        #[allow(unsafe_code)]
+        let dnd = unsafe {
+            wayland_dnd::WaylandDrop::new(wayland.display.as_ptr(), self.drops.0.clone(), wake)
+        };
+        self.dnd = dnd;
     }
 
     fn dispatch(&mut self, event_loop: &ActiveEventLoop, event: Event) {
@@ -490,7 +559,14 @@ impl<A: App> ApplicationHandler for Runner<A> {
         match self.create_window(event_loop) {
             Ok(win) => {
                 win.window.request_redraw();
+                let theme = win.window.theme();
+                #[cfg(all(unix, not(target_os = "macos")))]
+                self.start_wayland_dnd(&win.window);
                 self.win = Some(win);
+                // Before the first frame, so it's drawn in the right theme.
+                if let Some(theme) = theme {
+                    self.dispatch(event_loop, Event::ThemeChanged(os_theme(theme)));
+                }
             }
             Err(e) => {
                 self.error = Some(e);
@@ -500,7 +576,20 @@ impl<A: App> ApplicationHandler for Runner<A> {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
+        while let Ok(paths) = self.drops.1.try_recv() {
+            for path in paths {
+                self.dispatch(event_loop, Event::DroppedFile(path));
+            }
+        }
         self.dispatch(event_loop, Event::Wake);
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Our queue on winit's Wayland connection must go before the connection does.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            self.dnd = None;
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -528,6 +617,15 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 self.dispatch(event_loop, Event::ScaleChanged(scale_factor));
             }
             WindowEvent::Focused(focused) => self.dispatch(event_loop, Event::Focused(focused)),
+            WindowEvent::ThemeChanged(theme) => {
+                self.dispatch(event_loop, Event::ThemeChanged(os_theme(theme)));
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.dispatch(event_loop, Event::FileHover(false));
+                self.dispatch(event_loop, Event::DroppedFile(path));
+            }
+            WindowEvent::HoveredFile(_) => self.dispatch(event_loop, Event::FileHover(true)),
+            WindowEvent::HoveredFileCancelled => self.dispatch(event_loop, Event::FileHover(false)),
             WindowEvent::ModifiersChanged(m) => self.modifiers = input::modifiers(m.state()),
             WindowEvent::KeyboardInput { event, .. } => {
                 let key = input::key_input(&event, self.modifiers);
@@ -583,6 +681,12 @@ impl<A: App> ApplicationHandler for Runner<A> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some(dnd) = &mut self.dnd {
+            for wayland_dnd::DropEvent::Hover(on) in dnd.dispatch() {
+                self.dispatch(event_loop, Event::FileHover(on));
+            }
+        }
         self.check_timer(event_loop);
         event_loop.set_control_flow(match self.shared.timer {
             Some(at) => ControlFlow::WaitUntil(at),

@@ -13,6 +13,7 @@ fude-editor.workspace = true
 fude-render.workspace = true
 fude-text.workspace = true
 fude-platform.workspace = true
+fude-syntax.workspace = true
 
 [lints]
 workspace = true

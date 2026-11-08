@@ -1,49 +1,12 @@
-//! The window's chrome: the tab strip above the editor and the status bar below it.
+//! The status bar below the editor.
 
 use fude_render::Rect;
 
 use crate::painter::Painter;
 
-/// Logical heights.
-pub const TAB_STRIP_HEIGHT: f32 = 36.0;
+/// Logical height of the status bar.
 pub const STATUS_BAR_HEIGHT: f32 = 26.0;
 const CHROME_FONT: f32 = 13.0;
-
-/// One tab for now (tabs arrive in phase 3). A modified document shows a dot.
-pub fn tab_strip(p: &mut Painter, area: Rect, title: &str, modified: bool) {
-    let t = p.theme;
-    let style = p.style(CHROME_FONT);
-    p.rect(area, t.chrome_bg);
-    let pad = p.px(16.0);
-    let title_w = p.measure(title, &style).ceil() as i32;
-    let dot_w = if modified { p.px(14.0) } else { 0 };
-    let tab_w = (title_w + dot_w + pad * 2).max(p.px(120.0)).min(area.w);
-    p.rect(Rect::new(area.x, area.y, tab_w, area.h), t.editor_bg);
-    p.rect(Rect::new(area.x, area.y, tab_w, p.px(2.0)), t.accent);
-    p.rect(
-        Rect::new(
-            area.x + tab_w,
-            area.bottom() - p.px(1.0),
-            area.w - tab_w,
-            p.px(1.0),
-        ),
-        t.border,
-    );
-    let baseline = p.center_baseline(area.y, area.h, &style);
-    p.text(
-        title,
-        &style,
-        (area.x + pad) as f32,
-        baseline,
-        t.chrome_text,
-    );
-    if modified {
-        let d = p.px(7.0);
-        let x = area.x + pad + title_w + p.px(8.0);
-        let y = area.y + (area.h - d) / 2;
-        p.rect(Rect::new(x, y, d, d), t.chrome_text_muted);
-    }
-}
 
 /// A message shown in the status bar until replaced or dismissed.
 #[derive(Clone, Debug, PartialEq)]

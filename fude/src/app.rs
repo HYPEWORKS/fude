@@ -1,135 +1,299 @@
-//! The application: one document in one window, files, saving, prompts.
+//! The application: documents in tabs, input routing, drawing.
 
-use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use fude_buffer::{FileStamp, Format, LineEnding, Loaded, Rope, SaveError, Version};
-use fude_editor::Editor;
-use fude_platform::{Canvas, Ctx, CursorShape, Event, FileDialog, Key, KeyInput, Waker};
+use fude_editor::Selections;
+use fude_platform::{
+    Canvas, Ctx, CursorShape, Event, Key, KeyInput, MouseButton, OsTheme, ScrollUnit, Waker,
+};
 use fude_render::Rect;
 use fude_ui::{
-    Action, EditorView, Painter, Prompt, PromptInput, STATUS_BAR_HEIGHT, SUMI, StatusMessage,
-    TAB_STRIP_HEIGHT, action_for, status_bar, tab_strip,
+    Action, EditorView, FindBar, Painter, Palette, PaletteAction, PaletteItem, Prompt, PromptInput,
+    STATUS_BAR_HEIGHT, StatusMessage, TAB_STRIP_HEIGHT, TabEvent, TabInfo, TabStrip, action_for,
+    status_bar,
 };
+
+use crate::config::{self, Config};
+use crate::doc::{Doc, DocId, Then};
+use crate::find::FindState;
+use crate::instance;
+use crate::session::{self, Session, Tab};
+
+/// How long after a change the session (and unsaved text) is written.
+const SESSION_DELAY: Duration = Duration::from_secs(2);
+
+/// Lines highlighted beyond the visible ones, so short scrolls are already colored.
+const HIGHLIGHT_MARGIN: usize = 60;
+
+/// Where keys go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    Editor,
+    Find,
+    Palette,
+}
+
+/// Where the cursor was before a go-to-line preview, to go back on Escape.
+struct PaletteOrigin {
+    doc: DocId,
+    selections: Selections,
+    scroll: (f32, f32),
+}
 
 /// How long a status bar message stays.
 const MESSAGE_FOR: Duration = Duration::from_secs(4);
 
-pub struct Doc {
-    pub view: EditorView,
-    pub path: Option<PathBuf>,
-    /// The file as last read or written, to notice changes made by other programs.
-    stamp: Option<FileStamp>,
-    /// Saving would also change bytes the user didn't edit (the encoding can't represent
-    /// them exactly); asked about once before the first save.
-    inexact: bool,
-}
-
-impl Doc {
-    pub fn untitled() -> Doc {
-        let format = Format {
-            line_ending: LineEnding::PLATFORM,
-            ..Format::default()
-        };
-        Doc::new(Rope::new(), format, None)
-    }
-
-    pub fn new(text: Rope, format: Format, path: Option<PathBuf>) -> Doc {
-        Doc {
-            view: EditorView::new(Editor::new(text, format)),
-            path,
-            stamp: None,
-            inexact: false,
-        }
-    }
-
-    pub fn loaded(loaded: Loaded, path: PathBuf) -> Doc {
-        let mut doc = Doc::new(loaded.text, loaded.format, Some(path));
-        doc.stamp = loaded.stamp;
-        doc.inexact = !loaded.exact;
-        doc
-    }
-
-    pub fn name(&self) -> String {
-        match &self.path {
-            Some(p) => p.file_name().map_or_else(
-                || p.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            ),
-            None => "Untitled".to_owned(),
-        }
-    }
-
-    fn modified(&self) -> bool {
-        self.view.editor.buffer().is_modified()
-    }
-}
-
-/// What to do once unsaved changes are dealt with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Then {
-    New,
-    Open,
-    Quit,
-}
-
 /// Which question a prompt asks, and what happens after.
-enum Question {
+pub enum Question {
     /// Save, Don't Save, Cancel.
-    Unsaved(Then),
+    Unsaved(DocId, Then),
     /// Save as UTF-8, Cancel.
-    NotEncodable(Option<Then>),
+    NotEncodable(DocId, Option<Then>),
     /// Save, Cancel.
-    Inexact(Option<Then>),
+    Inexact(DocId, Option<Then>),
     /// Save As…, Cancel.
-    ReadOnly(Option<Then>),
+    ReadOnly(DocId, Option<Then>),
     /// Reload, Keep Mine.
-    ChangedOnDisk,
+    ChangedOnDisk(DocId),
     /// OK.
     Info,
 }
 
-struct SaveJob {
-    version: Version,
-    path: PathBuf,
-    then: Option<Then>,
-    result: mpsc::Receiver<Result<FileStamp, SaveError>>,
-}
-
 pub struct Fude {
-    pub doc: Doc,
+    pub docs: Vec<Doc>,
+    pub active: usize,
+    next_id: u64,
     pub painter: Painter,
-    prompt: Option<(Prompt, Question)>,
+    tabs: TabStrip,
+    pub prompt: Option<(Prompt, Question)>,
     message: Option<(StatusMessage, Instant)>,
-    saving: Option<SaveJob>,
-    waker: Option<Waker>,
+    pub waker: Option<Waker>,
     title: String,
-    /// Window size, physical pixels.
-    size: (u32, u32),
-    editor_rect: Rect,
+    /// Last pointer position, physical pixels.
+    pointer: (f32, f32),
+    pub config: Config,
+    pub find: FindBar,
+    pub find_state: FindState,
+    pub focus: Focus,
+    palette: Palette,
+    /// The action behind each palette item.
+    palette_actions: Vec<Action>,
+    palette_origin: Option<PaletteOrigin>,
+    /// Started on first use (it needs a waker), so startup doesn't pay for it.
+    highlighter: Option<fude_syntax::Highlighter>,
+    /// Where the session and backups live.
+    pub state_dir: Option<PathBuf>,
+    /// Other launches hand their files to this instance.
+    pub instance: Option<instance::Server>,
+    /// When to write the session next.
+    session_due: Option<Instant>,
+    /// What the session looked like when last written: tabs, versions, paths, active.
+    session_print: Vec<(u64, u64, Option<PathBuf>)>,
+    /// The version of each document whose unsaved text is in its backup.
+    backed_up: HashMap<DocId, u64>,
+    session_writing: Arc<AtomicBool>,
+    /// Files are being dragged over the window.
+    drop_hover: bool,
+    os_theme: Option<OsTheme>,
+    /// Zoom steps from the configured font size, for every document.
+    zoom: f32,
     pub last_frame: Duration,
 }
 
 impl Fude {
-    pub fn new(doc: Doc) -> Fude {
-        Fude {
-            doc,
-            painter: Painter::new(&SUMI),
+    pub fn new(config: Config) -> Fude {
+        let mut app = Fude {
+            docs: Vec::new(),
+            active: 0,
+            next_id: 0,
+            painter: Painter::new(config.theme(None)),
+            tabs: TabStrip::new(),
             prompt: None,
             message: None,
-            saving: None,
             waker: None,
             title: String::new(),
-            size: (0, 0),
-            editor_rect: Rect::default(),
+            pointer: (0.0, 0.0),
+            config,
+            find: FindBar::new(),
+            find_state: FindState::default(),
+            focus: Focus::Editor,
+            palette: Palette::new(),
+            palette_actions: Vec::new(),
+            palette_origin: None,
+            highlighter: None,
+            state_dir: None,
+            instance: None,
+            session_due: None,
+            session_print: Vec::new(),
+            backed_up: HashMap::new(),
+            session_writing: Arc::new(AtomicBool::new(false)),
+            drop_hover: false,
+            os_theme: None,
+            zoom: 0.0,
             last_frame: Duration::ZERO,
+        };
+        let id = app.new_id();
+        let mut doc = Doc::untitled(id);
+        app.configure(&mut doc.view);
+        app.docs.push(doc);
+        app
+    }
+
+    /// Applies settings and zoom to a view.
+    pub fn configure(&self, view: &mut EditorView) {
+        view.set_font_size(self.config.font_size + self.zoom);
+        view.editor.settings.tab_width = self.config.tab_width;
+        view.insert_spaces = self.config.insert_spaces;
+        view.wrap = self.config.word_wrap;
+    }
+
+    fn configure_all(&mut self) {
+        let mut docs = std::mem::take(&mut self.docs);
+        for doc in &mut docs {
+            self.configure(&mut doc.view);
+        }
+        self.docs = docs;
+    }
+
+    /// Re-reads the settings file and applies it.
+    pub fn reload_config(&mut self) {
+        let (config, problems) = Config::load();
+        self.config = config;
+        self.configure_all();
+        match problems.first() {
+            Some(p) => self.say(p.clone(), true),
+            None => self.say("Settings applied", false),
         }
     }
 
+    /// Opens the settings file, creating it with every default if it doesn't exist.
+    fn open_settings(&mut self) {
+        let Some(path) = config::config_path() else {
+            self.say("No settings directory on this system", true);
+            return;
+        };
+        if !path.exists() {
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, config::TEMPLATE));
+            if let Err(e) = written {
+                self.say(format!("Couldn't create {}: {e}", path.display()), true);
+                return;
+            }
+        }
+        self.open(&path);
+    }
+
+    pub fn new_id(&mut self) -> DocId {
+        self.next_id += 1;
+        DocId(self.next_id)
+    }
+
+    pub fn doc(&self) -> &Doc {
+        &self.docs[self.active]
+    }
+
+    pub fn doc_mut(&mut self) -> &mut Doc {
+        &mut self.docs[self.active]
+    }
+
+    pub fn index_of(&self, id: DocId) -> Option<usize> {
+        self.docs.iter().position(|d| d.id == id)
+    }
+
+    /// Adds a document as a new tab after the active one (or in place of a blank active
+    /// tab) and switches to it.
+    pub fn add_doc(&mut self, mut doc: Doc) {
+        self.configure(&mut doc.view);
+        if self.doc().is_blank() {
+            self.docs[self.active] = doc;
+        } else {
+            self.active += 1;
+            self.docs.insert(self.active, doc);
+        }
+        self.tabs.reveal_active();
+    }
+
+    pub fn new_doc(&mut self) {
+        let id = self.new_id();
+        let mut doc = Doc::untitled(id);
+        self.configure(&mut doc.view);
+        self.active = (self.active + 1).min(self.docs.len());
+        self.docs.insert(self.active, doc);
+        self.tabs.reveal_active();
+    }
+
+    pub fn activate(&mut self, index: usize) {
+        if index < self.docs.len() && index != self.active {
+            self.active = index;
+            self.tabs.reveal_active();
+            self.doc_mut().view.set_focused(true, Instant::now());
+        }
+    }
+
+    /// Removes a tab without asking. Closing the last tab leaves a new blank one.
+    pub fn remove_doc(&mut self, id: DocId) {
+        let Some(i) = self.index_of(id) else { return };
+        self.docs.remove(i);
+        if let Some(h) = &self.highlighter {
+            h.close(id.0);
+        }
+        if self.docs.is_empty() {
+            let id = self.new_id();
+            let mut doc = Doc::untitled(id);
+            self.configure(&mut doc.view);
+            self.docs.push(doc);
+        }
+        if i < self.active || self.active >= self.docs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        self.tabs.reveal_active();
+    }
+
     pub fn window_title(&self) -> String {
-        let dot = if self.doc.modified() { "• " } else { "" };
-        format!("{dot}{} · fude", self.doc.name())
+        let doc = self.doc();
+        let dot = if doc.modified() { "• " } else { "" };
+        format!("{dot}{} · fude", doc.name())
+    }
+
+    pub fn say(&mut self, text: impl Into<String>, error: bool) {
+        self.message = Some((
+            StatusMessage {
+                text: text.into(),
+                error,
+            },
+            Instant::now() + MESSAGE_FOR,
+        ));
+    }
+
+    pub fn ask(
+        &mut self,
+        question: Question,
+        title: &str,
+        message: &str,
+        buttons: &[&str],
+        default: usize,
+        cancel: usize,
+    ) {
+        self.prompt = Some((
+            Prompt::new(title, message, buttons, default, cancel),
+            question,
+        ));
+    }
+
+    /// After a command panicked: says so, and leaves the documents as they are.
+    pub fn recover(&mut self, ctx: &mut Ctx<'_>, message: &str) {
+        self.prompt = None;
+        self.say(
+            format!("Internal error: {message}. Your text is still here; save it if you can."),
+            true,
+        );
+        ctx.request_redraw();
     }
 
     // --- Drawing -----------------------------------------------------------------------
@@ -137,66 +301,210 @@ impl Fude {
     pub fn draw(&mut self, canvas: &mut Canvas<'_>, scale: f32, now: Instant) {
         let start = Instant::now();
         let (w, h) = (canvas.width() as i32, canvas.height() as i32);
-        self.size = (w as u32, h as u32);
+        self.painter.theme = self.config.theme(self.os_theme);
         let p = &mut self.painter;
         p.begin(scale);
         let tabs_h = p.px(TAB_STRIP_HEIGHT);
         let status_h = p.px(STATUS_BAR_HEIGHT);
-        let tabs = Rect::new(0, 0, w, tabs_h);
-        let status = Rect::new(0, h - status_h, w, status_h);
-        self.editor_rect = Rect::new(0, tabs_h, w, (h - tabs_h - status_h).max(0));
+        let find_h = if self.find_state.open {
+            p.px(self.find.height())
+        } else {
+            0
+        };
+        let editor = Rect::new(0, tabs_h, w, (h - tabs_h - status_h - find_h).max(0));
 
-        let modified = self.doc.modified();
-        tab_strip(p, tabs, &self.doc.name(), modified);
-        self.doc.view.draw(p, self.editor_rect, now);
+        let names: Vec<(String, bool)> =
+            self.docs.iter().map(|d| (d.name(), d.modified())).collect();
+        let infos: Vec<TabInfo<'_>> = names
+            .iter()
+            .map(|(title, modified)| TabInfo {
+                title,
+                modified: *modified,
+            })
+            .collect();
+        self.tabs
+            .draw(p, Rect::new(0, 0, w, tabs_h), &infos, self.active);
 
-        let editor = &self.doc.view.editor;
-        let format = editor.format();
-        let line_endings = if editor.text().line_ending_counts().is_mixed() {
+        let doc = &mut self.docs[self.active];
+        doc.view.search = if self.find_state.open {
+            self.find_state.searcher.clone()
+        } else {
+            None
+        };
+        doc.view.draw(p, editor, now);
+        if self.find_state.open {
+            self.find
+                .draw(p, Rect::new(0, editor.bottom(), w, find_h), now);
+        }
+
+        let editor_state = &doc.view.editor;
+        let format = editor_state.format();
+        let line_endings = if editor_state.text().line_ending_counts().is_mixed() {
             "Mixed".to_owned()
         } else {
             format.line_ending.name().to_owned()
         };
-        let items = [
-            format.encoding_label(),
-            line_endings,
-            "Plain Text".to_owned(),
-        ];
-        let position = self.doc.view.position_label();
+        let items = [format.encoding_label(), line_endings, doc.language.clone()];
+        let position = doc.view.position_label();
         let message = self.message.as_ref().map(|(m, _)| m);
-        status_bar(p, status, &position, message, &items);
+        status_bar(
+            p,
+            Rect::new(0, h - status_h, w, status_h),
+            &position,
+            message,
+            &items,
+        );
 
+        if self.focus == Focus::Palette {
+            self.palette.draw(p, Rect::new(0, 0, w, h), tabs_h, now);
+        }
+        if self.drop_hover {
+            draw_drop_target(p, editor);
+        }
         if let Some((prompt, _)) = &mut self.prompt {
             prompt.draw(p, Rect::new(0, 0, w, h));
         }
         p.finish(canvas);
+        self.request_highlights();
         self.last_frame = start.elapsed();
     }
 
-    // --- Events --------------------------------------------------------------------------
+    /// Asks for syntax colors for the visible lines if they're missing or stale.
+    pub fn request_highlights(&mut self) {
+        let Some(highlighter) = &self.highlighter else {
+            return;
+        };
+        let doc = &mut self.docs[self.active];
+        let visible = doc.view.visible_lines();
+        let lines_total = doc.view.editor.text().line_count();
+        let want = visible.start.saturating_sub(HIGHLIGHT_MARGIN)
+            ..(visible.end + HIGHLIGHT_MARGIN).min(lines_total);
+        let version = doc.view.editor.buffer().version();
+        let covered = doc
+            .view
+            .highlights
+            .as_ref()
+            .is_some_and(|h| h.covers(version.get(), &visible));
+        let asked = doc.requested.as_ref().is_some_and(|(v, r)| {
+            *v == version.get() && r.start <= visible.start && visible.end <= r.end
+        });
+        if covered || asked {
+            return;
+        }
+        let text = doc.view.editor.text().clone();
+        let changed_from = doc
+            .view
+            .editor
+            .take_changed()
+            .map(|at| text.byte_to_line(at.min(text.len())));
+        highlighter.request(fude_syntax::Request {
+            doc: doc.id.0,
+            version: version.get(),
+            text,
+            file_name: doc.path.as_ref().map(|_| doc.name()),
+            changed_from,
+            lines: want.clone(),
+        });
+        doc.requested = Some((version.get(), want));
+    }
+
+    /// Takes in finished highlighting. Returns whether to redraw.
+    pub fn poll_highlights(&mut self) -> bool {
+        let Some(highlighter) = &self.highlighter else {
+            return false;
+        };
+        let mut redraw = false;
+        while let Some(reply) = highlighter.try_recv() {
+            let Some(doc) = self.docs.iter_mut().find(|d| d.id.0 == reply.doc) else {
+                continue;
+            };
+            doc.language = reply.language;
+            // Keep the newest colors; older ones still beat none while new ones are made.
+            let newer = doc
+                .view
+                .highlights
+                .as_ref()
+                .is_none_or(|h| h.version <= reply.version);
+            if newer {
+                doc.view.highlights = Some(fude_ui::Highlights {
+                    version: reply.version,
+                    first_line: reply.first_line,
+                    lines: reply.lines,
+                });
+            }
+            redraw = true;
+        }
+        redraw
+    }
+
+    /// Starts the highlighter (once a waker exists to deliver its results).
+    fn ensure_highlighter(&mut self) {
+        if self.highlighter.is_none()
+            && let Some(waker) = self.waker.clone()
+        {
+            self.highlighter = Some(fude_syntax::Highlighter::start(move || waker.wake()));
+        }
+    }
+
+    /// For the modes without a window: highlights the visible lines and waits for them.
+    pub fn highlight_now(&mut self) {
+        if self.highlighter.is_none() {
+            self.highlighter = Some(fude_syntax::Highlighter::start(|| {}));
+        }
+        self.docs[self.active].requested = None;
+        self.request_highlights();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.poll_highlights() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // --- Events ------------------------------------------------------------------------
 
     pub fn event(&mut self, ctx: &mut Ctx<'_>, event: Event) {
         if self.waker.is_none() {
             self.waker = Some(ctx.waker());
+            if let Some(server) = &self.instance {
+                server.set_waker(ctx.waker());
+            }
+            // Requests that arrived before there was a waker.
+            self.poll_instance(ctx);
         }
+        self.ensure_highlighter();
         let now = Instant::now();
         let redraw = match event {
             Event::CloseRequested => {
-                self.unless_unsaved(ctx, Then::Quit);
+                self.quit(ctx);
                 true
             }
             Event::Resized { .. } | Event::ScaleChanged(_) => true,
+            Event::ThemeChanged(theme) => {
+                self.os_theme = Some(theme);
+                true
+            }
             Event::Focused(focused) => {
-                self.doc.view.set_focused(focused, now);
+                self.doc_mut().view.set_focused(focused, now);
                 if focused {
-                    self.check_disk(ctx);
+                    self.check_disk();
                 }
                 true
             }
             Event::Key(key) => self.key(ctx, &key, now),
             Event::Ime(ime) => {
-                if self.prompt.is_none() {
-                    self.doc.view.ime(ime, now);
+                if self.prompt.is_some() {
+                } else if self.focus == Focus::Palette {
+                    if let Some(action) = self.palette.ime(ime, now) {
+                        self.palette_action(ctx, action, now);
+                    }
+                } else if self.focus == Focus::Find {
+                    if let Some(action) = self.find.ime(ime, now) {
+                        self.find_action(action, now);
+                    }
+                } else {
+                    self.doc_mut().view.ime(ime, now);
                 }
                 true
             }
@@ -207,19 +515,22 @@ impl Fude {
                 modifiers,
             } => {
                 if self.prompt.is_none() {
-                    self.doc.view.scroll(dx, dy, unit, modifiers);
+                    if self.tabs.contains(self.pointer.0, self.pointer.1) {
+                        let step = match unit {
+                            ScrollUnit::Lines => 40.0 * self.painter.scale,
+                            ScrollUnit::Pixels => 1.0,
+                        };
+                        self.tabs.scroll((dx + dy) * step);
+                    } else {
+                        let p = &mut self.painter;
+                        self.docs[self.active]
+                            .view
+                            .scroll(p, dx, dy, unit, modifiers);
+                    }
                 }
                 true
             }
-            Event::MouseMove { x, y, .. } => {
-                if let Some((prompt, _)) = &mut self.prompt {
-                    ctx.set_cursor(CursorShape::Default);
-                    prompt.mouse_move(x, y)
-                } else {
-                    ctx.set_cursor(self.doc.view.cursor_shape(x, y));
-                    self.doc.view.mouse_move(&mut self.painter, x, y)
-                }
-            }
+            Event::MouseMove { x, y, .. } => self.mouse_move(ctx, x, y),
             Event::MouseDown {
                 x,
                 y,
@@ -232,30 +543,90 @@ impl Fude {
                         self.answer(ctx, choice);
                     }
                     true
-                } else if button == fude_platform::MouseButton::Left {
-                    self.doc
+                } else if self.focus == Focus::Palette {
+                    let p = &mut self.painter;
+                    if let Some(action) = self.palette.mouse_down(p, x, y, clicks, modifiers, now) {
+                        self.palette_action(ctx, action, now);
+                    }
+                    true
+                } else if self.tabs.contains(x, y) {
+                    let event = self.tabs.mouse_down(x, y, button, clicks);
+                    self.tab_event(ctx, event);
+                    true
+                } else if self.find_state.open && self.find.contains(x, y) {
+                    if button == MouseButton::Left {
+                        self.focus = Focus::Find;
+                        self.doc_mut().view.set_focused(false, now);
+                        let p = &mut self.painter;
+                        if let Some(action) = self.find.mouse_down(p, x, y, clicks, modifiers, now)
+                        {
+                            self.find_action(action, now);
+                        }
+                    }
+                    true
+                } else if button == MouseButton::Left {
+                    if self.focus == Focus::Find {
+                        self.focus = Focus::Editor;
+                        self.find.blur(now);
+                        self.doc_mut().view.set_focused(true, now);
+                    }
+                    let p = &mut self.painter;
+                    self.docs[self.active]
                         .view
-                        .mouse_down(&mut self.painter, x, y, clicks, modifiers, now)
+                        .mouse_down(p, x, y, clicks, modifiers, now)
                 } else {
                     false
                 }
             }
-            Event::MouseUp { .. } => {
-                self.doc.view.mouse_up();
+            Event::MouseUp { x, y, .. } => {
+                let event = self.tabs.mouse_up(x, y);
+                self.tab_event(ctx, event);
+                self.doc_mut().view.mouse_up();
+                self.find.mouse_up();
+                self.palette.mouse_up();
                 true
             }
-            Event::MouseLeave => self.doc.view.mouse_leave(),
+            Event::MouseLeave => {
+                let tabs = self.tabs.mouse_leave();
+                self.doc_mut().view.mouse_leave() || tabs
+            }
             Event::Timer => {
                 if self.message.as_ref().is_some_and(|(_, at)| *at <= now) {
                     self.message = None;
                 }
-                self.doc.view.tick(&mut self.painter, now)
+                if self.session_due.is_some_and(|at| at <= now) {
+                    self.save_session(false);
+                }
+                let p = &mut self.painter;
+                self.docs[self.active].view.tick(p, now)
             }
-            Event::Wake => self.poll_save(ctx),
+            Event::Wake => {
+                let opened = self.poll_instance(ctx);
+                let saves = self.poll_saves(ctx) || opened;
+                let colors = self.poll_highlights();
+                self.poll_find(now) || saves || colors
+            }
+            Event::DroppedFile(path) => {
+                self.drop_hover = false;
+                self.open(&path);
+                true
+            }
+            Event::FileHover(on) => {
+                self.drop_hover = on;
+                true
+            }
         };
+        let find_timer = match self.focus {
+            Focus::Find if self.find_state.open => self.find.next_timer(now),
+            Focus::Palette => self.palette.next_timer(now),
+            _ => None,
+        };
+        self.schedule_session(now);
         let next = [
-            self.doc.view.next_timer(now),
+            self.doc().view.next_timer(now),
+            find_timer,
             self.message.as_ref().map(|(_, at)| *at),
+            self.session_due,
         ]
         .into_iter()
         .flatten()
@@ -271,389 +642,498 @@ impl Fude {
         }
     }
 
-    /// After a command panicked: says so, and leaves the document as it is.
-    pub fn recover(&mut self, ctx: &mut Ctx<'_>, message: &str) {
-        self.prompt = None;
-        self.say(
-            format!("Internal error: {message}. Your text is still here; save it if you can."),
-            true,
-        );
-        ctx.request_redraw();
-    }
-
     /// Places the IME candidate window at the caret.
     pub fn presented(&mut self, ctx: &mut Ctx<'_>) {
-        if let Some(r) = self.doc.view.caret_rect() {
+        let caret = match self.focus {
+            Focus::Find => self.find.caret_rect(),
+            Focus::Palette => self.palette.caret_rect(),
+            Focus::Editor => self.doc().view.caret_rect(),
+        };
+        if let Some(r) = caret {
             ctx.set_ime_area(r.x as f32, r.y as f32, r.w as f32, r.h as f32);
+        }
+    }
+
+    fn mouse_move(&mut self, ctx: &mut Ctx<'_>, x: f32, y: f32) -> bool {
+        self.pointer = (x, y);
+        if let Some((prompt, _)) = &mut self.prompt {
+            ctx.set_cursor(CursorShape::Default);
+            return prompt.mouse_move(x, y);
+        }
+        if self.focus == Focus::Palette {
+            ctx.set_cursor(CursorShape::Default);
+            let p = &mut self.painter;
+            return self.palette.mouse_move(p, x, y);
+        }
+        let (redraw_tabs, event) = self.tabs.mouse_move(x, y);
+        self.tab_event(ctx, event);
+        let over_find = self.find_state.open && self.find.contains(x, y);
+        if self.tabs.contains(x, y) {
+            ctx.set_cursor(CursorShape::Default);
+        } else if over_find {
+            ctx.set_cursor(CursorShape::Text);
+        } else {
+            ctx.set_cursor(self.doc().view.cursor_shape(x, y));
+        }
+        let p = &mut self.painter;
+        let redraw_find = self.find_state.open && self.find.mouse_move(p, x, y);
+        let redraw_view = self.docs[self.active].view.mouse_move(p, x, y);
+        redraw_tabs || redraw_view || redraw_find
+    }
+
+    fn tab_event(&mut self, ctx: &mut Ctx<'_>, event: Option<TabEvent>) {
+        match event {
+            Some(TabEvent::Activate(i)) => self.activate(i),
+            Some(TabEvent::Close(i)) => {
+                if let Some(doc) = self.docs.get(i) {
+                    let id = doc.id;
+                    self.close(ctx, id);
+                }
+            }
+            Some(TabEvent::Move { from, to }) => {
+                let doc = self.docs.remove(from);
+                self.docs.insert(to, doc);
+                self.active = to;
+            }
+            Some(TabEvent::New) => self.new_doc(),
+            None => {}
         }
     }
 
     fn key(&mut self, ctx: &mut Ctx<'_>, key: &KeyInput, now: Instant) -> bool {
         if let Some((prompt, _)) = &mut self.prompt {
-            match prompt.key(key) {
-                PromptInput::Chose(choice) => self.answer(ctx, choice),
-                PromptInput::Handled | PromptInput::Ignored => {}
+            if let PromptInput::Chose(choice) = prompt.key(key) {
+                self.answer(ctx, choice);
             }
+            return true;
+        }
+        if self.focus == Focus::Palette
+            && let Some(action) = self.palette.key(key, now)
+        {
+            self.palette_action(ctx, action, now);
+            return true;
+        }
+        if self.focus == Focus::Find
+            && let Some(action) = self.find.key(key, now)
+        {
+            self.find_action(action, now);
             return true;
         }
         if let Some(action) = action_for(key) {
             self.action(ctx, action, now);
             return true;
         }
-        if key.pressed && key.key == Key::Escape && self.message.is_some() {
+        if self.focus != Focus::Editor {
+            return false;
+        }
+        if key.pressed && key.key == Key::Escape {
+            if self.find_state.open {
+                self.close_find(now);
+                return true;
+            }
             self.message = None;
         }
-        self.doc.view.key(&mut self.painter, key, now)
+        let version = self.doc().view.editor.buffer().version();
+        let p = &mut self.painter;
+        let handled = self.docs[self.active].view.key(p, key, now);
+        if self.find_state.open && self.doc().view.editor.buffer().version() != version {
+            self.restart_count();
+        }
+        handled
     }
 
     fn action(&mut self, ctx: &mut Ctx<'_>, action: Action, now: Instant) {
-        let view = &mut self.doc.view;
+        let n = self.docs.len();
         match action {
-            Action::New | Action::Close => self.unless_unsaved(ctx, Then::New),
-            Action::Open => self.unless_unsaved(ctx, Then::Open),
-            Action::Quit => self.unless_unsaved(ctx, Then::Quit),
-            Action::Save => self.save(ctx, None),
-            Action::SaveAs => self.save_as(ctx, None),
+            Action::New => self.new_doc(),
+            Action::Close => {
+                let id = self.doc().id;
+                self.close(ctx, id);
+            }
+            Action::Open => self.open_dialog(ctx),
+            Action::Quit => self.quit(ctx),
+            Action::Save => {
+                let id = self.doc().id;
+                self.save(ctx, id, None);
+            }
+            Action::SaveAs => {
+                let id = self.doc().id;
+                self.save_as(ctx, id, None);
+            }
+            Action::NextTab => self.activate((self.active + 1) % n),
+            Action::PreviousTab => self.activate((self.active + n - 1) % n),
+            Action::GoToTab(k) => {
+                self.activate(if k == 9 { n - 1 } else { usize::from(k) - 1 });
+            }
+            // Editing actions go to the find bar's fields when they have focus.
+            Action::Undo
+            | Action::Redo
+            | Action::Copy
+            | Action::Cut
+            | Action::Paste
+            | Action::SelectAll
+                if self.focus == Focus::Find =>
+            {
+                let input = self.find.focused_input();
+                match action {
+                    Action::Undo => {
+                        input.editor.undo();
+                    }
+                    Action::Redo => {
+                        input.editor.redo();
+                    }
+                    Action::Copy => ctx.set_clipboard_text(input.editor.copy()),
+                    Action::Cut => ctx.set_clipboard_text(input.editor.cut(now)),
+                    Action::SelectAll => input.select_all(),
+                    _ => {
+                        if let Some(text) = ctx.clipboard_text() {
+                            let action = self.find.paste(&text, now);
+                            self.find_action(action, now);
+                        }
+                    }
+                }
+                if matches!(action, Action::Undo | Action::Redo | Action::Cut) {
+                    self.find_action(fude_ui::FindAction::QueryChanged, now);
+                }
+            }
+            Action::Paste if self.focus == Focus::Palette => {
+                if let Some(text) = ctx.clipboard_text() {
+                    let action = self.palette.paste(&text, now);
+                    self.palette_action(ctx, action, now);
+                }
+            }
+            Action::CommandPalette => self.open_palette("", now),
+            Action::GoToLine => self.open_palette(":", now),
+            Action::Find => self.open_find(false, now),
+            Action::Replace => self.open_find(true, now),
+            Action::FindNext => self.find_next(false, now),
+            Action::FindPrevious => self.find_next(true, now),
             Action::Undo => {
+                let view = &mut self.doc_mut().view;
                 view.editor.undo();
                 view.changed(now);
             }
             Action::Redo => {
+                let view = &mut self.doc_mut().view;
                 view.editor.redo();
                 view.changed(now);
             }
             Action::Copy => {
-                let text = view.editor.copy();
+                let text = self.doc_mut().view.editor.copy();
                 ctx.set_clipboard_text(text);
             }
             Action::Cut => {
+                let view = &mut self.doc_mut().view;
                 let text = view.editor.cut(now);
-                ctx.set_clipboard_text(text);
                 view.changed(now);
+                ctx.set_clipboard_text(text);
             }
             Action::Paste => {
                 if let Some(text) = ctx.clipboard_text() {
+                    let view = &mut self.doc_mut().view;
                     view.editor.paste(&text, now);
                     view.changed(now);
                 }
             }
-            Action::SelectAll => view.editor.select_all(),
-            Action::ZoomIn => view.zoom(1.0),
-            Action::ZoomOut => view.zoom(-1.0),
-            Action::ZoomReset => view.reset_zoom(),
-        }
-    }
-
-    fn say(&mut self, text: impl Into<String>, error: bool) {
-        self.message = Some((
-            StatusMessage {
-                text: text.into(),
-                error,
-            },
-            Instant::now() + MESSAGE_FOR,
-        ));
-    }
-
-    fn ask(
-        &mut self,
-        question: Question,
-        title: &str,
-        message: &str,
-        buttons: &[&str],
-        default: usize,
-        cancel: usize,
-    ) {
-        self.prompt = Some((
-            Prompt::new(title, message, buttons, default, cancel),
-            question,
-        ));
-    }
-
-    fn answer(&mut self, ctx: &mut Ctx<'_>, choice: usize) {
-        let Some((_, question)) = self.prompt.take() else {
-            return;
-        };
-        match (question, choice) {
-            (Question::Unsaved(then), 0) => self.save(ctx, Some(then)),
-            (Question::Unsaved(then), 1) => self.proceed(ctx, then),
-            (Question::NotEncodable(then), 0) => {
-                let editor = &mut self.doc.view.editor;
-                let format = Format {
-                    encoding: fude_buffer::Encoding::for_label(b"utf-8").expect("UTF-8"),
-                    bom: false,
-                    ..*editor.format()
+            Action::SelectAll => self.doc_mut().view.editor.select_all(),
+            Action::ZoomIn | Action::ZoomOut | Action::ZoomReset => {
+                self.zoom = match action {
+                    Action::ZoomIn => self.zoom + 1.0,
+                    Action::ZoomOut => self.zoom - 1.0,
+                    _ => 0.0,
                 };
-                let sels = editor.selections().clone();
-                editor.buffer_mut().set_format(format, sels.clone(), sels);
-                self.doc.inexact = false;
-                self.save(ctx, then);
+                let size = (self.config.font_size + self.zoom).clamp(6.0, 72.0);
+                self.zoom = size - self.config.font_size;
+                self.configure_all();
             }
-            (Question::Inexact(then), 0) => {
-                self.doc.inexact = false;
-                self.save(ctx, then);
-            }
-            (Question::ReadOnly(then), 0) => self.save_as(ctx, then),
-            (Question::ChangedOnDisk, 0) => self.reload(),
-            (Question::ChangedOnDisk, _) => {
-                // Keep the edited text; the file on disk no longer matches any version.
-                self.doc.view.editor.buffer_mut().mark_unsaved();
-                if let Some(path) = &self.doc.path {
-                    self.doc.stamp = FileStamp::of(path).ok();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // --- Files ---------------------------------------------------------------------------
-
-    /// Does `then`, after asking about unsaved changes if there are any.
-    fn unless_unsaved(&mut self, ctx: &mut Ctx<'_>, then: Then) {
-        if !self.doc.modified() {
-            self.proceed(ctx, then);
-            return;
-        }
-        let name = self.doc.name();
-        self.ask(
-            Question::Unsaved(then),
-            "Save changes?",
-            &format!("{name} has changes that aren't saved."),
-            &["Save", "Don't Save", "Cancel"],
-            0,
-            2,
-        );
-    }
-
-    fn proceed(&mut self, ctx: &mut Ctx<'_>, then: Then) {
-        match then {
-            Then::Quit => ctx.exit(),
-            Then::New => self.doc = Doc::untitled(),
-            Then::Open => {
-                let dir = self.directory();
-                let options = FileDialog {
-                    title: "Open",
-                    directory: dir.as_deref(),
-                    file_name: None,
-                };
-                if let Some(path) = ctx.open_file_dialog(&options) {
-                    self.open(&path);
-                }
+            Action::OpenSettings => self.open_settings(),
+            Action::ToggleWrap => {
+                // For this session; the setting in the file is the default.
+                self.config.word_wrap = !self.config.word_wrap;
+                self.configure_all();
+                let state = if self.config.word_wrap { "on" } else { "off" };
+                self.say(format!("Word wrap {state}"), false);
             }
         }
     }
 
-    fn directory(&self) -> Option<PathBuf> {
-        self.doc
-            .path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(Path::to_path_buf)
-    }
-
-    pub fn open(&mut self, path: &Path) {
-        match fude_buffer::load(path) {
-            Ok(loaded) => {
-                let note = loaded_note(&loaded);
-                self.doc = Doc::loaded(loaded, path.to_path_buf());
-                if let Some(note) = note {
-                    self.say(note, false);
-                }
-            }
-            Err(e) => self.say(format!("Couldn't open {}: {e}", path.display()), true),
-        }
-    }
-
-    fn save(&mut self, ctx: &mut Ctx<'_>, then: Option<Then>) {
-        let Some(path) = self.doc.path.clone() else {
-            self.save_as(ctx, then);
-            return;
-        };
-        if self.saving.is_some() {
-            self.say("Already saving…", false);
-            return;
-        }
-        if self.doc.inexact {
-            let encoding = self.doc.view.editor.format().encoding.name();
-            self.ask(
-                Question::Inexact(then),
-                "Save anyway?",
-                &format!(
-                    "{} has bytes that {encoding} can't represent exactly. Saving will change \
-                     them, even where you didn't edit.",
-                    self.doc.name()
-                ),
-                &["Save", "Cancel"],
-                0,
-                1,
-            );
-            return;
-        }
-        let snapshot = self.doc.view.editor.buffer().snapshot();
-        let (tx, rx) = mpsc::channel();
-        let waker = self.waker.clone().unwrap_or_else(|| ctx.waker());
-        let job_path = path.clone();
-        std::thread::spawn(move || {
-            let result = fude_buffer::save(&job_path, &snapshot.text, &snapshot.format);
-            let _ = tx.send(result);
-            waker.wake();
+    fn open_palette(&mut self, prefix: &str, now: Instant) {
+        let commands = fude_ui::commands();
+        self.palette_actions = commands.iter().map(|c| c.0).collect();
+        let items = commands
+            .into_iter()
+            .map(|(_, title, shortcut)| PaletteItem {
+                title: title.to_owned(),
+                detail: shortcut,
+            })
+            .collect();
+        let doc = self.doc();
+        self.palette_origin = Some(PaletteOrigin {
+            doc: doc.id,
+            selections: doc.view.editor.selections().clone(),
+            scroll: doc.view.scroll_position(),
         });
-        self.saving = Some(SaveJob {
-            version: snapshot.version,
-            path,
-            then,
-            result: rx,
-        });
-        self.say("Saving…", false);
+        self.palette.open(items, prefix, now);
+        self.focus = Focus::Palette;
+        self.find.blur(now);
+        self.doc_mut().view.set_focused(false, now);
     }
 
-    fn save_as(&mut self, ctx: &mut Ctx<'_>, then: Option<Then>) {
-        let dir = self.directory();
-        let name = self.doc.name();
-        let options = FileDialog {
-            title: "Save As",
-            directory: dir.as_deref(),
-            file_name: Some(&name),
-        };
-        if let Some(path) = ctx.save_file_dialog(&options) {
-            self.doc.path = Some(path);
-            // A new file has no original bytes to worry about.
-            self.doc.inexact = false;
-            self.save(ctx, then);
+    fn close_palette(&mut self, restore: bool, now: Instant) {
+        self.focus = Focus::Editor;
+        self.palette.input.set_focused(false, now);
+        let origin = self.palette_origin.take();
+        if restore
+            && let Some(origin) = origin
+            && let Some(i) = self.index_of(origin.doc)
+        {
+            let view = &mut self.docs[i].view;
+            view.editor.set_selections(origin.selections);
+            view.set_scroll_position(origin.scroll);
         }
+        self.doc_mut().view.set_focused(true, now);
     }
 
-    /// Picks up a finished save. Returns whether to redraw.
-    fn poll_save(&mut self, ctx: &mut Ctx<'_>) -> bool {
-        let Some(job) = &self.saving else {
-            return false;
-        };
-        let Ok(result) = job.result.try_recv() else {
-            return false;
-        };
-        let job = self.saving.take().expect("checked");
-        let encoding = self.doc.view.editor.format().encoding.name();
-        match result {
-            Ok(stamp) => {
-                if self.doc.path.as_ref() == Some(&job.path) {
-                    self.doc.view.editor.buffer_mut().mark_saved(job.version);
-                    self.doc.stamp = Some(stamp);
-                }
-                self.say(format!("Saved {}", self.doc.name()), false);
-                if let Some(then) = job.then {
-                    self.proceed(ctx, then);
+    fn palette_action(&mut self, ctx: &mut Ctx<'_>, action: PaletteAction, now: Instant) {
+        match action {
+            PaletteAction::Run(i) => {
+                self.close_palette(false, now);
+                if let Some(&action) = self.palette_actions.get(i) {
+                    self.action(ctx, action, now);
                 }
             }
-            Err(SaveError::Unmappable { offset, ch, .. }) => {
-                let line = self.doc.view.editor.text().byte_to_line(offset) + 1;
-                self.ask(
-                    Question::NotEncodable(job.then),
-                    "Can't save in this encoding",
-                    &format!("\"{ch}\" on line {line} can't be saved as {encoding}. Save as UTF-8 instead?"),
-                    &["Save as UTF-8", "Cancel"],
-                    0,
-                    1,
-                );
+            PaletteAction::Preview { line, column } => self.go_to(line, column, now),
+            PaletteAction::GoTo { line, column } => {
+                self.go_to(line, column, now);
+                self.close_palette(false, now);
             }
-            Err(SaveError::InvalidUtf8 { offset, .. }) => {
-                let line = self.doc.view.editor.text().byte_to_line(offset) + 1;
-                self.ask(
-                    Question::NotEncodable(job.then),
-                    "Can't save in this encoding",
-                    &format!(
-                        "Line {line} has bytes that aren't valid text, which only UTF-8 can save as they are. Save as UTF-8 instead?"
-                    ),
-                    &["Save as UTF-8", "Cancel"],
-                    0,
-                    1,
-                );
-            }
-            Err(SaveError::ReadOnly) => {
-                let name = self.doc.name();
-                self.ask(
-                    Question::ReadOnly(job.then),
-                    "File is read-only",
-                    &format!("{name} is read-only. Save a copy somewhere else?"),
-                    &["Save As…", "Cancel"],
-                    0,
-                    1,
-                );
-            }
-            Err(e) => {
-                let name = self.doc.name();
-                self.ask(
-                    Question::Info,
-                    "Couldn't save",
-                    &format!("{name} couldn't be saved: {e}"),
-                    &["OK"],
-                    0,
-                    0,
-                );
-            }
+            PaletteAction::Close => self.close_palette(true, now),
+            PaletteAction::Redraw => {}
         }
-        true
     }
 
-    /// When the window regains focus, notices if another program changed the file.
-    fn check_disk(&mut self, _ctx: &mut Ctx<'_>) {
-        if self.saving.is_some() || self.prompt.is_some() {
+    /// Moves the cursor to a 1-based line and character column, centering it.
+    fn go_to(&mut self, line: usize, column: Option<usize>, now: Instant) {
+        let view = &mut self.doc_mut().view;
+        let text = view.editor.text();
+        let line = line.clamp(1, text.line_count()) - 1;
+        let span = text.line_span(line);
+        let mut at = span.start;
+        if let Some(col) = column {
+            let mut bytes = Vec::new();
+            text.copy_range(span.start..span.end.min(span.start + (1 << 20)), &mut bytes);
+            let s = String::from_utf8_lossy(&bytes);
+            at += s
+                .char_indices()
+                .nth(col.saturating_sub(1))
+                .map_or(span.end - span.start, |(i, _)| i)
+                .min(span.end - span.start);
+        }
+        let at = fude_editor::text::floor_grapheme(text, at);
+        view.editor.select(at..at);
+        view.changed_centered(now);
+    }
+
+    // --- Single instance -----------------------------------------------------------------
+
+    /// Opens files another launch handed over, and comes to the front. Returns whether
+    /// anything arrived.
+    fn poll_instance(&mut self, ctx: &mut Ctx<'_>) -> bool {
+        let mut any = false;
+        while let Some(request) = self.instance.as_ref().and_then(instance::Server::try_recv) {
+            any = true;
+            if request.files.is_empty() {
+                self.new_doc();
+            }
+            for path in &request.files {
+                self.open(path);
+            }
+        }
+        if any {
+            ctx.focus_window();
+        }
+        any
+    }
+
+    // --- Session -------------------------------------------------------------------------
+
+    /// Schedules a session write when tabs or text changed since the last one.
+    fn schedule_session(&mut self, now: Instant) {
+        if self.state_dir.is_none() {
             return;
         }
-        let (Some(path), Some(stamp)) = (&self.doc.path, self.doc.stamp) else {
+        let mut print: Vec<(u64, u64, Option<PathBuf>)> = self
+            .docs
+            .iter()
+            .map(|d| {
+                (
+                    d.id.0,
+                    d.view.editor.buffer().version().get(),
+                    d.path.clone(),
+                )
+            })
+            .collect();
+        print.push((u64::MAX, self.active as u64, None));
+        if print != self.session_print && self.session_due.is_none() {
+            self.session_due = Some(now + SESSION_DELAY);
+        }
+    }
+
+    /// Writes the session, and the text of documents with unsaved changes, to the state
+    /// directory: on a worker, or right away when `now` (quitting).
+    pub fn save_session(&mut self, now: bool) {
+        let Some(state) = self.state_dir.clone() else {
             return;
         };
-        let Ok(current) = FileStamp::of(path) else {
-            return;
-        };
-        if current == stamp {
+        if !now && self.session_writing.load(Ordering::Acquire) {
+            // One write at a time; try again shortly.
+            self.session_due = Some(Instant::now() + SESSION_DELAY);
             return;
         }
-        if self.doc.modified() {
-            let name = self.doc.name();
-            self.ask(
-                Question::ChangedOnDisk,
-                "File changed on disk",
-                &format!("{name} was changed by another program. Reload it and lose your changes, or keep your version?"),
-                &["Reload", "Keep Mine"],
-                1,
-                1,
-            );
+        self.session_due = None;
+        let mut writes: Vec<(String, fude_buffer::Rope)> = Vec::new();
+        let mut tabs = Vec::new();
+        let mut active = 0;
+        let Fude {
+            docs, backed_up, ..
+        } = self;
+        for (i, doc) in docs.iter_mut().enumerate() {
+            let backup = if doc.modified() {
+                let name = doc
+                    .backup
+                    .get_or_insert_with(session::new_backup_name)
+                    .clone();
+                let version = doc.view.editor.buffer().version().get();
+                if backed_up.get(&doc.id) != Some(&version) {
+                    writes.push((name.clone(), doc.view.editor.text().clone()));
+                    backed_up.insert(doc.id, version);
+                }
+                Some(name)
+            } else {
+                doc.backup = None;
+                backed_up.remove(&doc.id);
+                None
+            };
+            if doc.path.is_none() && backup.is_none() {
+                continue;
+            }
+            if i <= self.active {
+                active = tabs.len();
+            }
+            let format = doc.view.editor.format();
+            tabs.push(Tab {
+                path: doc.path.clone(),
+                backup,
+                encoding: format.encoding.name().to_owned(),
+                bom: format.bom,
+                line_ending: format.line_ending,
+                cursor: doc.view.editor.selections().primary().head,
+                scroll: doc.view.scroll_position().0,
+            });
+        }
+        let session = Session { active, tabs };
+        self.session_print = self
+            .docs
+            .iter()
+            .map(|d| {
+                (
+                    d.id.0,
+                    d.view.editor.buffer().version().get(),
+                    d.path.clone(),
+                )
+            })
+            .chain([(u64::MAX, self.active as u64, None)])
+            .collect();
+        let job = move || {
+            for (name, text) in &writes {
+                if let Err(e) = session::write_backup(&state, name, text) {
+                    eprintln!("fude: couldn't back up unsaved changes: {e}");
+                }
+            }
+            if let Err(e) = session.write(&state) {
+                eprintln!("fude: couldn't save the session: {e}");
+            }
+            let keep: Vec<&str> = session
+                .tabs
+                .iter()
+                .filter_map(|t| t.backup.as_deref())
+                .collect();
+            session::clean_backups(&state, &keep);
+        };
+        if now {
+            job();
         } else {
-            self.reload();
+            let writing = self.session_writing.clone();
+            writing.store(true, Ordering::Release);
+            std::thread::spawn(move || {
+                job();
+                writing.store(false, Ordering::Release);
+            });
         }
     }
 
-    fn reload(&mut self) {
-        let Some(path) = self.doc.path.clone() else {
+    /// Reopens the tabs of the last session, with their unsaved changes.
+    pub fn restore_session(&mut self) {
+        let Some(state) = self.state_dir.clone() else {
             return;
         };
-        match fude_buffer::load(&path) {
-            Ok(loaded) => {
-                let editor = &mut self.doc.view.editor;
-                editor.replace_content(loaded.text, loaded.format);
-                let version = editor.buffer().version();
-                editor.buffer_mut().mark_saved(version);
-                self.doc.stamp = loaded.stamp;
-                self.doc.inexact = !loaded.exact;
-                self.say(
-                    format!("Reloaded {} (changed on disk)", self.doc.name()),
-                    false,
-                );
-            }
-            Err(e) => self.say(format!("Couldn't reload: {e}"), true),
+        let Some(session) = Session::read(&state) else {
+            return;
+        };
+        let mut restored = 0;
+        for tab in &session.tabs {
+            let id = self.new_id();
+            let mut doc = match (&tab.backup, &tab.path) {
+                (Some(name), path) => match session::read_backup(&state, name) {
+                    Ok(text) => {
+                        let mut doc = Doc::new(id, text, tab.format(), path.clone());
+                        doc.view.editor.buffer_mut().mark_unsaved();
+                        doc.stamp = path
+                            .as_deref()
+                            .and_then(|p| fude_buffer::FileStamp::of(p).ok());
+                        doc.backup = Some(name.clone());
+                        doc
+                    }
+                    Err(_) => continue,
+                },
+                (None, Some(path)) => match fude_buffer::load(path) {
+                    Ok(loaded) => Doc::loaded(id, loaded, path.clone()),
+                    Err(_) => continue,
+                },
+                (None, None) => continue,
+            };
+            let len = doc.view.editor.text().len();
+            let at = fude_editor::text::floor_grapheme(doc.view.editor.text(), tab.cursor.min(len));
+            doc.view.editor.select(at..at);
+            doc.view.set_scroll_position((tab.scroll, 0.0));
+            self.add_doc(doc);
+            restored += 1;
+        }
+        if restored > 0 {
+            let first = self.docs.len() - restored;
+            self.active = (first + session.active).min(self.docs.len() - 1);
+            self.tabs.reveal_active();
         }
     }
 }
 
-/// Anything worth telling the user about how a file was read.
-fn loaded_note(loaded: &Loaded) -> Option<String> {
-    if loaded.binary {
-        Some("This looks like a binary file".to_owned())
-    } else if !loaded.exact {
-        Some(format!(
-            "Opened as {}; some bytes can't be represented exactly",
-            loaded.format.encoding.name()
-        ))
-    } else {
-        None
-    }
+/// What the editor shows while files are dragged over the window.
+fn draw_drop_target(p: &mut Painter, area: Rect) {
+    let t = p.theme;
+    p.rect(area, t.scrim);
+    let style = p.style(15.0);
+    let label = "Drop to open";
+    let pad = p.px(28.0);
+    let w = p.measure(label, &style).ceil() as i32 + 2 * pad;
+    let h = p.px(64.0);
+    let x = area.x + (area.w - w) / 2;
+    let y = area.y + (area.h - h) / 2;
+    let border = p.px(2.0).max(1);
+    p.rect(
+        Rect::new(x - border, y - border, w + 2 * border, h + 2 * border),
+        t.accent,
+    );
+    p.rect(Rect::new(x, y, w, h), t.dialog_bg);
+    let baseline = p.center_baseline(y, h, &style);
+    p.text(label, &style, (x + pad) as f32, baseline, t.text);
 }

@@ -6,14 +6,21 @@
 
 mod app;
 mod args;
+mod config;
+mod doc;
+mod files;
+mod find;
+mod instance;
+mod session;
 mod welcome;
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use app::{Doc, Fude};
+use app::Fude;
 use args::{Args, Mode, USAGE};
+use doc::Doc;
 use fude_buffer::{Format, Rope};
 use fude_editor::Motion;
 use fude_platform::{App, Canvas, Ctx, Event, StartupMark, WindowOptions};
@@ -50,24 +57,40 @@ fn main() -> ExitCode {
     }
 }
 
-/// The document to start with: the file given (new if it doesn't exist yet), or an
-/// empty one. `demo` shows the welcome text instead of an empty document.
-fn initial_doc(args: &Args, demo: bool) -> Result<Doc, String> {
-    match &args.file {
-        Some(path) => match fude_buffer::load(path) {
-            Ok(loaded) => Ok(Doc::loaded(loaded, path.clone())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Doc::new(Rope::new(), Format::default(), Some(path.clone())))
-            }
-            Err(e) => Err(format!("{}: {e}", path.display())),
-        },
-        None if demo => Ok(Doc::new(
+/// The app with the files given open (a path that doesn't exist yet opens as a new
+/// document), or an empty document. `demo` shows the welcome text when no file is given.
+fn initial_app(args: &Args, demo: bool) -> Result<Fude, String> {
+    let (config, problems) = config::Config::load();
+    let mut app = Fude::new(config);
+    if let Some(problem) = problems.first() {
+        app.say(problem.clone(), true);
+    }
+    for path in &args.files {
+        if path.is_dir() {
+            return Err(format!("{} is a directory", path.display()));
+        }
+    }
+    // The window keeps a session; the modes without one, and benchmarks, don't touch it.
+    if !demo && !args.bench_startup {
+        app.state_dir = config::state_dir();
+        app.restore_session();
+    }
+    for path in &args.files {
+        if path.is_dir() {
+            return Err(format!("{} is a directory", path.display()));
+        }
+        app.open(path);
+    }
+    if args.files.is_empty() && demo {
+        let id = app.new_id();
+        app.add_doc(Doc::new(
+            id,
             Rope::from(welcome::text().as_str()),
             Format::default(),
             None,
-        )),
-        None => Ok(Doc::untitled()),
+        ));
     }
+    Ok(app)
 }
 
 struct Window {
@@ -97,12 +120,75 @@ impl StartupBench {
     }
 }
 
+/// Starts this launch again in the background, detached from the terminal it was run
+/// from, and returns true if that worked (then this process can exit). Only for launches
+/// from a terminal (stdin is one), on Unix; elsewhere the window simply opens.
+fn detach(args: &Args, state: Option<&Path>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::io::IsTerminal;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        if !std::io::stdin().is_terminal() {
+            return false;
+        }
+        for path in &args.files {
+            if path.is_dir() {
+                // Report it here, where the user can see it.
+                return false;
+            }
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        // Errors from the detached process go to a log, since its terminal is gone.
+        let log = state.and_then(|dir| {
+            std::fs::create_dir_all(dir).ok()?;
+            std::fs::File::create(dir.join("fude.log")).ok()
+        });
+        let stderr = log.map_or_else(Stdio::null, Stdio::from);
+        let args_os: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        Command::new(exe)
+            .arg("--detached")
+            .args(args_os)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            // Its own process group: Ctrl+C and the terminal closing don't reach it.
+            .process_group(0)
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (args, state);
+        false
+    }
+}
+
 fn run_window(args: &Args, started: Instant) -> Result<(), String> {
     let mut bench = args.bench_startup.then(|| StartupBench {
         started,
         marks: vec![],
     });
-    let app = Fude::new(initial_doc(args, false)?);
+    // Hand the files to a running fude, if there is one.
+    let single = !args.new_instance && !args.wait && !args.bench_startup;
+    let state = config::state_dir();
+    if single
+        && let Some(state) = &state
+        && instance::hand_off(state, &args.files)
+    {
+        return Ok(());
+    }
+    // From a terminal, run the window in the background and give the terminal back.
+    if !args.wait && !args.detached && !args.bench_startup && detach(args, state.as_deref()) {
+        return Ok(());
+    }
+    let mut app = initial_app(args, false)?;
+    if single && let Some(state) = &state {
+        app.instance = instance::serve(state);
+    }
     if let Some(b) = &mut bench {
         b.mark("view-ready");
     }
@@ -159,9 +245,16 @@ impl App for Window {
 }
 
 fn screenshot(args: &Args, path: &Path) -> Result<(), String> {
-    let mut app = Fude::new(initial_doc(args, true)?);
+    let mut app = initial_app(args, true)?;
     let (w, h) = args.size;
     let mut pixels = vec![0u32; w as usize * h as usize];
+    app.draw(
+        &mut Canvas::new(&mut pixels, w as usize, h as usize),
+        args.scale,
+        Instant::now(),
+    );
+    // Draw again with syntax colors.
+    app.highlight_now();
     app.draw(
         &mut Canvas::new(&mut pixels, w as usize, h as usize),
         args.scale,
@@ -193,7 +286,7 @@ fn summary(times: &mut [Duration]) -> String {
 /// Full-frame redraws without a window: what the CPU renderer costs per frame, worst case
 /// (no damage tracking, every pixel drawn).
 fn bench_render(args: &Args) -> Result<(), String> {
-    let mut app = Fude::new(initial_doc(args, true)?);
+    let mut app = initial_app(args, true)?;
     let (w, h) = args.size;
     let mut pixels = vec![0u32; w as usize * h as usize];
     let mut draw = |app: &mut Fude| {
@@ -208,7 +301,9 @@ fn bench_render(args: &Args) -> Result<(), String> {
     const FRAMES: usize = 120;
     let mut times = Vec::with_capacity(FRAMES);
     for _ in 0..FRAMES {
-        app.doc.view.scroll(
+        let p = &mut app.painter;
+        app.docs[app.active].view.scroll(
+            p,
             0.0,
             1.0,
             fude_platform::ScrollUnit::Lines,
@@ -228,7 +323,7 @@ fn bench_render(args: &Args) -> Result<(), String> {
 /// Keystroke latency without a window: each step is an edit (or move) followed by a full
 /// frame, so it measures fude's whole share of "key pressed → frame ready".
 fn bench_typing(args: &Args) -> Result<(), String> {
-    let mut app = Fude::new(initial_doc(args, true)?);
+    let mut app = initial_app(args, true)?;
     let (w, h) = args.size;
     let mut pixels = vec![0u32; w as usize * h as usize];
     let mut draw = |app: &mut Fude| {
@@ -239,12 +334,15 @@ fn bench_typing(args: &Args) -> Result<(), String> {
         );
     };
     draw(&mut app);
+    // With syntax colors, so frames draw colored runs (they go stale as typing goes on,
+    // which costs the same to draw).
+    app.highlight_now();
     // Start in the middle of the document.
     let middle = {
-        let text = app.doc.view.editor.text();
+        let text = app.doc_mut().view.editor.text();
         text.line_to_byte(text.line_count() / 2)
     };
-    let view = &mut app.doc.view;
+    let view = &mut app.doc_mut().view;
     view.editor.set_selections(fude_editor::Selections::single(
         fude_editor::Selection::cursor(middle),
     ));
@@ -259,32 +357,32 @@ fn bench_typing(args: &Args) -> Result<(), String> {
     for i in 0..KEYS {
         let start = Instant::now();
         let now = Instant::now();
-        app.doc
+        app.doc_mut()
             .view
             .editor
             .insert(if i % 7 == 6 { " " } else { "x" }, now);
-        app.doc.view.changed(now);
+        app.doc_mut().view.changed(now);
         draw(&mut app);
         typing.push(start.elapsed());
 
         let start = Instant::now();
-        app.doc
+        app.doc_mut()
             .view
             .editor
             .move_cursors(Motion::Down, false, &mut layout);
-        app.doc.view.changed(now);
+        app.doc_mut().view.changed(now);
         draw(&mut app);
         moving.push(start.elapsed());
     }
     for _ in 0..KEYS {
         let start = Instant::now();
         let now = Instant::now();
-        app.doc.view.editor.backspace(now);
-        app.doc.view.changed(now);
+        app.doc_mut().view.editor.backspace(now);
+        app.doc_mut().view.changed(now);
         draw(&mut app);
         deleting.push(start.elapsed());
     }
-    let size = app.doc.view.editor.text().len();
+    let size = app.doc_mut().view.editor.text().len();
     println!(
         "fude typing benchmark: {w}x{h} @{}x, {:.1} MB document, edit + full frame per key",
         args.scale,
