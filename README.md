@@ -20,6 +20,7 @@ cargo run --release -- some/file.txt
 | Move | arrows, Home / End, PageUp / PageDown, Ctrl+arrows by word, Ctrl+Home / End |
 | Select | Shift + any move, drag, double-click a word, triple-click a line, click the gutter |
 | Edit | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) undo and redo, Ctrl+X / C / V, Ctrl+A, Ctrl+/ comment, Shift+Alt+A block comment |
+| Context menu | Right-click (or Control-click on macOS), Shift+F10 or the menu key; arrows to choose, Enter to run, Escape to dismiss |
 | Cursors | Ctrl+Click add or remove, Ctrl+D next occurrence, Ctrl+Shift+L all occurrences, Ctrl+Alt+↑/↓ add above or below, Shift+Alt+I one per line, Alt+drag or Shift+Alt+arrows column selection, Escape back to one |
 | Lines | Alt+↑/↓ move, Ctrl+Shift+D duplicate, Ctrl+Shift+K delete, Ctrl+J join, Ctrl+Enter / Ctrl+Shift+Enter new line below / above, Tab / Shift+Tab (or Ctrl+] / Ctrl+[) indent / outdent, Ctrl+Shift+\ matching bracket |
 | Files | Ctrl+N new tab, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+W close tab, Ctrl+Q quit |

@@ -12,9 +12,9 @@ use fude_platform::{
 };
 use fude_render::Rect;
 use fude_ui::{
-    Action, EditorView, FindBar, Painter, Palette, PaletteAction, PaletteItem, Prompt, PromptInput,
-    STATUS_BAR_HEIGHT, StatusMessage, TAB_STRIP_HEIGHT, TabEvent, TabInfo, TabStrip, action_for,
-    status_bar,
+    Action, ContextMenu, ContextMenuItem, EditorView, FindBar, Painter, Palette, PaletteAction,
+    PaletteItem, Prompt, PromptInput, STATUS_BAR_HEIGHT, StatusMessage, TAB_STRIP_HEIGHT, TabEvent,
+    TabInfo, TabStrip, action_for, status_bar,
 };
 
 use crate::config::{self, Config};
@@ -91,6 +91,9 @@ pub struct Fude {
     /// The action behind each palette item.
     palette_actions: Vec<Action>,
     palette_origin: Option<PaletteOrigin>,
+    context_menu: ContextMenu,
+    /// Window bounds from the last frame, for placing popups before they are drawn.
+    window_area: Rect,
     /// Started on first use (it needs a waker), so startup doesn't pay for it.
     highlighter: Option<fude_syntax::Highlighter>,
     /// Where the session and backups live.
@@ -140,6 +143,8 @@ impl Fude {
             palette: Palette::new(),
             palette_actions: Vec::new(),
             palette_origin: None,
+            context_menu: ContextMenu::new(),
+            window_area: Rect::default(),
             highlighter: None,
             state_dir: None,
             instance: None,
@@ -229,6 +234,7 @@ impl Fude {
     /// Adds a document as a new tab after the active one (or in place of a blank active
     /// tab) and switches to it.
     pub fn add_doc(&mut self, mut doc: Doc) {
+        self.context_menu.close();
         self.configure(&mut doc.view);
         if self.doc().is_blank() {
             self.docs[self.active] = doc;
@@ -240,6 +246,7 @@ impl Fude {
     }
 
     pub fn new_doc(&mut self) {
+        self.context_menu.close();
         let id = self.new_id();
         let mut doc = Doc::untitled(id);
         self.configure(&mut doc.view);
@@ -250,6 +257,7 @@ impl Fude {
 
     pub fn activate(&mut self, index: usize) {
         if index < self.docs.len() && index != self.active {
+            self.context_menu.close();
             self.active = index;
             self.tabs.reveal_active();
             self.doc_mut().view.set_focused(true, Instant::now());
@@ -259,6 +267,7 @@ impl Fude {
     /// Removes a tab without asking. Closing the last tab leaves a new blank one.
     pub fn remove_doc(&mut self, id: DocId) {
         let Some(i) = self.index_of(id) else { return };
+        self.context_menu.close();
         self.docs.remove(i);
         if let Some(h) = &self.highlighter {
             h.close(id.0);
@@ -300,6 +309,7 @@ impl Fude {
         default: usize,
         cancel: usize,
     ) {
+        self.context_menu.close();
         self.prompt = Some((
             Prompt::new(title, message, buttons, default, cancel),
             question,
@@ -309,6 +319,7 @@ impl Fude {
     /// After a command panicked: says so, and leaves the documents as they are.
     pub fn recover(&mut self, ctx: &mut Ctx<'_>, message: &str) {
         self.prompt = None;
+        self.context_menu.close();
         self.say(
             format!("Internal error: {message}. Your text is still here; save it if you can."),
             true,
@@ -321,6 +332,7 @@ impl Fude {
     pub fn draw(&mut self, canvas: &mut Canvas<'_>, scale: f32, now: Instant) {
         let start = Instant::now();
         let (w, h) = (canvas.width() as i32, canvas.height() as i32);
+        self.window_area = canvas.bounds();
         self.painter.theme = self.config.theme(self.os_theme);
         let p = &mut self.painter;
         p.begin(scale);
@@ -382,6 +394,7 @@ impl Fude {
         if self.focus == Focus::Palette {
             self.palette.draw(p, Rect::new(0, 0, w, h), tabs_h, now);
         }
+        self.context_menu.draw(p);
         if self.drop_hover {
             draw_drop_target(p, editor);
         }
@@ -490,6 +503,68 @@ impl Fude {
 
     // --- Events ------------------------------------------------------------------------
 
+    /// Targets a context click without starting a selection drag.
+    fn open_editor_context_menu(&mut self, x: f32, y: f32, now: Instant) -> bool {
+        if !self.docs[self.active]
+            .view
+            .context_menu_at(&mut self.painter, x, y, now)
+        {
+            return false;
+        }
+        self.show_editor_context_menu(x, y, now);
+        true
+    }
+
+    fn show_editor_context_menu(&mut self, x: f32, y: f32, now: Instant) {
+        self.focus = Focus::Editor;
+        self.find.blur(now);
+        self.find.mouse_up();
+        self.doc_mut().view.set_focused(true, now);
+        self.doc_mut().view.mouse_up();
+        self.doc_mut().view.ime(fude_platform::Ime::Disabled, now);
+        let items = self.editor_context_menu_items();
+        self.context_menu
+            .open(&mut self.painter, self.window_area, x, y, items);
+    }
+
+    fn editor_context_menu_items(&self) -> Vec<ContextMenuItem> {
+        let editor = &self.doc().view.editor;
+        let writable = !editor.is_read_only();
+        let has_text = !editor.text().is_empty();
+        let commands = fude_ui::commands();
+        [
+            Some(Action::Undo),
+            Some(Action::Redo),
+            None,
+            Some(Action::Cut),
+            Some(Action::Copy),
+            Some(Action::Paste),
+            None,
+            Some(Action::SelectAll),
+        ]
+        .into_iter()
+        .map(|action| {
+            let enabled = match action {
+                Some(Action::Undo) => writable && editor.buffer().can_undo(),
+                Some(Action::Redo) => writable && editor.buffer().can_redo(),
+                Some(Action::Cut) => writable && has_text,
+                Some(Action::Copy | Action::SelectAll) => has_text,
+                Some(Action::Paste) => writable,
+                _ => false,
+            };
+            let command = commands.iter().find(|c| Some(c.0) == action);
+            ContextMenuItem {
+                action,
+                label: command
+                    .map(|c| c.1.rsplit(": ").next().unwrap_or(&c.1).to_owned())
+                    .unwrap_or_default(),
+                shortcut: command.map(|c| c.2.clone()).unwrap_or_default(),
+                enabled,
+            }
+        })
+        .collect()
+    }
+
     pub fn event(&mut self, ctx: &mut Ctx<'_>, event: Event) {
         if self.waker.is_none() {
             self.waker = Some(ctx.waker());
@@ -508,12 +583,18 @@ impl Fude {
                 self.quit(ctx);
                 true
             }
-            Event::Resized { .. } | Event::ScaleChanged(_) => true,
+            Event::Resized { .. } | Event::ScaleChanged(_) => {
+                self.context_menu.close();
+                true
+            }
             Event::ThemeChanged(theme) => {
                 self.os_theme = Some(theme);
                 true
             }
             Event::Focused(focused) => {
+                if !focused {
+                    self.context_menu.close();
+                }
                 self.doc_mut().view.set_focused(focused, now);
                 if focused {
                     // Tell the input method again where the caret is.
@@ -526,7 +607,7 @@ impl Fude {
             Event::Ime(ime) => {
                 // Only real changes redraw: an empty update redrawing would send the
                 // caret area again, which KWin answers with another empty update.
-                if self.prompt.is_some() {
+                if self.prompt.is_some() || self.context_menu.is_open() {
                     false
                 } else if self.focus == Focus::Palette {
                     if let Some(action) = self.palette.ime(ime, now) {
@@ -552,7 +633,22 @@ impl Fude {
                 unit,
                 modifiers,
             } => {
-                if self.prompt.is_none() {
+                if self.context_menu.is_open() {
+                    if self.context_menu.contains(self.pointer.0, self.pointer.1) {
+                        let rows = match unit {
+                            ScrollUnit::Lines => dy,
+                            ScrollUnit::Pixels => dy / (28.0 * self.painter.scale),
+                        };
+                        let rows = if rows > 0.0 {
+                            rows.ceil()
+                        } else {
+                            rows.floor()
+                        };
+                        self.context_menu.scroll(rows as i32);
+                    } else {
+                        self.context_menu.close();
+                    }
+                } else if self.prompt.is_none() {
                     if self.tabs.contains(self.pointer.0, self.pointer.1) {
                         let step = match unit {
                             ScrollUnit::Lines => 40.0 * self.painter.scale,
@@ -576,16 +672,44 @@ impl Fude {
                 clicks,
                 modifiers,
             } => {
+                self.pointer = (x, y);
+                let context_click = button == MouseButton::Right
+                    || (cfg!(target_os = "macos") && button == MouseButton::Left && modifiers.ctrl);
                 if let Some((prompt, _)) = &mut self.prompt {
-                    if let Some(choice) = prompt.mouse_down(x, y) {
+                    if button == MouseButton::Left
+                        && !context_click
+                        && let Some(choice) = prompt.mouse_down(x, y)
+                    {
                         self.answer(ctx, choice);
                     }
                     true
                 } else if self.focus == Focus::Palette {
-                    let p = &mut self.painter;
-                    if let Some(action) = self.palette.mouse_down(p, x, y, clicks, modifiers, now) {
-                        self.palette_action(ctx, action, now);
+                    if button == MouseButton::Left && !context_click {
+                        let p = &mut self.painter;
+                        if let Some(action) =
+                            self.palette.mouse_down(p, x, y, clicks, modifiers, now)
+                        {
+                            self.palette_action(ctx, action, now);
+                        }
                     }
+                    true
+                } else if self.context_menu.is_open()
+                    && (!context_click || self.context_menu.contains(x, y))
+                {
+                    if button == MouseButton::Left
+                        && !context_click
+                        && let Some(action) = self.context_menu.mouse_down(x, y)
+                    {
+                        self.action(ctx, action, now);
+                    }
+                    true
+                } else if context_click {
+                    self.context_menu.close();
+                    let opened = self.open_editor_context_menu(x, y, now);
+                    if opened {
+                        ctx.set_cursor(CursorShape::Default);
+                    }
+                    // A context click never acts like a primary click in other controls.
                     true
                 } else if self.tabs.contains(x, y) {
                     let event = self.tabs.mouse_down(x, y, button, clicks);
@@ -625,8 +749,9 @@ impl Fude {
                 true
             }
             Event::MouseLeave => {
+                let menu = self.context_menu.mouse_move(-1.0, -1.0);
                 let tabs = self.tabs.mouse_leave();
-                self.doc_mut().view.mouse_leave() || tabs
+                self.doc_mut().view.mouse_leave() || tabs || menu
             }
             Event::Timer => {
                 if self.message.as_ref().is_some_and(|(_, at)| *at <= now) {
@@ -639,12 +764,17 @@ impl Fude {
                 self.docs[self.active].view.tick(p, now)
             }
             Event::Wake => {
+                let version = self.doc().view.editor.buffer().version();
                 let loads = self.poll_loads();
                 let opened = self.poll_instance(ctx) || loads;
                 let saves = self.poll_saves(ctx) || opened;
                 let saves = self.poll_tools(ctx) || saves;
                 let colors = self.poll_highlights();
-                self.poll_find(now) || saves || colors
+                let find = self.poll_find(now);
+                if saves || self.doc().view.editor.buffer().version() != version {
+                    self.context_menu.close();
+                }
+                find || saves || colors
             }
             Event::DroppedFile(path) => {
                 self.drop_hover = false;
@@ -711,6 +841,10 @@ impl Fude {
             ctx.set_cursor(CursorShape::Default);
             return prompt.mouse_move(x, y);
         }
+        if self.context_menu.is_open() {
+            ctx.set_cursor(CursorShape::Default);
+            return self.context_menu.mouse_move(x, y);
+        }
         if self.focus == Focus::Palette {
             ctx.set_cursor(CursorShape::Default);
             let p = &mut self.painter;
@@ -755,6 +889,27 @@ impl Fude {
         if let Some((prompt, _)) = &mut self.prompt {
             if let PromptInput::Chose(choice) = prompt.key(key) {
                 self.answer(ctx, choice);
+            }
+            return true;
+        }
+        if self.context_menu.is_open() {
+            if let Some(action) = self.context_menu.key(key) {
+                self.action(ctx, action, now);
+            }
+            return true;
+        }
+        let m = key.modifiers;
+        if self.focus == Focus::Editor
+            && key.pressed
+            && (key.key == Key::ContextMenu
+                || (key.key == Key::F(10) && m.shift && !m.ctrl && !m.alt && !m.logo))
+        {
+            if let Some((x, y)) = self.docs[self.active]
+                .view
+                .context_menu_position(&mut self.painter)
+            {
+                self.show_editor_context_menu(x, y, now);
+                ctx.set_cursor(CursorShape::Default);
             }
             return true;
         }
@@ -804,6 +959,7 @@ impl Fude {
     }
 
     fn action(&mut self, ctx: &mut Ctx<'_>, action: Action, now: Instant) {
+        self.context_menu.close();
         let n = self.docs.len();
         match action {
             Action::New => self.new_doc(),
@@ -1337,4 +1493,118 @@ fn draw_drop_target(p: &mut Painter, area: Rect) {
     p.rect(Rect::new(x, y, w, h), t.dialog_bg);
     let baseline = p.center_baseline(y, h, &style);
     p.text(label, &style, (x + pad) as f32, baseline, t.text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fude_editor::Selection;
+    use fude_platform::{Ime, Modifiers};
+
+    fn draw(app: &mut Fude) {
+        let mut pixels = vec![0; 800 * 600];
+        app.draw(&mut Canvas::new(&mut pixels, 800, 600), 1.0, Instant::now());
+    }
+
+    fn enabled(app: &Fude, action: Action) -> bool {
+        app.editor_context_menu_items()
+            .iter()
+            .find(|item| item.action == Some(action))
+            .unwrap()
+            .enabled
+    }
+
+    #[test]
+    fn context_commands_follow_history_and_read_only_state() {
+        let mut app = Fude::new(Config::default());
+        for action in [
+            Action::Undo,
+            Action::Redo,
+            Action::Cut,
+            Action::Copy,
+            Action::SelectAll,
+        ] {
+            assert!(!enabled(&app, action));
+        }
+        assert!(enabled(&app, Action::Paste));
+
+        app.doc_mut().view.editor.insert("alpha", Instant::now());
+        for action in [
+            Action::Undo,
+            Action::Cut,
+            Action::Copy,
+            Action::Paste,
+            Action::SelectAll,
+        ] {
+            assert!(enabled(&app, action));
+        }
+        assert!(!enabled(&app, Action::Redo));
+        app.doc_mut().view.editor.undo();
+        assert!(enabled(&app, Action::Redo));
+        assert!(!enabled(&app, Action::Undo));
+        app.doc_mut().view.editor.redo();
+        app.doc_mut().view.editor.set_read_only(true);
+        for action in [Action::Undo, Action::Redo, Action::Cut, Action::Paste] {
+            assert!(!enabled(&app, action));
+        }
+        assert!(enabled(&app, Action::Copy));
+        assert!(enabled(&app, Action::SelectAll));
+    }
+
+    #[test]
+    fn context_click_returns_focus_from_find_without_losing_selection() {
+        let mut app = Fude::new(Config::default());
+        let now = Instant::now();
+        let view = &mut app.doc_mut().view;
+        view.editor.insert("alpha beta", now);
+        view.editor
+            .set_selections(Selections::single(Selection::new(5, 0)));
+        app.find_state.open = true;
+        app.find.open(false, None, now);
+        app.focus = Focus::Find;
+        draw(&mut app);
+        let caret = app.doc().view.caret_rect().unwrap();
+        let selections = app.doc().view.editor.selections().clone();
+        assert!(app.open_editor_context_menu(caret.x as f32 + 5.0, caret.y as f32 + 2.0, now));
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(*app.doc().view.editor.selections(), selections);
+        assert!(app.context_menu.is_open());
+        draw(&mut app);
+
+        let key = |key| KeyInput {
+            key,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+            text: None,
+            base: None,
+        };
+        app.context_menu.key(&key(Key::End));
+        assert_eq!(
+            app.context_menu.key(&key(Key::Enter)),
+            Some(Action::SelectAll)
+        );
+        assert!(!app.context_menu.is_open());
+    }
+
+    #[test]
+    fn opening_menu_clears_composition_and_document_changes_dismiss_it() {
+        let mut app = Fude::new(Config::default());
+        let now = Instant::now();
+        app.doc_mut().view.ime(Ime::Preedit("か".into(), None), now);
+        draw(&mut app);
+        assert!(app.open_editor_context_menu(100.0, 60.0, now));
+        assert!(!app.doc_mut().view.ime(Ime::Disabled, now));
+        assert!(app.doc().view.editor.text().is_empty());
+        app.new_doc();
+        assert!(!app.context_menu.is_open());
+
+        draw(&mut app);
+        assert!(app.open_editor_context_menu(100.0, 60.0, now));
+        app.activate(0);
+        assert!(!app.context_menu.is_open());
+        app.show_editor_context_menu(100.0, 60.0, now);
+        app.ask(Question::Info, "Test", "Message", &["OK"], 0, 0);
+        assert!(!app.context_menu.is_open());
+    }
 }

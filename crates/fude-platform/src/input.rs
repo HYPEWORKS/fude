@@ -39,6 +39,8 @@ pub enum Key {
     PageUp,
     PageDown,
     Insert,
+    /// The dedicated context-menu key, present on some keyboards.
+    ContextMenu,
     /// F1 to F12.
     F(u8),
     Other,
@@ -97,6 +99,7 @@ pub(crate) fn key_input(ev: &KeyEvent, modifiers: Modifiers) -> KeyInput {
             NamedKey::PageUp => Key::PageUp,
             NamedKey::PageDown => Key::PageDown,
             NamedKey::Insert => Key::Insert,
+            NamedKey::ContextMenu => Key::ContextMenu,
             NamedKey::F1 => Key::F(1),
             NamedKey::F2 => Key::F(2),
             NamedKey::F3 => Key::F(3),

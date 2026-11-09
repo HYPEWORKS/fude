@@ -2,6 +2,7 @@
 //! `fude-render` draw list with one theme.
 
 mod chrome;
+mod context_menu;
 mod display;
 mod find;
 mod fuzzy;
@@ -16,6 +17,7 @@ mod theme;
 mod view;
 
 pub use chrome::{STATUS_BAR_HEIGHT, StatusMessage, status_bar};
+pub use context_menu::{ContextMenu, ContextMenuItem};
 pub use find::{FindAction, FindBar, FindField, FindStatus};
 pub use input::{ImeChange, InputKey, TextInput};
 pub use keymap::{Action, Shortcut, action_for, commands};

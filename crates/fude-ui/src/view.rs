@@ -905,6 +905,71 @@ impl EditorView {
         }
     }
 
+    /// Targets a context menu without starting a selection drag. A click inside any
+    /// selection keeps the entire set; elsewhere it places one caret at the click.
+    pub fn context_menu_at(&mut self, p: &mut Painter, x: f32, y: f32, now: Instant) -> bool {
+        self.mouse_up();
+        let (xi, yi) = (x as i32, y as i32);
+        if !self.geo.area.contains(xi, yi) || self.geo.scrollbar.contains(xi, yi) {
+            return false;
+        }
+        self.mouse = (x, y);
+        let at = self.hit(p, x, y);
+        let keep = self
+            .editor
+            .selections()
+            .iter()
+            .any(|s| s.range().contains(&at) || (s.is_empty() && s.head == at));
+        if !keep {
+            self.column = None;
+            self.editor.select(at..at);
+        }
+        self.blink_start = now;
+        // In particular, preserving an off-screen primary selection must not scroll
+        // away from the secondary selection that was clicked.
+        self.reveal = false;
+        self.center = false;
+        true
+    }
+
+    /// Reveals the primary cursor and returns a keyboard context menu anchor at the
+    /// bottom of its row. Uses current layout rather than the last frame's caret.
+    pub fn context_menu_position(&mut self, p: &mut Painter) -> Option<(f32, f32)> {
+        if self.geo.text.w <= 0 || self.geo.text.h <= 0 {
+            return None;
+        }
+        self.mouse_up();
+        self.scroll_to_cursor(p);
+        self.reveal = false;
+        let doc = self.editor.text().clone();
+        let head = self.editor.selections().primary().head;
+        let target = piece_of(&doc, head);
+        let (first, first_row, mut y) = self.top(&mut p.text, &doc);
+        let g = self.geo;
+        let scroll_x = self.scroll_x;
+        let mut ctx = self.line_ctx(&mut p.text);
+        let (mut piece, mut skip) = (Some(first), first_row);
+        while let Some(pc) = piece {
+            ctx.prepare(&doc, &pc, None);
+            let rows = ctx.rows();
+            if pc.start == target.start {
+                let row = ctx.row_at(&rows, &pc, head);
+                let display = ctx.s.display.to_display(head.min(pc.end) - pc.start);
+                let x = (g.text.x + g.text_pad) as f32 + rows[row].place(ctx.x_at_display(display))
+                    - scroll_x;
+                y += (row + 1 - skip) as i32 * g.line_h;
+                return Some((
+                    x.clamp(g.text.x as f32, (g.text.right() - 1) as f32),
+                    (y as f32).clamp(g.text.y as f32, g.text.bottom() as f32),
+                ));
+            }
+            y += (rows.len() - skip) as i32 * g.line_h;
+            skip = 0;
+            piece = next_piece(&doc, &pc);
+        }
+        None
+    }
+
     pub fn mouse_down(
         &mut self,
         p: &mut Painter,
@@ -1864,6 +1929,110 @@ mod tests {
     fn draw(view: &mut EditorView, p: &mut Painter, area: Rect) {
         p.begin(1.0);
         view.draw(p, area, Instant::now());
+    }
+
+    fn first_line_point(view: &EditorView, p: &mut Painter, prefix: &str) -> (f32, f32) {
+        let g = view.geo;
+        let x = (g.text.x + g.text_pad) as f32 + p.measure(prefix, &view.style());
+        let y = (g.text.y + g.pad_top + g.line_h / 2) as f32;
+        (x, y)
+    }
+
+    #[test]
+    fn context_click_preserves_selections_and_targets_unselected_text() {
+        let (mut view, mut p, _) = view_of("alpha beta gamma", false);
+        let selections = Selections::new(vec![Selection::new(5, 0), Selection::new(11, 16)], 0);
+        view.editor.set_selections(selections.clone());
+        for prefix in ["", "alp", "alpha beta ga"] {
+            let (x, y) = first_line_point(&view, &mut p, prefix);
+            assert!(view.context_menu_at(&mut p, x, y, Instant::now()));
+            assert_eq!(*view.editor.selections(), selections);
+        }
+
+        // The selection's end is outside its range, so this becomes one caret.
+        let (x, y) = first_line_point(&view, &mut p, "alpha");
+        assert!(view.context_menu_at(&mut p, x, y, Instant::now()));
+        assert_eq!(
+            *view.editor.selections(),
+            Selections::single(Selection::cursor(5))
+        );
+    }
+
+    #[test]
+    fn context_click_keeps_existing_cursors_and_cancels_drag() {
+        let (mut view, mut p, _) = view_of("alpha beta gamma", false);
+        let (x, y) = first_line_point(&view, &mut p, "alpha b");
+        view.mouse_down(&mut p, x, y, 1, Modifiers::default(), Instant::now());
+        assert!(view.drag.is_some());
+        let selections = Selections::new(vec![Selection::cursor(0), Selection::cursor(7)], 0);
+        view.editor.set_selections(selections.clone());
+        assert!(view.context_menu_at(&mut p, x, y, Instant::now()));
+        assert!(view.drag.is_none());
+        view.mouse_move(&mut p, x + 50.0, y);
+        assert_eq!(*view.editor.selections(), selections);
+    }
+
+    #[test]
+    fn context_click_ignores_scrollbar_and_outside_view() {
+        let (mut view, mut p, _) = view_of("alpha beta gamma", false);
+        view.editor.select(0..5);
+        let selections = view.editor.selections().clone();
+        let scrollbar = view.geo.scrollbar;
+        for (x, y) in [
+            (scrollbar.x as f32, scrollbar.y as f32 + 20.0),
+            (-10.0, 20.0),
+            (100.0, 700.0),
+        ] {
+            assert!(!view.context_menu_at(&mut p, x, y, Instant::now()));
+            assert_eq!(*view.editor.selections(), selections);
+        }
+
+        // The gutter targets the line's start without selecting the whole line.
+        assert!(view.context_menu_at(&mut p, 10.0, 45.0, Instant::now()));
+        assert!(view.editor.selections().primary().is_empty());
+    }
+
+    #[test]
+    fn context_click_on_secondary_selection_preserves_scrolled_view() {
+        let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let (mut view, mut p, area) = view_of(&text, false);
+        view.scroll(&mut p, 0.0, 30.0, ScrollUnit::Lines, Modifiers::default());
+        draw(&mut view, &mut p, area);
+        let scroll = view.scroll_position();
+        let (x, y) = first_line_point(&view, &mut p, "");
+        let at = view.hit(&mut p, x, y);
+        assert!(at > 0);
+        let selections = Selections::new(vec![Selection::cursor(0), Selection::new(at, at + 4)], 0);
+        view.editor.set_selections(selections.clone());
+        view.changed(Instant::now());
+        assert!(view.context_menu_at(&mut p, x, y, Instant::now()));
+        draw(&mut view, &mut p, area);
+        assert_eq!(*view.editor.selections(), selections);
+        assert_eq!(view.scroll_position(), scroll);
+    }
+
+    #[test]
+    fn keyboard_context_menu_uses_current_cursor_and_reveals_it() {
+        let text = "alpha beta gamma\n".repeat(500);
+        for wrap in [false, true] {
+            let (mut view, mut p, area) = view_of(&text, wrap);
+            view.editor.select(text.len() - 8..text.len() - 8);
+            let (x, y) = view.context_menu_position(&mut p).unwrap();
+            assert_eq!(
+                view.hit(&mut p, x, y - 1.0),
+                view.editor.selections().primary().head
+            );
+            assert!(
+                view.geo.text.contains(x as i32, y as i32 - 1),
+                "anchor ({x}, {y}), area {:?}, top {:?}",
+                view.geo.text,
+                view.top
+            );
+            draw(&mut view, &mut p, area);
+            let caret = view.caret_rect().unwrap();
+            assert!((x - caret.x as f32).abs() <= 1.0);
+            assert!(y >= caret.y as f32);
+        }
     }
 
     /// A line of 1 MB: drawing, moving and clicking anywhere in it only lays out pieces.
