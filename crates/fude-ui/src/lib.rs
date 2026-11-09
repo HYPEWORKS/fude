@@ -18,7 +18,7 @@ mod view;
 pub use chrome::{STATUS_BAR_HEIGHT, StatusMessage, status_bar};
 pub use find::{FindAction, FindBar, FindField, FindStatus};
 pub use input::{ImeChange, InputKey, TextInput};
-pub use keymap::{Action, action_for, commands};
+pub use keymap::{Action, Shortcut, action_for, commands};
 pub use painter::Painter;
 pub use palette::{Palette, PaletteAction, PaletteItem};
 pub use prompt::{Prompt, PromptInput};

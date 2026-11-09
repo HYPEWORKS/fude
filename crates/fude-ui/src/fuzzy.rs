@@ -58,5 +58,11 @@ mod tests {
         let (scattered, _) = score("fs", "Preferences: Open Settings").unwrap();
         assert!(word_starts > scattered);
         assert_eq!(score("save", "File: Save").unwrap().1, vec![6, 7, 8, 9]);
+        // Equally good matches: the shorter title first.
+        let all = score("select all", "Selection: Select All").unwrap().0;
+        let occurrences = score("select all", "Selection: Select All Occurrences")
+            .unwrap()
+            .0;
+        assert!(all > occurrences);
     }
 }

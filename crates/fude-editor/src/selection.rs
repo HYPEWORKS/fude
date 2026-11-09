@@ -79,6 +79,14 @@ impl Selections {
         self.ranges.iter()
     }
 
+    /// The selections that touch `range` (sorted, like all of them): found by binary
+    /// search, so drawing a screen costs the same with ten thousand cursors elsewhere.
+    pub fn touching(&self, range: std::ops::Range<usize>) -> &[Selection] {
+        let first = self.ranges.partition_point(|s| s.end() < range.start);
+        let last = self.ranges.partition_point(|s| s.start() <= range.end);
+        &self.ranges[first..last.max(first)]
+    }
+
     pub fn len(&self) -> usize {
         self.ranges.len()
     }
@@ -103,6 +111,30 @@ impl Selections {
     /// Just the primary selection.
     pub fn only_primary(&self) -> Selections {
         Selections::single(*self.primary())
+    }
+
+    /// Without selection `index` (unless it's the only one). The one before it, or else
+    /// the first, becomes primary if it was.
+    pub fn without(&self, index: usize) -> Selections {
+        if self.ranges.len() == 1 || index >= self.ranges.len() {
+            return self.clone();
+        }
+        let mut ranges = self.ranges.clone();
+        ranges.remove(index);
+        let primary = match self.primary {
+            p if p == index => index.saturating_sub(1),
+            p if p > index => p - 1,
+            p => p,
+        };
+        Selections { ranges, primary }
+    }
+
+    /// With `selection` added, as the primary.
+    pub fn with(&self, selection: Selection) -> Selections {
+        let mut ranges = self.ranges.clone();
+        ranges.push(selection);
+        let primary = ranges.len() - 1;
+        Selections::new(ranges, primary)
     }
 
     /// Sorts and merges selections that overlap, or touch where one is a cursor.

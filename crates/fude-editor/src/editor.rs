@@ -5,11 +5,20 @@ use std::time::{Duration, Instant};
 
 use fude_buffer::{Bias, Buffer, Edit, Format, LineEnding, Rope, Version, map_offset};
 
+mod cursors;
+mod lines;
+
+pub use cursors::MAX_CURSORS;
+
 use crate::layout::Layout;
 use crate::selection::{Selection, Selections};
 use crate::text::{
-    WordStop, display_column, indent_end, next_grapheme, prev_grapheme, word_left, word_right,
+    WordStop, display_column, find_opener, indent_end, next_grapheme, prev_grapheme, word_left,
+    word_right,
 };
+
+/// How far bracket matching and auto-indent look for a bracket's partner.
+pub const BRACKET_LIMIT: usize = 64 * 1024;
 
 /// Where a cursor motion goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +42,10 @@ pub enum Motion {
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     pub tab_width: usize,
+    /// Indent with spaces (up to the next tab stop) rather than tabs.
+    pub insert_spaces: bool,
+    /// A line ending in `:` opens a block (Python): Enter indents after it.
+    pub indent_after_colon: bool,
     pub word_stop: WordStop,
     /// Typing after a pause this long starts a new undo step.
     pub undo_pause: Duration,
@@ -42,6 +55,8 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             tab_width: 4,
+            insert_spaces: false,
+            indent_after_colon: false,
             word_stop: WordStop::PLATFORM,
             undo_pause: Duration::from_secs(1),
         }
@@ -86,6 +101,9 @@ pub struct Editor {
     read_only: bool,
     /// An edit was refused since [`Editor::take_refused`] was last called.
     refused: bool,
+    /// The selections came from "select next occurrence" starting at a bare cursor, so
+    /// further occurrences match whole words only.
+    occurrence_word: bool,
     pub settings: Settings,
 }
 
@@ -99,7 +117,17 @@ impl Editor {
             changed_from: None,
             read_only: false,
             refused: false,
+            occurrence_word: false,
             settings: Settings::default(),
+        }
+    }
+
+    /// One level of indentation: a tab, or a tab's width of spaces.
+    pub fn indent_unit(&self) -> Vec<u8> {
+        if self.settings.insert_spaces {
+            vec![b' '; self.settings.tab_width.max(1)]
+        } else {
+            vec![b'\t']
         }
     }
 
@@ -185,6 +213,7 @@ impl Editor {
     /// Replaces the selections (mouse selection, select all). Ends the current undo step.
     pub fn set_selections(&mut self, selections: Selections) {
         self.selections = selections;
+        self.occurrence_word = false;
         self.seal();
     }
 
@@ -221,6 +250,46 @@ impl Editor {
         self.selections = after;
         self.mark_changed(from);
         self.seal();
+    }
+
+    /// Applies `edits` (sorted, non-overlapping) as one undo step, ending with `after`.
+    fn commit(&mut self, edits: &[(Range<usize>, Vec<u8>)], after: Selections) {
+        if edits.is_empty() || self.refuse() {
+            return;
+        }
+        let edits: Vec<Edit<'_>> = edits
+            .iter()
+            .map(|(r, t)| Edit::replace(r.clone(), t))
+            .collect();
+        let from = edits[0].range.start;
+        self.buffer
+            .edit(&edits, self.selections.clone(), after.clone(), false);
+        self.selections = after;
+        self.mark_changed(from);
+        self.seal();
+    }
+
+    /// Applies edits to whole lines (indenting, commenting): cursors move with the text
+    /// after them, selections grow to take in what's inserted at their edges.
+    fn apply_line_edits(&mut self, edits: &[(Range<usize>, Vec<u8>)]) {
+        let mapped: Vec<Edit<'_>> = edits
+            .iter()
+            .map(|(r, t)| Edit::replace(r.clone(), t))
+            .collect();
+        let after = self.selections.map(|s| {
+            if s.is_empty() {
+                return Selection::cursor(map_offset(&mapped, s.head, Bias::After));
+            }
+            let start = map_offset(&mapped, s.start(), Bias::Before);
+            let end = map_offset(&mapped, s.end(), Bias::After);
+            if s.head >= s.anchor {
+                Selection::new(start, end)
+            } else {
+                Selection::new(end, start)
+            }
+        });
+        drop(mapped);
+        self.commit(edits, after);
     }
 
     pub fn select_all(&mut self) {
@@ -274,26 +343,58 @@ impl Editor {
             return;
         }
         let bytes = normalize_breaks(text, self.format().line_ending);
+        let doc = self.text().clone();
         let reps = self
-            .each(|_, s| Some((s.range(), bytes.clone(), bytes.len())))
+            .each(|_, s| {
+                // A closing bracket typed into a line's indentation lines up with the
+                // line that opened it.
+                if let [close @ (b'}' | b']' | b')')] = bytes[..]
+                    && s.is_empty()
+                    && let Some(rep) = outdent_closer(&doc, s.head, close)
+                {
+                    return Some(rep);
+                }
+                Some((s.range(), bytes.clone(), bytes.len()))
+            })
             .collect();
         let ended_with_space = text.ends_with(char::is_whitespace);
         let starts_word = !text.starts_with(char::is_whitespace);
         self.apply(reps, Some(Kind::Typing), now, ended_with_space, starts_word);
     }
 
-    /// Enter: a line break in the document's style, keeping the line's indentation.
+    /// Enter: a line break in the document's style, keeping the line's indentation, one
+    /// level deeper after an opening bracket (or a `:` in Python). Between a pair of
+    /// brackets, the closing one goes on a line of its own.
     pub fn newline(&mut self, now: Instant) {
         let text = self.text().clone();
-        let le = self.format().line_ending;
+        let le = self.format().line_ending.as_bytes();
+        let unit = self.indent_unit();
+        let colon = self.settings.indent_after_colon;
         let reps = self
             .each(|_, s| {
                 let span = text.line_span(text.byte_to_line(s.start()));
                 let indent_to = indent_end(&text, span.start, span.end).min(s.start());
-                let mut insert = le.as_bytes().to_vec();
-                text.copy_range(span.start..indent_to, &mut insert);
-                let len = insert.len();
-                Some((s.range(), insert, len))
+                let mut indent = Vec::new();
+                text.copy_range(span.start..indent_to, &mut indent);
+                let before = last_non_blank(&text, span.start, s.start());
+                let opens =
+                    matches!(before, Some(b'{' | b'[' | b'(')) || (colon && before == Some(b':'));
+                let mut insert = le.to_vec();
+                insert.extend_from_slice(&indent);
+                if opens {
+                    insert.extend_from_slice(&unit);
+                }
+                let cursor = insert.len();
+                let after = (s.end() < span.end).then(|| text.byte(s.end()));
+                let closes = matches!(
+                    (before, after),
+                    (Some(b'{'), Some(b'}')) | (Some(b'['), Some(b']')) | (Some(b'('), Some(b')'))
+                );
+                if closes {
+                    insert.extend_from_slice(le);
+                    insert.extend_from_slice(&indent);
+                }
+                Some((s.range(), insert, cursor))
             })
             .collect();
         self.apply(reps, None, now, false, false);
@@ -460,10 +561,18 @@ impl Editor {
         let bytes = normalize_breaks(text, self.format().line_ending);
         let whole_lines = self.line_copy.as_deref() == Some(text)
             && self.selections.iter().all(Selection::is_empty);
+        // As many lines as cursors (copied from as many selections): one each.
+        let n = self.selections.len();
+        let lines: Vec<&str> = text.trim_end_matches(['\r', '\n']).lines().collect();
+        let spread = n > 1 && lines.len() == n && !whole_lines;
         let doc = self.text().clone();
         let reps = self
-            .each(|_, s| {
-                if whole_lines {
+            .each(|i, s| {
+                if spread {
+                    let line = lines[i].as_bytes().to_vec();
+                    let len = line.len();
+                    Some((s.range(), line, len))
+                } else if whole_lines {
                     let start = doc.line_to_byte(doc.byte_to_line(s.head));
                     Some((start..start, bytes.clone(), bytes.len() + (s.head - start)))
                 } else {
@@ -625,6 +734,39 @@ fn target(
 
 fn ends_with_break(text: &Rope, at: usize) -> bool {
     at > 0 && matches!(text.byte(at - 1), b'\n' | b'\r')
+}
+
+/// The last byte before `end` on its line (from `line_start`) that isn't a space or tab.
+fn last_non_blank(text: &Rope, line_start: usize, end: usize) -> Option<u8> {
+    let start = end.saturating_sub(256).max(line_start);
+    let mut window = Vec::new();
+    text.copy_range(start..end, &mut window);
+    window
+        .iter()
+        .rev()
+        .copied()
+        .find(|&b| b != b' ' && b != b'\t')
+}
+
+/// Typing `close` at `at`: if only indentation is before it on its line, the line's
+/// indentation becomes that of the line with the matching opener.
+fn outdent_closer(text: &Rope, at: usize, close: u8) -> Option<(Range<usize>, Vec<u8>, usize)> {
+    let span = text.line_span(text.byte_to_line(at));
+    if at - span.start > 256 || indent_end(text, span.start, at) != at {
+        return None;
+    }
+    let open = match close {
+        b'}' => b'{',
+        b']' => b'[',
+        _ => b'(',
+    };
+    let opener = find_opener(text, at, open, close, BRACKET_LIMIT, &|_| false)?;
+    let line = text.line_span(text.byte_to_line(opener));
+    let mut out = Vec::new();
+    text.copy_range(line.start..indent_end(text, line.start, line.end), &mut out);
+    out.push(close);
+    let len = out.len();
+    Some((span.start..at, out, len))
 }
 
 /// `text` with every line break in the given style.

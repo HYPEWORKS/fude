@@ -10,12 +10,14 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use fude_buffer::Rope;
-use fude_editor::{Editor, Layout, Motion, Searcher, Selection, Selections, nearest, text as nav};
+use fude_editor::{
+    BRACKET_LIMIT, Editor, Layout, Motion, Searcher, Selection, Selections, nearest, text as nav,
+};
 use fude_platform::{CursorShape, Ime, Key, KeyInput, Modifiers, ScrollUnit};
 use fude_render::Rect;
 use fude_text::{Chip, FontId, LineLayout, TextStyle, TextSystem};
 
-use fude_syntax::Span;
+use fude_syntax::{Span, Style};
 
 use crate::display::DisplayLine;
 use crate::pieces::{PIECE, Piece, first_piece, next_piece, piece_at, piece_of, prev_piece};
@@ -55,12 +57,25 @@ enum Unit {
     Char,
     Word,
     Line,
+    /// Alt+drag: a box, from a line and x.
+    Column,
 }
 
 /// A mouse selection in progress: what was clicked, and by what unit it grows.
 struct Drag {
     unit: Unit,
     origin: Range<usize>,
+}
+
+/// The bracket pair by the cursor (bracket, partner), for (text version, cursor,
+/// syntax colors' version).
+type BracketCache = ((u64, usize, u64), Option<(usize, usize)>);
+
+/// A column (box) selection being made: its corners as (line, x within the row).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Column {
+    anchor: (usize, f32),
+    head: (usize, f32),
 }
 
 /// Where things are, from the last layout (physical pixels).
@@ -358,8 +373,6 @@ pub struct EditorView {
     pub editor: Editor,
     /// Logical font size; zoom changes it.
     font_size: f32,
-    /// The Tab key inserts spaces up to the next tab stop.
-    pub insert_spaces: bool,
     /// Matches of this search are highlighted in the visible lines.
     pub search: Option<Searcher>,
     /// Wrap long lines at the view's edge.
@@ -378,6 +391,10 @@ pub struct EditorView {
     top_rows: usize,
     /// Scroll to this line at the next draw.
     goto_line: Option<f64>,
+    /// The column selection being made with Alt+drag or Shift+Alt+arrows.
+    column: Option<Column>,
+    /// The bracket pair at the cursor, for (version, cursor, colors' version).
+    bracket: Option<BracketCache>,
     /// Horizontal scroll, physical pixels.
     scroll_x: f32,
     /// Scroll the primary cursor into view at the next draw.
@@ -406,7 +423,6 @@ impl EditorView {
         EditorView {
             editor,
             font_size: DEFAULT_FONT_SIZE,
-            insert_spaces: false,
             search: None,
             wrap: false,
             highlights: None,
@@ -416,6 +432,8 @@ impl EditorView {
             top: Top::default(),
             top_rows: 1,
             goto_line: None,
+            column: None,
+            bracket: None,
             scroll_x: 0.0,
             reveal: false,
             center: false,
@@ -665,10 +683,28 @@ impl EditorView {
 
     /// Handles navigation, editing and typing keys. Returns whether the key was used.
     pub fn key(&mut self, p: &mut Painter, key: &KeyInput, now: Instant) -> bool {
-        if !key.pressed {
+        // Releases, and keys that do nothing here (Shift and Alt pressed on their own,
+        // on the way to Shift+Alt+Down), change nothing.
+        if !key.pressed || (key.key == Key::Other && key.text.is_none()) {
             return false;
         }
         let m = key.modifiers;
+        // Shift+Alt+arrows make a column selection (as in Notepad++).
+        if m.shift && m.alt && !m.primary() {
+            let rows = match key.key {
+                Key::Up => Some((-1, 0.0)),
+                Key::Down => Some((1, 0.0)),
+                Key::Left => Some((0, -1.0)),
+                Key::Right => Some((0, 1.0)),
+                _ => None,
+            };
+            if let Some((rows, columns)) = rows {
+                self.extend_column(p, rows, columns);
+                self.touched(now);
+                return true;
+            }
+        }
+        self.column = None;
         let mac = cfg!(target_os = "macos");
         let word = if mac { m.alt } else { m.ctrl };
         let page = (self.geo.visible - 1.0).floor().max(1.0) as usize;
@@ -719,8 +755,13 @@ impl EditorView {
             Key::Delete if word => self.editor.delete_word_right(now),
             Key::Delete => self.editor.delete(now),
             Key::Enter if !m.primary() => self.editor.newline(now),
-            Key::Tab if !m.primary() && !m.shift && !m.alt => {
-                if self.insert_spaces {
+            // Shift+Tab outdents; Tab indents when lines are selected.
+            Key::Tab if !m.primary() && !m.alt && m.shift => self.editor.outdent_lines(),
+            Key::Tab if !m.primary() && !m.alt && self.editor.spans_lines() => {
+                self.editor.indent_lines();
+            }
+            Key::Tab if !m.primary() && !m.alt => {
+                if self.editor.settings.insert_spaces {
                     // Spaces up to the next tab stop from the primary cursor.
                     let tab = self.editor.settings.tab_width.max(1);
                     let col = self.editor.cursor_line_col().1 - 1;
@@ -892,7 +933,35 @@ impl EditorView {
         }
         let at = self.hit(p, x, y);
         let doc = self.editor.text().clone();
-        let unit = if x < self.geo.text.x as f32 {
+        self.column = None;
+        let in_text = x >= self.geo.text.x as f32;
+        // Ctrl+Click (Cmd+Click on macOS) adds a cursor, or removes one.
+        let add = if cfg!(target_os = "macos") {
+            modifiers.logo
+        } else {
+            modifiers.ctrl
+        };
+        if add && clicks == 1 && in_text && !modifiers.shift {
+            self.editor.toggle_cursor(at);
+            self.blink_start = now;
+            return true;
+        }
+        // Alt+drag selects a column (a box).
+        if modifiers.alt && clicks == 1 && in_text {
+            let corner = (doc.byte_to_line(at), self.row_x(x));
+            let column = Column {
+                anchor: corner,
+                head: corner,
+            };
+            self.select_column(p, column);
+            self.drag = Some(Drag {
+                unit: Unit::Column,
+                origin: at..at,
+            });
+            self.blink_start = now;
+            return true;
+        }
+        let unit = if !in_text {
             Unit::Line
         } else {
             match clicks {
@@ -902,7 +971,7 @@ impl EditorView {
             }
         };
         let origin = match unit {
-            Unit::Char => at..at,
+            Unit::Char | Unit::Column => at..at,
             Unit::Word => nav::word_range(&doc, at),
             Unit::Line => line_range(&doc, at),
         };
@@ -954,7 +1023,16 @@ impl EditorView {
         let (unit, origin) = (drag.unit, drag.origin.clone());
         let at = self.hit(p, x, y);
         let doc = self.editor.text().clone();
+        if unit == Unit::Column {
+            if let Some(column) = self.column {
+                let head = (doc.byte_to_line(at), self.row_x(x));
+                self.select_column(p, Column { head, ..column });
+            }
+            self.reveal = true;
+            return;
+        }
         let selection = match unit {
+            Unit::Column => unreachable!("handled above"),
             Unit::Char => Selection::new(self.editor.selections().primary().anchor, at),
             Unit::Word | Unit::Line => {
                 let r = if unit == Unit::Word {
@@ -971,6 +1049,130 @@ impl EditorView {
         };
         self.editor.set_selections(Selections::single(selection));
         self.reveal = true;
+    }
+
+    // --- Multiple cursors and brackets ------------------------------------------------
+
+    /// A window x as an x within its row of text.
+    fn row_x(&self, x: f32) -> f32 {
+        (x - (self.geo.text.x + self.geo.text_pad) as f32 + self.scroll_x).max(0.0)
+    }
+
+    fn select_column(&mut self, p: &mut Painter, column: Column) {
+        self.column = Some(column);
+        let style = self.style();
+        let wrap = self.wrap_width();
+        let mut ctx = LineCtx {
+            text: &mut p.text,
+            style,
+            s: &mut self.scratch,
+            wrap,
+            max_x: f32::INFINITY,
+        };
+        self.editor
+            .select_column(column.anchor, column.head, &mut ctx);
+    }
+
+    /// Shift+Alt+arrows: grows the column selection by `rows` lines or `columns` columns,
+    /// starting one at the cursor.
+    fn extend_column(&mut self, p: &mut Painter, rows: isize, columns: f32) {
+        let doc = self.editor.text().clone();
+        let column = self.column.unwrap_or_else(|| {
+            let head = self.editor.selections().primary().head;
+            let line = doc.byte_to_line(head);
+            let x = self.line_ctx(&mut p.text).x_of(&doc, line, head);
+            Column {
+                anchor: (line, x),
+                head: (line, x),
+            }
+        });
+        let cell = p.metrics(&self.style()).space_advance;
+        let (line, x) = column.head;
+        let line = line.saturating_add_signed(rows).min(doc.line_count() - 1);
+        let x = (x + columns * cell).max(0.0);
+        self.select_column(
+            p,
+            Column {
+                head: (line, x),
+                ..column
+            },
+        );
+    }
+
+    /// Ctrl+Alt+Down (rows 1) / Up (-1): adds a cursor below the lowest (above the highest).
+    pub fn add_cursor_vertical(&mut self, p: &mut Painter, rows: isize, now: Instant) -> bool {
+        let style = self.style();
+        let wrap = self.wrap_width();
+        let mut ctx = LineCtx {
+            text: &mut p.text,
+            style,
+            s: &mut self.scratch,
+            wrap,
+            max_x: f32::INFINITY,
+        };
+        let added = self.editor.add_cursor_vertical(rows, &mut ctx);
+        self.touched(now);
+        added
+    }
+
+    /// Whether the bracket at `pos` is in a string or comment, as far as syntax colors for
+    /// the current text say.
+    fn in_string_or_comment(&self, doc: &Rope, pos: usize) -> bool {
+        let version = self.editor.buffer().version().get();
+        let Some(h) = self.highlights.as_ref().filter(|h| h.version == version) else {
+            return false;
+        };
+        let line = doc.byte_to_line(pos);
+        let Some(spans) = h.line(line) else {
+            return false;
+        };
+        let at = (pos - doc.line_to_byte(line)) as u32;
+        let i = spans.partition_point(|s| s.end <= at);
+        spans.get(i).is_some_and(|s| {
+            s.start <= at && matches!(s.style, Style::String | Style::Comment | Style::Escape)
+        })
+    }
+
+    /// The bracket next to the primary cursor and its partner, if it has one.
+    fn bracket_pair(&mut self) -> Option<(usize, usize)> {
+        let primary = *self.editor.selections().primary();
+        if !primary.is_empty() {
+            return None;
+        }
+        let colors = self.highlights.as_ref().map_or(0, |h| h.version);
+        let key = (self.editor.buffer().version().get(), primary.head, colors);
+        if let Some((k, pair)) = self.bracket
+            && k == key
+        {
+            return pair;
+        }
+        let doc = self.editor.text().clone();
+        let ignore = |pos: usize| self.in_string_or_comment(&doc, pos);
+        let pair = nav::matching_bracket(&doc, primary.head, BRACKET_LIMIT, &ignore);
+        self.bracket = Some((key, pair));
+        pair
+    }
+
+    /// Moves each cursor to the bracket matching the one next to it (before the bracket,
+    /// so doing it again comes back). Returns whether any moved.
+    pub fn go_to_bracket(&mut self, now: Instant) -> bool {
+        let doc = self.editor.text().clone();
+        let mut moved = false;
+        let next = self.editor.selections().map(|s| {
+            let ignore = |pos: usize| self.in_string_or_comment(&doc, pos);
+            match nav::matching_bracket(&doc, s.head, BRACKET_LIMIT, &ignore) {
+                Some((_, to)) => {
+                    moved = true;
+                    Selection::cursor(to)
+                }
+                None => *s,
+            }
+        });
+        if moved {
+            self.editor.set_selections(next);
+            self.touched(now);
+        }
+        moved
     }
 
     /// The piece at the top, its first visible row, and the y of that row.
@@ -1184,6 +1386,14 @@ impl EditorView {
         }
         let last = *visible.last().unwrap_or(&first);
         self.visible_lines = first.line..last.line + 1;
+        // Only the selections on screen are drawn: there can be thousands elsewhere.
+        let shown_sels: Vec<Selection> = sels
+            .touching(first.start..last.span.next.max(last.end))
+            .to_vec();
+        let active_lines: Vec<usize> = shown_sels
+            .iter()
+            .map(|s| doc.byte_to_line(s.head))
+            .collect();
         self.visible_bytes = last.end - first.start;
         self.fits = first.start == 0
             && first_row == 0
@@ -1209,9 +1419,12 @@ impl EditorView {
             t.selection_inactive
         };
         let caret_w = p.px(2.0).max(1);
+        let t_bracket = t.bracket_match;
+        let outline = p.px(1.0).max(1);
         let caret_h = ((m.ascent + m.descent) * 1.15).round() as i32;
         let gap = m.space_advance * 0.5;
         let preedit = self.preedit.clone();
+        let brackets = self.bracket_pair();
         let wrap = self.wrap_width();
         let mut max_width = 0.0f32;
         let mut row_layout = LineLayout::default();
@@ -1321,7 +1534,7 @@ impl EditorView {
                     }
                 }
                 // Selections, extended a little past the line end when they include the break.
-                for s in sels.iter().filter(|s| !s.is_empty()) {
+                for s in shown_sels.iter().filter(|s| !s.is_empty()) {
                     if s.end() < piece.start
                         || s.start() > piece.end
                         || s.end() == piece.start && piece.start != piece.end
@@ -1351,6 +1564,25 @@ impl EditorView {
                             selection_color,
                         );
                     }
+                }
+                // The bracket by the cursor and its partner, outlined.
+                for b in brackets.iter().flat_map(|&(a, b)| [a, b]) {
+                    if b < piece.start || b >= piece.end {
+                        continue;
+                    }
+                    let d = ctx.s.display.to_display(b - piece.start);
+                    if d < row.start || d >= row.end {
+                        continue;
+                    }
+                    let x0 = (origin + row.place(ctx.x_at_display(d))).round() as i32;
+                    let x1 = (origin + row.place(ctx.x_at_display(d + 1))).round() as i32;
+                    let (w, t) = ((x1 - x0).max(2), outline);
+                    let top = y + (g.line_h - caret_h) / 2;
+                    let color = t_bracket;
+                    p.list.rect(Rect::new(x0, top, w, t), color);
+                    p.list.rect(Rect::new(x0, top + caret_h - t, w, t), color);
+                    p.list.rect(Rect::new(x0, top, t, caret_h), color);
+                    p.list.rect(Rect::new(x0 + w - t, top, t, caret_h), color);
                 }
                 // The row's glyphs on screen, moved to the row's start. Glyphs advance
                 // left to right (shaped runs come in visual order), so a row of a long
@@ -1445,7 +1677,7 @@ impl EditorView {
                     }
                 }
                 // Carets on this row.
-                for s in sels.iter() {
+                for s in shown_sels.iter() {
                     if !piece.holds(s.head) {
                         continue;
                     }
@@ -1482,7 +1714,7 @@ impl EditorView {
             // Line number, on the line's first row.
             if piece.is_first() && skip == 0 {
                 let baseline = p.center_baseline(line_top, g.line_h, &style);
-                let active = sels.iter().any(|s| doc.byte_to_line(s.head) == piece.line);
+                let active = active_lines.contains(&piece.line);
                 let number = (piece.line + 1).to_string();
                 let w = p.measure(&number, &style);
                 let x = (g.text.x - p.px(16.0)) as f32 - w;
@@ -1624,6 +1856,7 @@ mod tests {
                 ..Modifiers::default()
             },
             text: None,
+            base: None,
         };
         view.key(p, &input, Instant::now());
     }

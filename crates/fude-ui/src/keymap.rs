@@ -1,7 +1,9 @@
 //! Shortcuts for actions beyond moving and typing (which [`crate::EditorView`] handles).
 //! Every action has a stable name, ready for the command palette and user keymaps.
 
+use fude_buffer::LineEnding;
 use fude_platform::{Key, KeyInput};
+use fude_tools::Tool;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -32,6 +34,29 @@ pub enum Action {
     CommandPalette,
     GoToLine,
     ToggleWrap,
+    SelectNextOccurrence,
+    SelectAllOccurrences,
+    SplitIntoLines,
+    AddCursorAbove,
+    AddCursorBelow,
+    GoToBracket,
+    DuplicateLine,
+    MoveLineUp,
+    MoveLineDown,
+    DeleteLine,
+    JoinLines,
+    InsertLineBelow,
+    InsertLineAbove,
+    Indent,
+    Outdent,
+    ToggleComment,
+    ToggleBlockComment,
+    /// A built-in text tool.
+    Tool(Tool),
+    /// Converts every line break.
+    LineEndings(LineEnding),
+    /// An external tool from the settings, by its index there.
+    External(u16),
 }
 
 impl Action {
@@ -63,6 +88,28 @@ impl Action {
             Action::CommandPalette => "app.command_palette",
             Action::GoToLine => "edit.go_to_line",
             Action::ToggleWrap => "view.toggle_wrap",
+            Action::SelectNextOccurrence => "selection.add_next_occurrence",
+            Action::SelectAllOccurrences => "selection.all_occurrences",
+            Action::SplitIntoLines => "selection.split_into_lines",
+            Action::AddCursorAbove => "selection.add_cursor_above",
+            Action::AddCursorBelow => "selection.add_cursor_below",
+            Action::GoToBracket => "edit.go_to_bracket",
+            Action::DuplicateLine => "line.duplicate",
+            Action::MoveLineUp => "line.move_up",
+            Action::MoveLineDown => "line.move_down",
+            Action::DeleteLine => "line.delete",
+            Action::JoinLines => "line.join",
+            Action::InsertLineBelow => "line.insert_below",
+            Action::InsertLineAbove => "line.insert_above",
+            Action::Indent => "line.indent",
+            Action::Outdent => "line.outdent",
+            Action::ToggleComment => "edit.toggle_comment",
+            Action::ToggleBlockComment => "edit.toggle_block_comment",
+            Action::Tool(tool) => tool.name(),
+            Action::LineEndings(LineEnding::Lf) => "format.line_endings_lf",
+            Action::LineEndings(LineEnding::CrLf) => "format.line_endings_crlf",
+            Action::LineEndings(LineEnding::Cr) => "format.line_endings_cr",
+            Action::External(_) => "tools.external",
         }
     }
 }
@@ -93,9 +140,51 @@ pub fn action_for(key: &KeyInput) -> Option<Action> {
             _ => {}
         }
     }
-    // Alt+Z toggles word wrap, as in VS Code.
-    if m.alt && !m.ctrl && !m.logo && key.key == Key::Character("z".into()) {
-        return Some(Action::ToggleWrap);
+    let mac = cfg!(target_os = "macos");
+    match key.key {
+        // Alt+Up/Down move lines; Ctrl+Alt+Up/Down (Cmd+Option on macOS) add cursors.
+        Key::Up | Key::Down => {
+            let down = key.key == Key::Down;
+            let add_cursor = if mac {
+                m.logo && m.alt
+            } else {
+                m.ctrl && m.alt
+            };
+            if add_cursor && !m.shift {
+                return Some(if down {
+                    Action::AddCursorBelow
+                } else {
+                    Action::AddCursorAbove
+                });
+            }
+            if m.alt && !m.ctrl && !m.logo && !m.shift {
+                return Some(if down {
+                    Action::MoveLineDown
+                } else {
+                    Action::MoveLineUp
+                });
+            }
+        }
+        // Ctrl+Enter opens a line below, Ctrl+Shift+Enter above.
+        Key::Enter if m.primary() && !m.alt => {
+            return Some(if m.shift {
+                Action::InsertLineAbove
+            } else {
+                Action::InsertLineBelow
+            });
+        }
+        _ => {}
+    }
+    // Alt+Z toggles word wrap (as in VS Code), Shift+Alt+A block comments, Shift+Alt+I
+    // splits the selection into lines.
+    if m.alt && !m.ctrl && !m.logo {
+        let c = key.shortcut_char().map(str::to_lowercase);
+        match (c.as_deref(), m.shift) {
+            (Some("z"), false) => return Some(Action::ToggleWrap),
+            (Some("a"), true) => return Some(Action::ToggleBlockComment),
+            (Some("i"), true) => return Some(Action::SplitIntoLines),
+            _ => {}
+        }
     }
     if !m.primary() {
         // Shift+Delete / Shift+Insert / Ctrl+Insert, the old clipboard keys.
@@ -105,7 +194,7 @@ pub fn action_for(key: &KeyInput) -> Option<Action> {
             _ => None,
         };
     }
-    let Key::Character(c) = &key.key else {
+    let Some(c) = key.shortcut_char() else {
         return match key.key {
             Key::Insert => Some(Action::Copy),
             _ => None,
@@ -113,6 +202,15 @@ pub fn action_for(key: &KeyInput) -> Option<Action> {
     };
     let shift = m.shift;
     Some(match c.to_lowercase().as_str() {
+        "d" if shift => Action::DuplicateLine,
+        "d" => Action::SelectNextOccurrence,
+        "l" if shift => Action::SelectAllOccurrences,
+        "k" if shift => Action::DeleteLine,
+        "j" => Action::JoinLines,
+        "/" => Action::ToggleComment,
+        "]" => Action::Indent,
+        "[" => Action::Outdent,
+        "\\" | "|" if shift => Action::GoToBracket,
         "n" => Action::New,
         "o" => Action::Open,
         "s" if shift => Action::SaveAs,
@@ -148,7 +246,7 @@ pub fn action_for(key: &KeyInput) -> Option<Action> {
 }
 
 /// Every command for the palette: its action, a title, and its shortcut on this platform.
-pub fn commands() -> Vec<(Action, &'static str, String)> {
+pub fn commands() -> Vec<(Action, String, String)> {
     let mac = cfg!(target_os = "macos");
     let key = |k: &str| {
         if mac {
@@ -157,7 +255,21 @@ pub fn commands() -> Vec<(Action, &'static str, String)> {
             format!("Ctrl+{k}")
         }
     };
-    vec![
+    let alt = |k: &str| {
+        if mac {
+            format!("⌥{}", k.replace("Shift+", "⇧"))
+        } else {
+            format!("Alt+{k}")
+        }
+    };
+    let ctrl_alt = |k: &str| {
+        if mac {
+            format!("⌥⌘{k}")
+        } else {
+            format!("Ctrl+Alt+{k}")
+        }
+    };
+    let mut out: Vec<(Action, String, String)> = vec![
         (Action::New, "File: New", key("N")),
         (Action::Open, "File: Open…", key("O")),
         (Action::Save, "File: Save", key("S")),
@@ -173,7 +285,7 @@ pub fn commands() -> Vec<(Action, &'static str, String)> {
         (Action::Cut, "Edit: Cut", key("X")),
         (Action::Copy, "Edit: Copy", key("C")),
         (Action::Paste, "Edit: Paste", key("V")),
-        (Action::SelectAll, "Edit: Select All", key("A")),
+        (Action::SelectAll, "Selection: Select All", key("A")),
         (
             Action::GoToLine,
             "Go to Line…",
@@ -206,5 +318,286 @@ pub fn commands() -> Vec<(Action, &'static str, String)> {
         (Action::ZoomOut, "View: Zoom Out", key("-")),
         (Action::ZoomReset, "View: Reset Zoom", key("0")),
         (Action::OpenSettings, "Preferences: Open Settings", key(",")),
+        (
+            Action::SelectNextOccurrence,
+            "Selection: Add Next Occurrence",
+            key("D"),
+        ),
+        (
+            Action::SelectAllOccurrences,
+            "Selection: Select All Occurrences",
+            key("Shift+L"),
+        ),
+        (
+            Action::SplitIntoLines,
+            "Selection: Split into Lines",
+            alt("Shift+I"),
+        ),
+        (
+            Action::AddCursorAbove,
+            "Selection: Add Cursor Above",
+            ctrl_alt("↑"),
+        ),
+        (
+            Action::AddCursorBelow,
+            "Selection: Add Cursor Below",
+            ctrl_alt("↓"),
+        ),
+        (
+            Action::GoToBracket,
+            "Go to Matching Bracket",
+            key("Shift+\\"),
+        ),
+        (Action::DuplicateLine, "Line: Duplicate", key("Shift+D")),
+        (Action::MoveLineUp, "Line: Move Up", alt("↑")),
+        (Action::MoveLineDown, "Line: Move Down", alt("↓")),
+        (Action::DeleteLine, "Line: Delete", key("Shift+K")),
+        (Action::JoinLines, "Line: Join", key("J")),
+        (Action::InsertLineBelow, "Line: Insert Below", key("Enter")),
+        (
+            Action::InsertLineAbove,
+            "Line: Insert Above",
+            key("Shift+Enter"),
+        ),
+        (Action::Indent, "Line: Indent", key("]")),
+        (Action::Outdent, "Line: Outdent", key("[")),
+        (Action::ToggleComment, "Toggle Line Comment", key("/")),
+        (
+            Action::ToggleBlockComment,
+            "Toggle Block Comment",
+            alt("Shift+A"),
+        ),
+        (
+            Action::LineEndings(LineEnding::Lf),
+            "Line Endings: Convert to LF (Unix, macOS)",
+            String::new(),
+        ),
+        (
+            Action::LineEndings(LineEnding::CrLf),
+            "Line Endings: Convert to CRLF (Windows)",
+            String::new(),
+        ),
+        (
+            Action::LineEndings(LineEnding::Cr),
+            "Line Endings: Convert to CR (Classic Mac)",
+            String::new(),
+        ),
     ]
+    .into_iter()
+    .map(|(a, t, k)| (a, t.to_owned(), k))
+    .collect();
+    out.extend(Tool::ALL.iter().map(|&t| {
+        (
+            Action::Tool(t),
+            format!("Tools: {}", t.title()),
+            String::new(),
+        )
+    }));
+    out
+}
+
+/// A key combination from the settings, such as `"ctrl+alt+j"` or `"shift+f5"`. `mod` is
+/// Ctrl, or Cmd on macOS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shortcut {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    logo: bool,
+    key: ShortcutKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ShortcutKey {
+    /// A character, lower case.
+    Char(String),
+    Named(Key),
+}
+
+impl Shortcut {
+    pub fn parse(s: &str) -> Result<Shortcut, String> {
+        let mac = cfg!(target_os = "macos");
+        let mut out = Shortcut {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            logo: false,
+            key: ShortcutKey::Named(Key::Other),
+        };
+        let parts: Vec<String> = s.split('+').map(|p| p.trim().to_lowercase()).collect();
+        let Some((last, mods)) = parts.split_last() else {
+            return Err("an empty key".into());
+        };
+        for m in mods {
+            match m.as_str() {
+                "ctrl" | "control" => out.ctrl = true,
+                "alt" | "option" | "opt" => out.alt = true,
+                "shift" => out.shift = true,
+                "cmd" | "command" | "super" | "win" | "meta" | "logo" => out.logo = true,
+                "mod" | "primary" if mac => out.logo = true,
+                "mod" | "primary" => out.ctrl = true,
+                other => return Err(format!("unknown modifier {other:?} in {s:?}")),
+            }
+        }
+        out.key = match last.as_str() {
+            "enter" | "return" => ShortcutKey::Named(Key::Enter),
+            "tab" => ShortcutKey::Named(Key::Tab),
+            "space" => ShortcutKey::Char(" ".into()),
+            "escape" | "esc" => ShortcutKey::Named(Key::Escape),
+            "backspace" => ShortcutKey::Named(Key::Backspace),
+            "delete" | "del" => ShortcutKey::Named(Key::Delete),
+            "insert" | "ins" => ShortcutKey::Named(Key::Insert),
+            "home" => ShortcutKey::Named(Key::Home),
+            "end" => ShortcutKey::Named(Key::End),
+            "pageup" => ShortcutKey::Named(Key::PageUp),
+            "pagedown" => ShortcutKey::Named(Key::PageDown),
+            "up" => ShortcutKey::Named(Key::Up),
+            "down" => ShortcutKey::Named(Key::Down),
+            "left" => ShortcutKey::Named(Key::Left),
+            "right" => ShortcutKey::Named(Key::Right),
+            f if f.len() > 1
+                && f.starts_with('f')
+                && f[1..].parse::<u8>().is_ok_and(|n| (1..=12).contains(&n)) =>
+            {
+                ShortcutKey::Named(Key::F(f[1..].parse().expect("checked")))
+            }
+            c if c.chars().count() == 1 => ShortcutKey::Char(c.to_owned()),
+            other => return Err(format!("unknown key {other:?} in {s:?}")),
+        };
+        Ok(out)
+    }
+
+    pub fn matches(&self, key: &KeyInput) -> bool {
+        let m = key.modifiers;
+        if !key.pressed
+            || (m.ctrl, m.alt, m.shift, m.logo) != (self.ctrl, self.alt, self.shift, self.logo)
+        {
+            return false;
+        }
+        match &self.key {
+            ShortcutKey::Named(k) => key.key == *k,
+            ShortcutKey::Char(c) => key.shortcut_char().is_some_and(|s| s.to_lowercase() == *c),
+        }
+    }
+
+    /// For the command palette: "Ctrl+Alt+J", or "⌃⌥J" on macOS.
+    pub fn label(&self) -> String {
+        let mac = cfg!(target_os = "macos");
+        let key = match &self.key {
+            ShortcutKey::Char(c) if c == " " => "Space".to_owned(),
+            ShortcutKey::Char(c) => c.to_uppercase(),
+            ShortcutKey::Named(Key::F(n)) => format!("F{n}"),
+            ShortcutKey::Named(k) => format!("{k:?}"),
+        };
+        let mods = [
+            (self.ctrl, "Ctrl+", "⌃"),
+            (self.alt, "Alt+", "⌥"),
+            (self.shift, "Shift+", "⇧"),
+            (self.logo, if mac { "Cmd+" } else { "Super+" }, "⌘"),
+        ];
+        let mut out: String = mods
+            .iter()
+            .filter(|m| m.0)
+            .map(|m| if mac { m.2 } else { m.1 })
+            .collect();
+        out.push_str(&key);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fude_platform::Modifiers;
+
+    fn press(key: Key, base: Option<&str>, m: Modifiers) -> KeyInput {
+        KeyInput {
+            key,
+            pressed: true,
+            repeat: false,
+            modifiers: m,
+            text: None,
+            base: base.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn shortcuts_parse_and_match() {
+        let s = Shortcut::parse("Ctrl+Alt+J").unwrap();
+        let m = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Modifiers::default()
+        };
+        assert!(s.matches(&press(Key::Character("j".into()), Some("j"), m)));
+        assert!(!s.matches(&press(
+            Key::Character("j".into()),
+            Some("j"),
+            Modifiers::default()
+        )));
+        let f5 = Shortcut::parse("shift+f5").unwrap();
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert!(f5.matches(&press(Key::F(5), None, shift)));
+        assert!(Shortcut::parse("hyper+x").is_err());
+        assert!(Shortcut::parse("ctrl+banana").is_err());
+        if !cfg!(target_os = "macos") {
+            assert_eq!(s.label(), "Ctrl+Alt+J");
+        }
+    }
+
+    #[test]
+    fn new_editing_shortcuts() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let ctrl_shift = Modifiers {
+            shift: true,
+            ..ctrl
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let ch = |c: &str, shown: &str, m| press(Key::Character(shown.into()), Some(c), m);
+        assert_eq!(
+            action_for(&ch("d", "d", ctrl)),
+            Some(Action::SelectNextOccurrence)
+        );
+        assert_eq!(
+            action_for(&ch("d", "D", ctrl_shift)),
+            Some(Action::DuplicateLine)
+        );
+        // Shift turns \ into | on US layouts; shortcuts go by the unshifted key.
+        assert_eq!(
+            action_for(&ch("\\", "|", ctrl_shift)),
+            Some(Action::GoToBracket)
+        );
+        assert_eq!(action_for(&ch("/", "/", ctrl)), Some(Action::ToggleComment));
+        assert_eq!(
+            action_for(&press(Key::Up, None, alt)),
+            Some(Action::MoveLineUp)
+        );
+        let ctrl_alt = Modifiers { alt: true, ..ctrl };
+        assert_eq!(
+            action_for(&press(Key::Down, None, ctrl_alt)),
+            Some(Action::AddCursorBelow)
+        );
+        let shift_alt = Modifiers { shift: true, ..alt };
+        assert_eq!(
+            action_for(&ch("a", "A", shift_alt)),
+            Some(Action::ToggleBlockComment)
+        );
+        assert_eq!(
+            action_for(&press(Key::Up, None, shift_alt)),
+            None,
+            "column selection, in the view"
+        );
+    }
 }

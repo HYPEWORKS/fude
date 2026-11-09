@@ -32,6 +32,8 @@ pub struct Theme {
     /// Selection while the window isn't focused.
     pub selection_inactive: Color,
     /// Find matches other than the current one.
+    /// Outline around a bracket next to the cursor and its partner.
+    pub bracket_match: Color,
     pub find_match: Color,
     pub caret: Color,
     pub gutter_text: Color,
@@ -97,6 +99,7 @@ pub static SUMI: Theme = Theme {
     selection: Color::rgb(0x3D3530),
     selection_inactive: Color::rgb(0x312D29),
     find_match: Color::rgb(0x4D4128),
+    bracket_match: Color::rgba(0xE6E1D6, 0x60),
     caret: Color::rgb(0xE2553F),
     gutter_text: Color::rgb(0x5E5A53),
     gutter_text_active: Color::rgb(0xA8A296),
@@ -145,6 +148,7 @@ pub static WASHI: Theme = Theme {
     selection: Color::rgb(0xEED8CD),
     selection_inactive: Color::rgb(0xE8E2D6),
     find_match: Color::rgb(0xF4E2B2),
+    bracket_match: Color::rgba(0x2B2A27, 0x60),
     caret: Color::rgb(0xC8402A),
     gutter_text: Color::rgb(0xA9A194),
     gutter_text_active: Color::rgb(0x5E584E),

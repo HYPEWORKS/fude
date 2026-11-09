@@ -10,6 +10,7 @@
 //! the view with a fresh state, which is usually right; a background pass then fills in
 //! exact checkpoints (for files up to [`BACKGROUND_LIMIT`]) and corrects what's shown.
 
+mod comments;
 mod style;
 
 use std::collections::HashMap;
@@ -20,6 +21,7 @@ use std::thread;
 use fude_buffer::Rope;
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
+pub use comments::{Comments, comments};
 pub use style::Style;
 use style::StyleMap;
 

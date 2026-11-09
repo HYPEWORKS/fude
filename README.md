@@ -4,7 +4,7 @@
 
 A cross-platform text editor somewhere between Notepad and Notepad++: instant startup, instant response at any file size, low memory use. Windows, macOS and Linux, with BSD as a bonus.
 
-> **Status: early.** Phases 0–4 are done: tabs, find and replace, syntax highlighting for 75 languages, word wrap, a command palette, settings and light/dark themes, single instance, hot exit (quitting never asks; unsaved work comes back), and large files: a 500 MB file shows in 23 ms and loads in the background, and lines of any length (a 100 MB single-line JSON file) edit as quickly as short ones. Power features (multiple cursors, column selection, tools) are phase 5. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design, roadmap and measurements.
+> **Status: early.** Phases 0–4 are done: tabs, find and replace, syntax highlighting for 75 languages, word wrap, a command palette, settings and light/dark themes, single instance, hot exit (quitting never asks; unsaved work comes back), large files (a 500 MB file shows in 23 ms and loads in the background; lines of any length edit as quickly as short ones), multiple cursors and column selection, line commands, comments, bracket matching, auto-indent, and text tools, built in or your own. Packaging and release are phase 6. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design, roadmap and measurements.
 
 ## Building
 
@@ -19,15 +19,17 @@ cargo run --release -- some/file.txt
 |---|---|
 | Move | arrows, Home / End, PageUp / PageDown, Ctrl+arrows by word, Ctrl+Home / End |
 | Select | Shift + any move, drag, double-click a word, triple-click a line, click the gutter |
-| Edit | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) undo and redo, Ctrl+X / C / V, Ctrl+A |
+| Edit | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) undo and redo, Ctrl+X / C / V, Ctrl+A, Ctrl+/ comment, Shift+Alt+A block comment |
+| Cursors | Ctrl+Click add or remove, Ctrl+D next occurrence, Ctrl+Shift+L all occurrences, Ctrl+Alt+↑/↓ add above or below, Shift+Alt+I one per line, Alt+drag or Shift+Alt+arrows column selection, Escape back to one |
+| Lines | Alt+↑/↓ move, Ctrl+Shift+D duplicate, Ctrl+Shift+K delete, Ctrl+J join, Ctrl+Enter / Ctrl+Shift+Enter new line below / above, Tab / Shift+Tab (or Ctrl+] / Ctrl+[) indent / outdent, Ctrl+Shift+\ matching bracket |
 | Files | Ctrl+N new tab, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+W close tab, Ctrl+Q quit |
 | Tabs | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PageUp / PageDown, Ctrl+1…9; middle-click closes, drag reorders |
 | Find | Ctrl+F find, Ctrl+H replace (⌘⌥F on macOS), F3 / Shift+F3 next and previous, Alt+C / W / R case, word, regex |
-| Go | Ctrl+Shift+P or F1 command palette, Ctrl+G go to line (⌘L on macOS) |
+| Go | Ctrl+Shift+P or F1 command palette (with the text tools: sort, case, Base64, JSON, hashes, line endings…), Ctrl+G go to line (⌘L on macOS) |
 | View | Alt+Z word wrap, Ctrl+= / Ctrl+- / Ctrl+0 zoom, Shift+wheel scrolls sideways |
 | Settings | Ctrl+, opens `fude.toml` (font size, tab width, spaces, wrap, theme, hot exit, the size of file that asks before opening); saving it applies it |
 
-Run from a terminal, fude opens its window in the background and gives the terminal back, like `code`; running `fude file` while fude is open hands the file to the open window. `--new-instance` opens another window. `--wait` stays in the terminal until the window closes, for use as git's editor: `git config --global core.editor "fude --wait"`. Files dropped on the window open in tabs. A large file shows its start at once and is editable when the rest has loaded (a fraction of a second for hundreds of MB); files over 1 GB ask first. Without word wrap, a line longer than 4 KB shows as several wide rows rather than one endless one. Settings live in `~/.config/fude` (`%APPDATA%\fude` on Windows, `~/Library/Application Support/fude` on macOS); the session and unsaved changes in `~/.local/state/fude` (`%LOCALAPPDATA%\fude`, the same folder on macOS).
+Run from a terminal, fude opens its window in the background and gives the terminal back, like `code`; running `fude file` while fude is open hands the file to the open window. `--new-instance` opens another window. `--wait` stays in the terminal until the window closes, for use as git's editor: `git config --global core.editor "fude --wait"`. Files dropped on the window open in tabs. A large file shows its start at once and is editable when the rest has loaded (a fraction of a second for hundreds of MB); files over 1 GB ask first. Without word wrap, a line longer than 4 KB shows as several wide rows rather than one endless one. External programs can be added as tools in the settings (`[[tool]]`; the settings file has an example): they get the selection or document on standard input, and what they print replaces it, is inserted, opens in a new tab or shows in the status bar. Settings live in `~/.config/fude` (`%APPDATA%\fude` on Windows, `~/Library/Application Support/fude` on macOS); the session and unsaved changes in `~/.local/state/fude` (`%LOCALAPPDATA%\fude`, the same folder on macOS).
 
 ## Development
 
@@ -64,6 +66,7 @@ env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1920x1080x24 -noreset" cargo xt
 |---|---|
 | `crates/fude-buffer` | Rope, snapshots, undo, encodings, line endings, loading and saving |
 | `crates/fude-editor` | Selections, cursor movement, editing commands and search, without UI |
+| `crates/fude-tools` | Built-in text tools: sorting, case, encodings, JSON and XML formatting, hashes |
 | `crates/fude-syntax` | Syntax highlighting on a worker thread |
 | `crates/fude-ui` | Editor view, tabs, find bar, command palette, status bar, dialogs, themes |
 | `crates/fude-render` | Draw list and CPU rasterizer |

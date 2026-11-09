@@ -2,9 +2,10 @@
 //! when saved.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use fude_platform::OsTheme;
-use fude_ui::{SUMI, Theme, WASHI};
+use fude_ui::{SUMI, Shortcut, Theme, WASHI};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeChoice {
@@ -26,6 +27,44 @@ pub struct Config {
     pub hot_exit: bool,
     /// Ask before opening files larger than this (MB).
     pub large_file_mb: u64,
+    /// External tools (`[[tool]]` tables).
+    pub tools: Vec<ExternalTool>,
+}
+
+/// A program run as a command: it gets the selection or document on standard input, and
+/// what it prints is used as `output` says.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalTool {
+    pub name: String,
+    /// The program and its arguments; `{file}`, `{dir}`, `{name}` and `{line}` are
+    /// replaced with the document's path, folder, file name and the cursor's line.
+    pub command: Vec<String>,
+    pub input: ToolInput,
+    pub output: ToolOutput,
+    pub key: Option<Shortcut>,
+    /// The program is stopped if it runs longer than this.
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolInput {
+    /// The selections (each run on its own), or the whole document if nothing is selected.
+    SelectionOrDocument,
+    Selection,
+    Document,
+    Nothing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutput {
+    /// Replaces the input.
+    Replace,
+    /// Goes in at the cursor.
+    Insert,
+    NewTab,
+    /// Shown in the status bar.
+    Message,
+    Nothing,
 }
 
 impl Default for Config {
@@ -38,6 +77,7 @@ impl Default for Config {
             theme: ThemeChoice::Auto,
             hot_exit: true,
             large_file_mb: 1024,
+            tools: Vec::new(),
         }
     }
 }
@@ -67,6 +107,19 @@ hot_exit = true
 # Ask before opening a file larger than this many MB. Open files take about as much
 # memory as their size.
 large_file_mb = 1024
+
+# External tools run a program on the selection (or the whole document) and use what it
+# prints; they're in the command palette as "Tool: <name>". In the command, {file},
+# {dir} and {name} are the document's path, folder and file name, {line} the cursor's
+# line. For example:
+#
+# [[tool]]
+# name = "Format JSON (jq)"
+# command = ["jq", "."]
+# input = "selection-or-document"   # or "selection", "document", "nothing"
+# output = "replace"                # or "insert", "new-tab", "message", "nothing"
+# key = "ctrl+alt+j"                # optional
+# timeout = 30                      # seconds
 "#;
 
 impl Config {
@@ -104,6 +157,14 @@ impl Config {
                 "word_wrap" => value.as_bool().map(|b| config.word_wrap = b),
                 "hot_exit" => value.as_bool().map(|b| config.hot_exit = b),
                 "large_file_mb" => number(value).map(|n| config.large_file_mb = (n as u64).max(1)),
+                "tool" => value.as_array().map(|tools| {
+                    for (i, t) in tools.iter().enumerate() {
+                        match parse_tool(t) {
+                            Ok(tool) => config.tools.push(tool),
+                            Err(e) => problems.push(format!("settings: tool {}: {e}", i + 1)),
+                        }
+                    }
+                }),
                 "theme" => match value.as_str() {
                     Some("auto") => Some(ThemeChoice::Auto),
                     Some("dark") => Some(ThemeChoice::Dark),
@@ -129,6 +190,54 @@ impl Config {
             _ => &SUMI,
         }
     }
+}
+
+fn parse_tool(value: &toml::Value) -> Result<ExternalTool, String> {
+    let t = value.as_table().ok_or("expected a [[tool]] table")?;
+    let string = |k: &str| t.get(k).and_then(|v| v.as_str());
+    let name = string("name").ok_or("needs a name")?.to_owned();
+    let command: Vec<String> = match t.get("command") {
+        Some(toml::Value::Array(a)) => a
+            .iter()
+            .map(|v| v.as_str().map(str::to_owned))
+            .collect::<Option<_>>()
+            .ok_or("command must be a list of strings")?,
+        Some(toml::Value::String(s)) => s.split_whitespace().map(str::to_owned).collect(),
+        _ => return Err(format!("{name:?} needs a command")),
+    };
+    if command.is_empty() {
+        return Err(format!("{name:?} has an empty command"));
+    }
+    let input = match string("input").unwrap_or("selection-or-document") {
+        "selection-or-document" => ToolInput::SelectionOrDocument,
+        "selection" => ToolInput::Selection,
+        "document" => ToolInput::Document,
+        "nothing" | "none" => ToolInput::Nothing,
+        other => return Err(format!("unknown input {other:?}")),
+    };
+    let output = match string("output").unwrap_or("replace") {
+        "replace" => ToolOutput::Replace,
+        "insert" => ToolOutput::Insert,
+        "new-tab" => ToolOutput::NewTab,
+        "message" => ToolOutput::Message,
+        "nothing" | "none" => ToolOutput::Nothing,
+        other => return Err(format!("unknown output {other:?}")),
+    };
+    let key = string("key").map(Shortcut::parse).transpose()?;
+    let timeout = t
+        .get("timeout")
+        .and_then(number)
+        .map_or(Duration::from_secs(30), |s| {
+            Duration::from_secs_f32(s.clamp(0.1, 3600.0))
+        });
+    Ok(ExternalTool {
+        name,
+        command,
+        input,
+        output,
+        key,
+        timeout,
+    })
 }
 
 fn number(value: &toml::Value) -> Option<f32> {
@@ -211,5 +320,37 @@ mod tests {
         let (config, problems) = Config::parse("font_size = = 3");
         assert_eq!(config, Config::default());
         assert!(problems[0].contains("line 1"), "{problems:?}");
+    }
+
+    #[test]
+    fn external_tools() {
+        let (config, problems) = Config::parse(
+            r#"
+[[tool]]
+name = "Sort"
+command = ["sort", "-u"]
+
+[[tool]]
+name = "Word count"
+command = "wc -w"
+input = "document"
+output = "message"
+key = "ctrl+alt+w"
+timeout = 5
+
+[[tool]]
+name = "Broken"
+output = "sideways"
+command = ["x"]
+"#,
+        );
+        assert_eq!(problems, ["settings: tool 3: unknown output \"sideways\""]);
+        assert_eq!(config.tools.len(), 2);
+        assert_eq!(config.tools[0].command, ["sort", "-u"]);
+        assert_eq!(config.tools[0].output, ToolOutput::Replace);
+        assert_eq!(config.tools[1].command, ["wc", "-w"]);
+        assert_eq!(config.tools[1].input, ToolInput::Document);
+        assert_eq!(config.tools[1].timeout, Duration::from_secs(5));
+        assert!(config.tools[1].key.is_some());
     }
 }

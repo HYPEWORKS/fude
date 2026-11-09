@@ -94,6 +94,7 @@ impl Bench {
             repeat: false,
             modifiers,
             text: None,
+            base: None,
         };
         let Fude {
             docs,
@@ -254,6 +255,27 @@ pub fn run(args: &Args, path: &Path, check: bool) -> Result<(), String> {
     bench.moving("wrapped: move down", Key::Down, 100);
     let to_end = jump(&mut bench, Key::End);
     bench.report_once("wrapped: jump to end", to_end, Some(STEP_BUDGET));
+
+    // Multiple cursors at their limit: every occurrence of a common word (capped), and
+    // typing at all of them.
+    bench.app.doc_mut().view.wrap = false;
+    let word_at = text.len() / 3;
+    bench.place_cursor(fude_editor::text::floor_grapheme(&text, word_at));
+    let start = Instant::now();
+    let n = bench.app.doc_mut().view.editor.select_all_occurrences();
+    bench.frame();
+    bench.report_once(&format!("select {n} occurrences"), start.elapsed(), None);
+    if n > 1 {
+        let times = bench.steps(10, |app, _| {
+            let now = Instant::now();
+            let view = &mut app.doc_mut().view;
+            view.editor.insert("x", now);
+            view.changed(now);
+        });
+        bench.report(&format!("type at {n} cursors"), times, None);
+        let view = &mut bench.app.doc_mut().view;
+        while view.editor.undo() {}
+    }
 
     if check && !bench.over.is_empty() {
         return Err(format!("over budget: {}", bench.over.join(", ")));

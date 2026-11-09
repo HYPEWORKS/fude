@@ -47,11 +47,11 @@ fn editor_with(marked: &str, format: Format) -> Editor {
     e
 }
 
-fn editor(marked: &str) -> Editor {
+pub(crate) fn editor(marked: &str) -> Editor {
     editor_with(marked, lf())
 }
 
-fn show(e: &Editor) -> String {
+pub(crate) fn show(e: &Editor) -> String {
     let mut s = String::from_utf8(e.text().to_vec()).unwrap();
     let mut marks: Vec<(usize, char)> = vec![];
     for sel in e.selections().iter() {

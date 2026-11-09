@@ -17,6 +17,7 @@ fude-editor = { path = "crates/fude-editor" }
 fude-render = { path = "crates/fude-render" }
 fude-syntax = { path = "crates/fude-syntax" }
 fude-text = { path = "crates/fude-text" }
+fude-tools = { path = "crates/fude-tools" }
 fude-platform = { path = "crates/fude-platform" }
 fude-ui = { path = "crates/fude-ui" }
 

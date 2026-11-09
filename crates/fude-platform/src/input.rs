@@ -52,6 +52,21 @@ pub struct KeyInput {
     pub modifiers: Modifiers,
     /// Text this key press would insert, if any.
     pub text: Option<String>,
+    /// For a character key, the character it makes without modifiers (Shift, Option,
+    /// AltGr) in the current layout: what shortcuts match, so Ctrl+Shift+\ is "\" and
+    /// Option+Z on macOS is "z".
+    pub base: Option<String>,
+}
+
+impl KeyInput {
+    /// The key's character for shortcuts (see [`KeyInput::base`]).
+    pub fn shortcut_char(&self) -> Option<&str> {
+        match (&self.base, &self.key) {
+            (Some(b), _) => Some(b),
+            (None, Key::Character(c)) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn modifiers(m: ModifiersState) -> Modifiers {
@@ -98,11 +113,17 @@ pub(crate) fn key_input(ev: &KeyEvent, modifiers: Modifiers) -> KeyInput {
         },
         _ => Key::Other,
     };
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    let base = match ev.key_without_modifiers() {
+        WKey::Character(s) => Some(s.to_string()),
+        _ => None,
+    };
     KeyInput {
         key,
         pressed: ev.state == ElementState::Pressed,
         repeat: ev.repeat,
         modifiers,
         text: ev.text.as_ref().map(|t| t.to_string()),
+        base,
     }
 }

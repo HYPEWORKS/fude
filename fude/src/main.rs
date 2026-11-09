@@ -14,6 +14,7 @@ mod find;
 mod instance;
 mod loading;
 mod session;
+mod tools;
 mod welcome;
 
 use std::path::Path;

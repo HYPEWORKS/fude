@@ -4,7 +4,7 @@
 
 A cross-platform text editor that sits between Notepad and Notepad++. It should start instantly, respond instantly at any file size, use little memory, and look and feel polished on every platform.
 
-> Status: phase 4 (large files) done. Next: phase 5, power features. Last updated 2026-11-08.
+> Status: phase 5 (power features) done. Next: phase 6, release. Last updated 2026-11-08.
 
 ---
 
@@ -39,7 +39,7 @@ A cross-platform text editor that sits between Notepad and Notepad++. It should 
 | Idle RAM, empty document, 1080p | < 30 MB | 14.6 MB (Linux, X11) |
 | RAM for an open, unedited file | ≈ 1.1 × file size | 1.04 × the text (UTF-8); 1.2 × for Shift_JIS, UTF-16 and Japanese text, most of the difference being the CJK fallback font |
 | Idle CPU | 0 % | 0 CPU ticks over 5 s once the caret stops blinking (10 s after input) |
-| Release binary | < 10 MB | 9.4 MB (Linux x86-64): encodings added 0.3 MB in phase 1; font fallback, clipboard and file dialogs 1.1 MB in phase 2; syntax highlighting (syntect and its grammars) 2.4 MB and search 0.4 MB in phase 3; 0.2 MB in phase 4. Little room is left. |
+| Release binary | < 10 MB | 9.6 MB (Linux x86-64): encodings added 0.3 MB in phase 1; font fallback, clipboard and file dialogs 1.1 MB in phase 2; syntax highlighting (syntect and its grammars) 2.4 MB and search 0.4 MB in phase 3; 0.2 MB each in phases 4 and 5. Little room is left: the next large feature has to pay for itself (dropping grammars, or `opt-level = "s"` for cold code). |
 
 Measurements are from a fast desktop (32 threads, NVMe, warm page cache): startup with `cargo xtask bench-startup` under Xvfb, the buffer with `cargo run --release -p fude-buffer --example bench` on a generated 500 MB log, keystrokes with `fude --bench-typing`. They are a best case; laptops and Wayland/Windows/macOS numbers come next.
 
@@ -69,6 +69,8 @@ Even the 5K worst case fits a 120 Hz frame (8.3 ms) several times over, so CPU r
 | 21 MB of Rust | 10 ms | 0.01 s | 1.09 | 0.36 ms | 0.32 ms | 0.41 ms |
 
 The first screen includes a 20 ms wait that lets files of up to about 100 MB appear whole instead of as a preview; the Japanese files spend another 30 ms opening the CJK fallback font. Loading Shift_JIS is decoding-bound (and checks that every character re-encodes exactly). Before phase 4, a keystroke in the middle of the JSON line took 12 ms and every frame of the CSV 10 ms, and both lines were cut off at 16 KB.
+
+**Multiple cursors (phase 5):** typing at 10,000 cursors in a 100 MB line takes 5.7 ms per key; at 5,750 cursors spread over a 500 MB log, 10.7 ms (about 2 µs per cursor for the edit; drawing looks only at the cursors on screen). Selecting every occurrence of a word scans the text at about 10 GB/s: 55 ms for the 500 MB log.
 
 **Startup breakdown (Linux, X11):** about 8 ms is winit creating the event loop, more than half of it libX11 and xkbcommon each parsing the X11 Compose table. fude's own work (fonts, layout, rasterizing the first frame) is about 2 ms. Deferring the Compose table until the first key press is a possible later optimization.
 
@@ -231,10 +233,13 @@ UI thread (winit event loop)                         Worker pool
 
 ## 11. Editing model
 
-- **Multiple selections from day one.** Selections are a sorted, non-overlapping list of `{anchor, head, goal_x}`; a single cursor is a list of one. Column (box) selection builds on this.
+- **Multiple selections from day one.** Selections are a sorted, non-overlapping list of `{anchor, head, goal_x}`; a single cursor is a list of one. Cursors come from Ctrl+Click (Cmd+Click), Ctrl+Alt+↑/↓ (a cursor on the row above or below, at the same x), Ctrl+D (the word at the cursor, then each next occurrence: whole words if it began at a bare cursor), Ctrl+Shift+L (every occurrence) and Shift+Alt+I (one per line of a selection). A column (box) selection, by Alt+drag or Shift+Alt+arrows, is one selection per line between two x positions. Commands make at most 10,000 cursors. Pasting as many lines as there are cursors gives one each.
 - **Edits are transactions:** a list of range replacements applied atomically. All selections are mapped through each edit.
 - **Undo steps:** consecutive typing is one step per word (a new step starts when a word follows whitespace) or until a 1 s pause; consecutive backspaces or deletes are one step; anything else (paste, cut, Enter, word deletion) is its own step. Moving the cursor, undo, redo and saving end the current step.
 - **Clipboard:** copy or cut with nothing selected takes the whole line, and pasting that inserts it above the cursor's line. Pasted line breaks become the document's style. Invalid bytes copy as U+FFFD.
+- **Lines:** Alt+↑/↓ move the selected lines (each keeps its text, line breaks stay put), Ctrl+Shift+D duplicates, Ctrl+Shift+K deletes, Ctrl+J joins, Ctrl+Enter / Ctrl+Shift+Enter open a line below or above. Tab and Shift+Tab indent and outdent selected lines (Ctrl+] / Ctrl+[ too).
+- **Indentation and brackets:** Enter keeps the line's indentation, one level deeper after `{`, `[` or `(` (and `:` in Python); between a pair, the closer goes on a line of its own. A closing bracket typed into a line's indentation lines up with its opener's line. The bracket next to the cursor and its partner are outlined, nesting by kind and skipping brackets the syntax colors say are in strings or comments; Ctrl+Shift+\ jumps between them. Matching looks at most 64 KB away, and is cached per cursor position and version.
+- **Comments:** Ctrl+/ toggles line comments at the selection's common indentation (all commented → uncomment), Shift+Alt+A block comments, with markers per language (`#` for plain text, which covers most config files without a grammar). Languages with only block comments (HTML, CSS) wrap each line.
 - **Motions follow the platform:** Ctrl+Right moves to the start of the next word on Windows and Linux, Option+Right to the end of the word on macOS; Cmd+arrows go to line and document ends on macOS. Home toggles between the first non-blank character and the line start. Enter keeps the line's indentation.
 - **Everything is a named command** (`edit.duplicate_line`, `view.toggle_wrap`, …). Keybindings, menus and the command palette are front-ends that invoke commands with arguments.
 - **Fault isolation:** event handling runs inside `catch_unwind`. A bug in a feature shows an error in the status bar instead of losing unsaved text.
@@ -260,18 +265,21 @@ UI thread (winit event loop)                         Worker pool
 
 No plugin API in v1. Extensibility comes in three layers:
 
-1. **Built-in tools.** Features people commonly install plugins for are bundled as commands: sort lines, remove duplicates, reverse, trim whitespace, tabs ↔ spaces, case conversion, join lines, Base64 / URL / HTML encode and decode, hashes, JSON format and minify, XML format. They cost nothing at startup and live in the command palette and a Tools menu rather than in the main menus.
+1. **Built-in tools** (`fude-tools`, pure functions over bytes, written out rather than pulled in as dependencies). Features people commonly install plugins for are bundled as commands: sort lines (A–Z, Z–A, ignoring case, by number), remove duplicates, reverse, trim trailing whitespace, indentation tabs ↔ spaces, UPPER / lower / Title case, Base64 / URL / HTML encode and decode, SHA-256 / SHA-1 / MD5 (copied to the clipboard), JSON format and minify (token by token: numbers, escapes and key order are kept; JSON Lines work), XML format, and line-ending conversion. They work on the selections, or the whole document if nothing is selected, as one undo step, and live in the command palette ("Tools: …"). Up to 256 KB they run at once; beyond that on a worker over a snapshot, applied only if the document hasn't changed meanwhile.
 2. **Data, not code.** Syntax definitions (`.sublime-syntax`), color themes (`.tmTheme` or a fude theme file) and keymaps can be dropped into the config directory.
 3. **External tools.** Any program can be run as a fude command, taking the selection or document on stdin and replacing it, inserting the output, or showing it in a panel. This covers formatters (`jq`, `prettier`, `black`, `rustfmt`), linters and personal scripts in any language:
 
    ```toml
    [[tool]]
    name    = "Format JSON (jq)"
-   command = ["jq", "."]
-   input   = "selection-or-document"
-   output  = "replace"
+   command = ["jq", "."]               # {file}, {dir}, {name}, {line} are filled in
+   input   = "selection-or-document"   # or selection, document, nothing
+   output  = "replace"                 # or insert, new-tab, message, nothing
    key     = "ctrl+alt+j"
+   timeout = 30                        # seconds, then it's stopped
    ```
+
+   Each runs on a worker thread, once per selection, in the file's folder; standard input is written on a thread of its own so big inputs can't deadlock. A failure shows the first line the program printed to standard error. A line break the program adds at the end is dropped if its input had none, so filters like `tr` and `jq` don't grow every selection by a line.
 
 **Why no plugin API:** an API is a compatibility promise that can't be taken back; third-party code can't be held to the "no O(n) on the UI thread" rule, but fude gets blamed when it's slow; loading plugins costs startup time; and Rust has no stable ABI, so native plugins would mean a C ABI or an embedded runtime.
 
@@ -301,7 +309,7 @@ Single instance: opening a file while fude is running sends it to the existing w
 - **RAM:** peak and idle RSS measured for an empty document and for the large-file corpus.
 - **Large-file corpus,** generated rather than committed (`cargo xtask corpus`, about 1 GB in `target/corpus`; `--small` makes a tenth of that): a 500 MB log, 100 MB of JSON on one line, a CSV of 50 KB lines, Japanese text in UTF-8 and Shift_JIS, UTF-16LE, UTF-8 with stray bytes, mixed line endings, and 20 MB of Rust. `cargo xtask bench-large` opens each with `fude --bench-file` (no window) and measures the first screen, loading, memory, and keystrokes, scrolling and paging at the start, middle and end, with and without word wrap, against the budgets in §3. CI runs it on the small corpus and fails a missed budget on Linux.
 - **Micro benchmarks** for rope edits, line lookups, layout and search.
-- **UI test:** `cargo xtask ui-test` drives the real window through X11 (XTest) under Xvfb and checks the files it saves: typing, mouse selection, clipboard, undo, the unsaved-changes prompt, find and replace, tabs, go to line, the command palette, word wrap, hot exit, single instance, recovery after the process is killed, and editing the end of a 40 MB file's 2 MB last line once it has loaded (18 checks). It uses its own settings and state directories. Runs in CI on every push.
+- **UI test:** `cargo xtask ui-test` drives the real window through X11 (XTest) under Xvfb and checks the files it saves: typing, mouse selection, clipboard, undo, the unsaved-changes prompt, find and replace, tabs, go to line, the command palette, word wrap, hot exit, single instance, recovery after the process is killed, and editing the end of a 40 MB file's 2 MB last line once it has loaded, and the power features: Ctrl+D, moving, duplicating and commenting lines, a column of cursors, sorting from the command palette, an external tool on its own shortcut, and auto-indent (26 checks). It uses its own settings and state directories. Runs in CI on every push.
 - **Keystroke latency:** `fude --bench-typing` times an edit plus a full frame per key, without a window.
 - **CI:** Windows, macOS and Linux; a FreeBSD build in a VM. Budget regressions fail the build.
 
@@ -416,3 +424,10 @@ Each is evaluated for startup, RAM and binary size when introduced, and pinned t
 | 2026-11-08 | A legacy encoding is decided from the first megabyte when it's clear, so the file decodes as it's read (with a streaming exactness check) instead of being held raw and decoded at the end: half the memory for a Shift_JIS file, and a bit faster. |
 | 2026-11-08 | harfrust shaping plans are cached per font and segment properties (building one compiles the font's features: 11× slower CJK layout without the cache), and glyphs and advances for characters below U+0300 are cached per face. |
 | 2026-11-08 | Hot-exit backups of documents over 32 MB are written at most every 30 seconds while typing. |
+| 2026-11-08 | Multiple-cursor and line commands follow VS Code and Sublime (Ctrl+D, Ctrl+Shift+L, Alt+↑/↓, Ctrl+Shift+D/K, Ctrl+/); column selection follows Notepad++ (Alt+drag, Shift+Alt+arrows). |
+| 2026-11-08 | Shortcuts match a key's character without modifiers (winit's `key_without_modifiers`), so Ctrl+Shift+`\` matches whatever Shift turns the key into, and Option+letter shortcuts work on macOS. |
+| 2026-11-08 | Bracket matching is by kind with nesting, bounded to 64 KB, and uses syntax colors (when current) to skip brackets in strings and comments, rather than a parser per language. |
+| 2026-11-08 | Comment markers come from a table of the bundled grammars' names; plain text uses `#`. |
+| 2026-11-08 | Built-in tools in their own crate, written out (hashes, JSON, XML) instead of adding dependencies: the binary is near its budget. The JSON formatter rewrites whitespace only, so it never changes a number or reorders keys. |
+| 2026-11-08 | External tools take a command list (no shell), with placeholders, a timeout, and standard input fed from its own thread. |
+| 2026-11-08 | Commands make at most 10,000 cursors, and drawing finds the ones on screen by binary search. |

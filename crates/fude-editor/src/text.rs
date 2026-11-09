@@ -329,6 +329,96 @@ pub fn display_column(text: &Rope, line_start: usize, at: usize, tab_width: usiz
     col + (at - counted_end) + 1
 }
 
+/// The bracket pair of a bracket character, as (opener, closer, opens).
+fn bracket(b: u8) -> Option<(u8, u8, bool)> {
+    match b {
+        b'(' => Some((b'(', b')', true)),
+        b'[' => Some((b'[', b']', true)),
+        b'{' => Some((b'{', b'}', true)),
+        b')' => Some((b'(', b')', false)),
+        b']' => Some((b'[', b']', false)),
+        b'}' => Some((b'{', b'}', false)),
+        _ => None,
+    }
+}
+
+/// The bracket at a cursor at `at` (the one after it, else the one before) and its match,
+/// as (bracket, match) offsets. Brackets of the same kind nest; ones for which `ignore`
+/// is true (inside strings or comments, say) don't count. Looks at most `limit` bytes
+/// away, so it costs the same in any file.
+pub fn matching_bracket(
+    text: &Rope,
+    at: usize,
+    limit: usize,
+    ignore: &dyn Fn(usize) -> bool,
+) -> Option<(usize, usize)> {
+    let candidates = [Some(at).filter(|&a| a < text.len()), at.checked_sub(1)];
+    candidates.into_iter().flatten().find_map(|pos| {
+        let (open, close, opens) = bracket(text.byte(pos))?;
+        if ignore(pos) {
+            return None;
+        }
+        let found = if opens {
+            find_closer(text, pos + 1, open, close, limit, ignore)
+        } else {
+            find_opener(text, pos, open, close, limit, ignore)
+        };
+        Some((pos, found?))
+    })
+}
+
+/// The unmatched `open` before `before`, skipping nested pairs.
+pub fn find_opener(
+    text: &Rope,
+    before: usize,
+    open: u8,
+    close: u8,
+    limit: usize,
+    ignore: &dyn Fn(usize) -> bool,
+) -> Option<usize> {
+    let start = before.saturating_sub(limit);
+    let window = bytes(text, start, before);
+    let mut depth = 0usize;
+    for (i, &b) in window.iter().enumerate().rev() {
+        if (b == open || b == close) && !ignore(start + i) {
+            if b == close {
+                depth += 1;
+            } else if depth == 0 {
+                return Some(start + i);
+            } else {
+                depth -= 1;
+            }
+        }
+    }
+    None
+}
+
+/// The unmatched `close` from `from` on, skipping nested pairs.
+fn find_closer(
+    text: &Rope,
+    from: usize,
+    open: u8,
+    close: u8,
+    limit: usize,
+    ignore: &dyn Fn(usize) -> bool,
+) -> Option<usize> {
+    let end = (from + limit).min(text.len());
+    let window = bytes(text, from, end);
+    let mut depth = 0usize;
+    for (i, &b) in window.iter().enumerate() {
+        if (b == open || b == close) && !ignore(from + i) {
+            if b == open {
+                depth += 1;
+            } else if depth == 0 {
+                return Some(from + i);
+            } else {
+                depth -= 1;
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

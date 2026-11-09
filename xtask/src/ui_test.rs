@@ -174,6 +174,135 @@ fn exits(child: &mut Child) -> bool {
     false
 }
 
+/// Phase 4 of the UI test. Returns how many checks failed.
+fn power_features(
+    exe: &Path,
+    dir: &Path,
+    d: &mut Driver,
+    focus: &dyn Fn(&mut Driver, &str) -> Result<(), String>,
+) -> Result<usize, String> {
+    let file = dir.join("power.txt");
+    std::fs::write(&file, "cat dog cat\nalpha\nbeta\n").map_err(|e| e.to_string())?;
+    let config = dir.join("config4").join("fude");
+    std::fs::create_dir_all(&config).map_err(|e| e.to_string())?;
+    std::fs::write(
+        config.join("fude.toml"),
+        "[[tool]]\nname = \"Shout\"\ncommand = [\"tr\", \"a-z\", \"A-Z\"]\nkey = \"ctrl+alt+u\"\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let mut app = App(Command::new(exe)
+        .arg("--new-instance")
+        .arg(&file)
+        .env("XDG_CONFIG_HOME", dir.join("config4"))
+        .env("XDG_STATE_HOME", dir.join("state4"))
+        .spawn()
+        .map_err(|e| format!("launching {}: {e}", exe.display()))?);
+    focus(d, "power.txt")?;
+    let mut failures = 0;
+    let mut check = |d: &Driver, name: &str, expected: &str| -> Result<(), String> {
+        d.ctrl('s')?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut actual = String::new();
+        while Instant::now() < deadline {
+            actual = std::fs::read_to_string(&file).unwrap_or_default();
+            if actual == expected {
+                break;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        if actual == expected {
+            println!("  ✓ {name}");
+        } else {
+            println!("  ✗ {name}\n      expected {expected:?}\n      got      {actual:?}");
+            failures += 1;
+        }
+        Ok(())
+    };
+
+    d.click(0, 1.0, 1)?;
+    d.ctrl('d')?;
+    d.ctrl('d')?;
+    d.type_text("cow")?;
+    check(
+        d,
+        "Ctrl+D twice selects both \"cat\"s; typing replaces them",
+        "cow dog cow\nalpha\nbeta\n",
+    )?;
+
+    d.key(&[], ESCAPE)?;
+    d.click(1, 2.0, 1)?;
+    d.key(&[ALT], DOWN)?;
+    check(
+        d,
+        "Alt+Down moves a line down",
+        "cow dog cow\nbeta\nalpha\n",
+    )?;
+
+    d.key(&[CONTROL, SHIFT], 'd' as u32)?;
+    check(
+        d,
+        "Ctrl+Shift+D duplicates it",
+        "cow dog cow\nbeta\nalpha\nalpha\n",
+    )?;
+
+    d.key(&[CONTROL], '/' as u32)?;
+    check(
+        d,
+        "Ctrl+/ comments the copy out",
+        "cow dog cow\nbeta\nalpha\n# alpha\n",
+    )?;
+
+    d.key(&[CONTROL], HOME)?;
+    d.key(&[SHIFT, ALT], DOWN)?;
+    d.key(&[SHIFT, ALT], DOWN)?;
+    d.type_text(">")?;
+    check(
+        d,
+        "Shift+Alt+Down makes a column of cursors",
+        ">cow dog cow\n>beta\n>alpha\n# alpha\n",
+    )?;
+
+    d.key(&[], ESCAPE)?;
+    d.ctrl('a')?;
+    d.key(&[CONTROL, SHIFT], 'p' as u32)?;
+    d.type_text("sort lines (a to")?;
+    d.key(&[], RETURN)?;
+    check(
+        d,
+        "the command palette sorts the lines",
+        "# alpha\n>alpha\n>beta\n>cow dog cow\n",
+    )?;
+
+    d.ctrl('a')?;
+    d.key(&[CONTROL, ALT], 'u' as u32)?;
+    // The external tool runs on a worker; give it a moment.
+    sleep(Duration::from_millis(800));
+    check(
+        d,
+        "an external tool (tr a-z A-Z) from the settings, on its own shortcut",
+        "# ALPHA\n>ALPHA\n>BETA\n>COW DOG COW\n",
+    )?;
+
+    d.key(&[CONTROL], END)?;
+    d.type_text("if x {")?;
+    d.key(&[], RETURN)?;
+    d.type_text("y")?;
+    d.key(&[], RETURN)?;
+    d.type_text("}")?;
+    check(
+        d,
+        "Enter indents after {, and } outdents",
+        "# ALPHA\n>ALPHA\n>BETA\n>COW DOG COW\nif x {\n\ty\n}",
+    )?;
+
+    d.ctrl('q')?;
+    if !exits(&mut app.0) {
+        println!("  ✗ the app didn't quit");
+        failures += 1;
+    }
+    Ok(failures)
+}
+
 struct App(Child);
 
 impl Drop for App {
@@ -539,6 +668,9 @@ pub fn run(exe: &Path) -> Result<(), String> {
         println!("  ✗ the app with the large file didn't quit");
         failures += 1;
     }
+
+    // Phase 4: multiple cursors, line commands, comments, column selection, tools.
+    failures += power_features(exe, &dir, &mut d, &focus)?;
 
     let _ = std::fs::remove_dir_all(&dir);
     if failures > 0 {

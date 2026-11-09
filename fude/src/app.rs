@@ -78,7 +78,7 @@ pub struct Fude {
     pub painter: Painter,
     tabs: TabStrip,
     pub prompt: Option<(Prompt, Question)>,
-    message: Option<(StatusMessage, Instant)>,
+    pub message: Option<(StatusMessage, Instant)>,
     pub waker: Option<Waker>,
     title: String,
     /// Last pointer position, physical pixels.
@@ -112,6 +112,8 @@ pub struct Fude {
     ime_area: Option<Rect>,
     /// Files loading on worker threads report here.
     pub loads: crate::loading::Loads,
+    /// A text tool running on a worker thread.
+    pub tool_job: Option<crate::tools::ToolJob>,
     os_theme: Option<OsTheme>,
     /// Zoom steps from the configured font size, for every document.
     zoom: f32,
@@ -149,6 +151,7 @@ impl Fude {
             drop_hover: false,
             ime_area: None,
             loads: Default::default(),
+            tool_job: None,
             os_theme: None,
             zoom: 0.0,
             last_frame: Duration::ZERO,
@@ -164,7 +167,7 @@ impl Fude {
     pub fn configure(&self, view: &mut EditorView) {
         view.set_font_size(self.config.font_size + self.zoom);
         view.editor.settings.tab_width = self.config.tab_width;
-        view.insert_spaces = self.config.insert_spaces;
+        view.editor.settings.insert_spaces = self.config.insert_spaces;
         view.wrap = self.config.word_wrap;
     }
 
@@ -440,6 +443,8 @@ impl Fude {
                 continue;
             };
             doc.language = reply.language;
+            // Python opens blocks with a colon.
+            doc.view.editor.settings.indent_after_colon = doc.language == "Python";
             // Keep the newest colors; older ones still beat none while new ones are made.
             let newer = doc
                 .view
@@ -637,6 +642,7 @@ impl Fude {
                 let loads = self.poll_loads();
                 let opened = self.poll_instance(ctx) || loads;
                 let saves = self.poll_saves(ctx) || opened;
+                let saves = self.poll_tools(ctx) || saves;
                 let colors = self.poll_highlights();
                 self.poll_find(now) || saves || colors
             }
@@ -762,6 +768,16 @@ impl Fude {
             && let Some(action) = self.find.key(key, now)
         {
             self.find_action(action, now);
+            return true;
+        }
+        // External tools' own shortcuts come first, so settings can take any key.
+        if let Some(i) = self
+            .config
+            .tools
+            .iter()
+            .position(|t| t.key.as_ref().is_some_and(|k| k.matches(key)))
+        {
+            self.action(ctx, Action::External(i as u16), now);
             return true;
         }
         if let Some(action) = action_for(key) {
@@ -892,6 +908,67 @@ impl Fude {
                 self.configure_all();
             }
             Action::OpenSettings => self.open_settings(),
+            Action::Tool(tool) => self.run_tool(ctx, tool),
+            Action::External(i) => self.run_external(usize::from(i)),
+            Action::LineEndings(le) => self.convert_line_endings(ctx, le),
+            Action::AddCursorAbove | Action::AddCursorBelow => {
+                let rows = if action == Action::AddCursorBelow {
+                    1
+                } else {
+                    -1
+                };
+                let p = &mut self.painter;
+                self.docs[self.active]
+                    .view
+                    .add_cursor_vertical(p, rows, now);
+            }
+            Action::GoToBracket => {
+                if !self.doc_mut().view.go_to_bracket(now) {
+                    self.say("No bracket next to the cursor, or no match for it", false);
+                }
+            }
+            Action::ToggleComment | Action::ToggleBlockComment => {
+                self.toggle_comment(action == Action::ToggleBlockComment, now);
+            }
+            Action::SelectAllOccurrences => {
+                let n = self.doc_mut().view.editor.select_all_occurrences();
+                self.doc_mut().view.changed(now);
+                if n >= fude_editor::MAX_CURSORS {
+                    self.say(format!("Selected the first {n} occurrences"), false);
+                } else if n > 1 {
+                    self.say(format!("{n} occurrences"), false);
+                }
+            }
+            Action::SelectNextOccurrence
+            | Action::SplitIntoLines
+            | Action::DuplicateLine
+            | Action::MoveLineUp
+            | Action::MoveLineDown
+            | Action::DeleteLine
+            | Action::JoinLines
+            | Action::InsertLineBelow
+            | Action::InsertLineAbove
+            | Action::Indent
+            | Action::Outdent => {
+                let view = &mut self.doc_mut().view;
+                let e = &mut view.editor;
+                match action {
+                    Action::SelectNextOccurrence => {
+                        e.select_next_occurrence();
+                    }
+                    Action::SplitIntoLines => e.split_into_lines(),
+                    Action::DuplicateLine => e.duplicate(),
+                    Action::MoveLineUp => e.move_lines(false),
+                    Action::MoveLineDown => e.move_lines(true),
+                    Action::DeleteLine => e.delete_lines(),
+                    Action::JoinLines => e.join_lines(),
+                    Action::InsertLineBelow => e.insert_line(false, now),
+                    Action::InsertLineAbove => e.insert_line(true, now),
+                    Action::Indent => e.indent_lines(),
+                    _ => e.outdent_lines(),
+                }
+                view.changed(now);
+            }
             Action::ToggleWrap => {
                 // For this session; the setting in the file is the default.
                 self.config.word_wrap = !self.config.word_wrap;
@@ -902,13 +979,53 @@ impl Fude {
         }
     }
 
+    /// Toggles line comments (or with `block`, block comments) in the document's language.
+    /// A language with only block comments gets them around each cursor's line.
+    fn toggle_comment(&mut self, block: bool, now: Instant) {
+        let doc = self.doc();
+        let markers = fude_syntax::comments(&doc.language);
+        let language = doc.language.clone();
+        let view = &mut self.doc_mut().view;
+        let editor = &mut view.editor;
+        match (markers.line, markers.block) {
+            (Some(token), _) if !block => editor.toggle_line_comment(token),
+            (_, Some((open, close))) => {
+                if !block && editor.selections().iter().all(|s| s.is_empty()) {
+                    // Around the text of each cursor's line.
+                    let text = editor.text().clone();
+                    let lines = editor.selections().map(|s| {
+                        let span = text.line_span(text.byte_to_line(s.head));
+                        let start = fude_editor::text::indent_end(&text, span.start, span.end);
+                        fude_editor::Selection::new(start, span.end)
+                    });
+                    editor.set_selections(lines);
+                }
+                editor.toggle_block_comment(open, close);
+            }
+            (Some(token), None) => editor.toggle_line_comment(token),
+            (None, None) => {
+                self.say(format!("{language} has no comments"), false);
+                return;
+            }
+        }
+        view.changed(now);
+    }
+
     fn open_palette(&mut self, prefix: &str, now: Instant) {
-        let commands = fude_ui::commands();
+        let mut commands = fude_ui::commands();
+        commands.extend(self.config.tools.iter().enumerate().map(|(i, t)| {
+            let key = t
+                .key
+                .as_ref()
+                .map(fude_ui::Shortcut::label)
+                .unwrap_or_default();
+            (Action::External(i as u16), format!("Tool: {}", t.name), key)
+        }));
         self.palette_actions = commands.iter().map(|c| c.0).collect();
         let items = commands
             .into_iter()
             .map(|(_, title, shortcut)| PaletteItem {
-                title: title.to_owned(),
+                title,
                 detail: shortcut,
             })
             .collect();

@@ -1,0 +1,13 @@
+[package]
+name = "fude-tools"
+description = "Built-in text tools: sorting, case, encodings, JSON and XML formatting, hashes"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

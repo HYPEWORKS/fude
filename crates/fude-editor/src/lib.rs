@@ -8,7 +8,7 @@ pub mod search;
 mod selection;
 pub mod text;
 
-pub use editor::{Editor, Motion, Settings};
+pub use editor::{BRACKET_LIMIT, Editor, MAX_CURSORS, Motion, Settings};
 pub use layout::{Layout, MonoLayout, nearest};
 pub use search::{Query, Searcher};
 pub use selection::{Selection, Selections};
@@ -16,3 +16,5 @@ pub use text::WordStop;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_power;
