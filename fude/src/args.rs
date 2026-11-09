@@ -19,6 +19,9 @@ Development:
   --bench-render         Render frames without a window and print timings
   --bench-typing         Type into the document without a window: time per keystroke,
                          from edit to finished frame
+  --bench-file <PATH>    Open a (large) file without a window: time the first screen,
+                         loading, scrolling and typing, and measure memory
+  --check                With --bench-file, fail when a budget is missed
   --size <WxH>           Canvas size in physical pixels for the modes without a
                          window [default: 1280x800]
   --scale <FACTOR>       Scale factor for the modes without a window [default: 1]";
@@ -31,6 +34,7 @@ pub enum Mode {
     Screenshot(PathBuf),
     BenchRender,
     BenchTyping,
+    BenchFile(PathBuf),
 }
 
 #[derive(Debug, PartialEq)]
@@ -45,6 +49,8 @@ pub struct Args {
     pub detached: bool,
     pub size: (u32, u32),
     pub scale: f32,
+    /// Benchmarks fail when over budget.
+    pub check: bool,
 }
 
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
@@ -57,6 +63,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
         detached: false,
         size: (1280, 800),
         scale: 1.0,
+        check: false,
     };
     let mut args = args.into_iter();
     let mut only_files = false;
@@ -72,6 +79,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
             Some("--detached") => out.detached = true,
             Some("--bench-render") => out.mode = Mode::BenchRender,
             Some("--bench-typing") => out.mode = Mode::BenchTyping,
+            Some("--bench-file") => out.mode = Mode::BenchFile(value("--bench-file")?.into()),
+            Some("--check") => out.check = true,
             Some("--screenshot") => out.mode = Mode::Screenshot(value("--screenshot")?.into()),
             Some("--size") => {
                 let v = value("--size")?;

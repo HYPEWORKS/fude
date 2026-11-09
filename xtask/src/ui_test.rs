@@ -488,6 +488,58 @@ pub fn run(exe: &Path) -> Result<(), String> {
         failures += 1;
     }
 
+    // Phase 3: a large file, loaded in the background, ending in a 2 MB line.
+    let big = dir.join("big.log");
+    let mut text = String::with_capacity(42 << 20);
+    for i in 0..500_000 {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            text,
+            "{i:08} INFO worker request took {} ms: the quick brown fox",
+            i % 977
+        );
+    }
+    text.push_str(&"{\"k\":1},".repeat(2 << 20 >> 3));
+    std::fs::write(&big, &text).map_err(|e| e.to_string())?;
+    let mut fifth = App(Command::new(exe)
+        .arg("--new-instance")
+        .arg(&big)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_STATE_HOME", dir.join("state3"))
+        .spawn()
+        .map_err(|e| format!("launching {}: {e}", exe.display()))?);
+    focus(&mut d, "big.log")?;
+    // Loading takes well under a second; until then, typing is refused.
+    sleep(Duration::from_millis(1500));
+    d.key(&[CONTROL], END)?;
+    d.type_text("!")?;
+    d.ctrl('s')?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let expected = text.len() + 1;
+    let mut saved = Vec::new();
+    while Instant::now() < deadline {
+        saved = std::fs::read(&big).unwrap_or_default();
+        if saved.len() == expected {
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    if saved.len() == expected && saved.ends_with(b",!") && saved.starts_with(b"00000000 INFO") {
+        println!("  ✓ a 40 MB file loads, and typing at the end of its 2 MB last line saves");
+    } else {
+        println!(
+            "  ✗ large file: saved {} bytes (expected {expected}), ends {:?}",
+            saved.len(),
+            String::from_utf8_lossy(&saved[saved.len().saturating_sub(8)..])
+        );
+        failures += 1;
+    }
+    d.ctrl('q')?;
+    if !exits(&mut fifth.0) {
+        println!("  ✗ the app with the large file didn't quit");
+        failures += 1;
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
     if failures > 0 {
         return Err(format!("{failures} UI checks failed"));

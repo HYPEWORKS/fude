@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Writing the corpus's Shift_JIS file.
+encoding_rs.workspace = true
 
 # `cargo xtask ui-test` drives the app through X11 (XTest), on Linux and the BSDs.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

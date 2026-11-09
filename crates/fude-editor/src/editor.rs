@@ -82,6 +82,10 @@ pub struct Editor {
     line_copy: Option<String>,
     /// The earliest offset changed since [`Editor::take_changed`] was last called.
     changed_from: Option<usize>,
+    /// Edits are refused, while the document is still loading.
+    read_only: bool,
+    /// An edit was refused since [`Editor::take_refused`] was last called.
+    refused: bool,
     pub settings: Settings,
 }
 
@@ -93,8 +97,43 @@ impl Editor {
             last_edit: None,
             line_copy: None,
             changed_from: None,
+            read_only: false,
+            refused: false,
             settings: Settings::default(),
         }
+    }
+
+    /// Refuses (or allows again) every edit, undo and redo.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Whether an edit was refused (the editor is read-only) since the last call.
+    pub fn take_refused(&mut self) -> bool {
+        std::mem::take(&mut self.refused)
+    }
+
+    fn refuse(&mut self) -> bool {
+        self.refused |= self.read_only;
+        self.read_only
+    }
+
+    /// Replaces the text and format as if just loaded, without an undo step: the whole file
+    /// after a preview of its start. Selections stay where the new text allows; the text
+    /// before `unchanged` is the same as before (for re-highlighting from there).
+    pub fn load(&mut self, text: Rope, format: Format, unchanged: usize) {
+        let len = text.len();
+        let clamp = |at: usize| crate::text::floor_grapheme(&text, at.min(len));
+        self.selections = self
+            .selections
+            .map(|s| Selection::new(clamp(s.anchor), clamp(s.head)));
+        self.buffer.reset(text, format);
+        self.last_edit = None;
+        self.mark_changed(unchanged.min(len));
     }
 
     pub fn text(&self) -> &Rope {
@@ -163,7 +202,7 @@ impl Editor {
     /// Applies replacements (sorted, non-overlapping, in the current text's coordinates)
     /// as one undo step. Selections follow the text around them.
     pub fn apply_edits(&mut self, edits: &[(Range<usize>, Vec<u8>)]) {
-        if edits.is_empty() {
+        if edits.is_empty() || self.refuse() {
             return;
         }
         let edits: Vec<Edit<'_>> = edits
@@ -318,6 +357,9 @@ impl Editor {
     }
 
     pub fn undo(&mut self) -> bool {
+        if self.refuse() {
+            return false;
+        }
         self.last_edit = None;
         match self.buffer.undo() {
             Some(selections) => {
@@ -330,6 +372,9 @@ impl Editor {
     }
 
     pub fn redo(&mut self) -> bool {
+        if self.refuse() {
+            return false;
+        }
         self.last_edit = None;
         match self.buffer.redo() {
             Some(selections) => {
@@ -482,6 +527,9 @@ impl Editor {
         ended_with_space: bool,
         starts_word: bool,
     ) {
+        if self.refuse() {
+            return;
+        }
         reps.sort_by_key(|r| (r.range.start, r.range.end));
         // Expanded deletions of neighbouring cursors can overlap: merge them.
         let mut merged: Vec<Replace> = Vec::with_capacity(reps.len());

@@ -23,7 +23,7 @@ pub struct Tab {
     /// Cursor byte offset.
     pub cursor: usize,
     /// First visible line (fractional).
-    pub scroll: f32,
+    pub scroll: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -87,6 +87,8 @@ fn write_replacing(
     result
 }
 
+/// Backups are read like any file, by the loader; this is for tests.
+#[cfg(test)]
 pub fn read_backup(state: &Path, name: &str) -> io::Result<Rope> {
     Ok(fude_buffer::load_with(&backup_dir(state).join(name), Some(encoding_utf8()))?.text)
 }
@@ -135,7 +137,7 @@ impl Session {
                         .get("scroll")
                         .and_then(|v| v.as_float())
                         .unwrap_or(0.0)
-                        .max(0.0) as f32,
+                        .max(0.0),
                 })
             })
             .collect();

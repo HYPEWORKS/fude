@@ -263,16 +263,19 @@ pub fn word_range(text: &Rope, at: usize) -> std::ops::Range<usize> {
         (_, Some((_, u))) if u.class() != Class::LineBreak => u.class(),
         _ => return at..at,
     };
+    // A "word" can be megabytes of base64; a double click (and every move of the drag
+    // after it) looks this far each way at most.
+    const MAX: usize = 64 * 1024;
     let mut start = at;
     for (off, u) in units_before(text, at) {
-        if u.class() != class {
+        if u.class() != class || at - off > MAX {
             break;
         }
         start = off;
     }
     let mut end = at;
     for (off, u) in units_after(text, at) {
-        if u.class() != class {
+        if u.class() != class || off - at > MAX {
             break;
         }
         end = off + u.len();
@@ -295,18 +298,31 @@ pub fn indent_end(text: &Rope, line_start: usize, line_end: usize) -> usize {
 /// The 1-based column of `at` for display: grapheme clusters, with tabs expanded to
 /// `tab_width` stops. Lines longer than a megabyte count bytes past that point.
 pub fn display_column(text: &Rope, line_start: usize, at: usize, tab_width: usize) -> usize {
-    const LIMIT: usize = 1 << 20;
+    // Counted exactly this far into a line; past it, a byte is a column (exact for ASCII),
+    // so a cursor deep in a huge line costs no more than one near its start.
+    const LIMIT: usize = 64 * 1024;
     let counted_end = at.min(line_start + LIMIT);
     let prefix = bytes(text, line_start, counted_end);
     let tab = tab_width.max(1);
     let mut col = 0;
     for chunk in prefix.utf8_chunks() {
-        for g in chunk.valid().graphemes(true) {
-            col = if g == "\t" {
-                (col / tab + 1) * tab
-            } else {
-                col + 1
-            };
+        let valid = chunk.valid();
+        if valid.is_ascii() {
+            for b in valid.bytes() {
+                col = if b == b'\t' {
+                    (col / tab + 1) * tab
+                } else {
+                    col + 1
+                };
+            }
+        } else {
+            for g in valid.graphemes(true) {
+                col = if g == "\t" {
+                    (col / tab + 1) * tab
+                } else {
+                    col + 1
+                };
+            }
         }
         col += chunk.invalid().len();
     }

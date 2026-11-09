@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use fude_buffer::{FileStamp, Format, LineEnding, Loaded, Rope, SaveError, Version};
+use fude_buffer::{FileStamp, Format, LineEnding, Rope, SaveError, Version};
 use fude_editor::Editor;
 use fude_ui::EditorView;
 
@@ -42,6 +42,8 @@ pub struct Doc {
     pub requested: Option<(u64, std::ops::Range<usize>)>,
     /// The session backup holding this document's unsaved text, once it has one.
     pub backup: Option<String>,
+    /// The file is still being read (the text is a read-only preview of its start).
+    pub loading: Option<crate::loading::Loading>,
 }
 
 impl Doc {
@@ -56,6 +58,7 @@ impl Doc {
             language: "Plain Text".to_owned(),
             requested: None,
             backup: None,
+            loading: None,
         }
     }
 
@@ -65,13 +68,6 @@ impl Doc {
             ..Format::default()
         };
         Doc::new(id, Rope::new(), format, None)
-    }
-
-    pub fn loaded(id: DocId, loaded: Loaded, path: PathBuf) -> Doc {
-        let mut doc = Doc::new(id, loaded.text, loaded.format, Some(path));
-        doc.stamp = loaded.stamp;
-        doc.inexact = !loaded.exact;
-        doc
     }
 
     pub fn name(&self) -> String {

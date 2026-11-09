@@ -98,7 +98,7 @@ static JETBRAINS_MONO_ITALIC: &[u8] =
 pub struct TextSystem {
     faces: Vec<Face>,
     glyphs: GlyphCache,
-    shape_buffer: Option<harfrust::Buffer>,
+    shaping: layout::Shaping,
     no_ligatures: Vec<Feature>,
     /// The font chosen for a character the fast path can't decide, per style font.
     font_for: FxHashMap<(FontId, char), FontId>,
@@ -125,7 +125,7 @@ impl TextSystem {
         TextSystem {
             faces,
             glyphs: GlyphCache::new(),
-            shape_buffer: None,
+            shaping: layout::Shaping::default(),
             no_ligatures,
             font_for: FxHashMap::default(),
             fallback: None,
@@ -148,13 +148,39 @@ impl TextSystem {
 
     /// Lays out one line of text (no line breaks) into `out`, reusing its allocation.
     pub fn layout_line(&mut self, text: &str, style: &TextStyle, out: &mut LineLayout) {
+        self.layout_line_until(text, style, out, f32::INFINITY);
+    }
+
+    /// Like [`TextSystem::layout_line`], but may stop once the pen is past `max_x`: for
+    /// drawing a long line of which only the start shows. `out.width` is then where it
+    /// stopped.
+    pub fn layout_line_until(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        out: &mut LineLayout,
+        max_x: f32,
+    ) {
         out.glyphs.clear();
-        let tab = self.metrics(style.font, style.px).space_advance * style.tab_width.max(1) as f32;
+        let cell = self.metrics(style.font, style.px).space_advance;
+        let tab = cell * style.tab_width.max(1) as f32;
+        // In the (monospace) style font, every ASCII character advances at least a cell,
+        // so a line that only has to reach `max_x` can be cut short before its fonts are
+        // even worked out.
+        let text = match ((max_x / cell).ceil() as usize).checked_add(2) {
+            Some(n) if max_x.is_finite() && text.len() > n && text.as_bytes()[..n].is_ascii() => {
+                &text[..n]
+            }
+            _ => text,
+        };
         let mut pen = 0.0f32;
         let mut seg_start = 0;
         let mut runs = std::mem::take(&mut self.runs);
         // Tabs split the line into segments; each segment splits into runs by font.
         for (i, seg) in text.split('\t').enumerate() {
+            if pen > max_x {
+                break;
+            }
             if i > 0 {
                 pen = ((pen / tab).floor() + 1.0) * tab;
             }
@@ -167,8 +193,19 @@ impl TextSystem {
                 }
             }
             for (k, &(start, font)) in runs.iter().enumerate() {
+                if pen > max_x {
+                    break;
+                }
                 let end = runs.get(k + 1).map_or(seg.len(), |&(s, _)| s);
-                pen = self.layout_run(&seg[start..end], seg_start + start, font, style, pen, out);
+                pen = self.layout_run(
+                    &seg[start..end],
+                    seg_start + start,
+                    font,
+                    style,
+                    pen,
+                    max_x,
+                    out,
+                );
             }
             seg_start += seg.len() + 1;
         }
@@ -176,6 +213,7 @@ impl TextSystem {
         out.width = pen;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn layout_run(
         &mut self,
         text: &str,
@@ -183,6 +221,7 @@ impl TextSystem {
         font: FontId,
         style: &TextStyle,
         mut pen: f32,
+        max_x: f32,
         out: &mut LineLayout,
     ) -> f32 {
         if font == FontId::CHIP {
@@ -202,19 +241,18 @@ impl TextSystem {
         let face = &self.faces[font.0 as usize];
         let scale = style.px / face.upem;
         if font == style.font && !style.ligatures && !layout::needs_shaping(text) {
-            return layout::fast_run(face, font, text, cluster_base, pen, scale, out);
+            return layout::fast_run(face, font, text, cluster_base, pen, scale, max_x, out);
         }
         let features: &[Feature] = if style.ligatures {
             &[]
         } else {
             &self.no_ligatures
         };
-        let buffer = self.shape_buffer.get_or_insert_with(harfrust::Buffer::new);
         layout::shaped_run(
             face,
             font,
             features,
-            buffer,
+            &mut self.shaping,
             text,
             cluster_base,
             pen,

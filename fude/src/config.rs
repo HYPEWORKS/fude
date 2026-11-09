@@ -24,6 +24,8 @@ pub struct Config {
     pub theme: ThemeChoice,
     /// Quit without asking about unsaved changes; they come back on the next launch.
     pub hot_exit: bool,
+    /// Ask before opening files larger than this (MB).
+    pub large_file_mb: u64,
 }
 
 impl Default for Config {
@@ -35,6 +37,7 @@ impl Default for Config {
             word_wrap: false,
             theme: ThemeChoice::Auto,
             hot_exit: true,
+            large_file_mb: 1024,
         }
     }
 }
@@ -60,6 +63,10 @@ theme = "auto"
 # Quit without asking about unsaved changes. They are kept, and come back the next
 # time fude starts.
 hot_exit = true
+
+# Ask before opening a file larger than this many MB. Open files take about as much
+# memory as their size.
+large_file_mb = 1024
 "#;
 
 impl Config {
@@ -96,6 +103,7 @@ impl Config {
                 "insert_spaces" => value.as_bool().map(|b| config.insert_spaces = b),
                 "word_wrap" => value.as_bool().map(|b| config.word_wrap = b),
                 "hot_exit" => value.as_bool().map(|b| config.hot_exit = b),
+                "large_file_mb" => number(value).map(|n| config.large_file_mb = (n as u64).max(1)),
                 "theme" => match value.as_str() {
                     Some("auto") => Some(ThemeChoice::Auto),
                     Some("dark") => Some(ThemeChoice::Dark),

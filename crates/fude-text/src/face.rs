@@ -1,6 +1,11 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use harfrust::{ShaperFont, Tag};
+use harfrust::{GlyphId, ShaperFont, Tag};
+
+/// Characters below this are cached by [`Face::nominal`]: what the fast path lays out.
+pub(crate) const NOMINAL_CACHED: u32 = 0x300;
+const UNCACHED: u64 = u64::MAX;
 
 /// Font file data: bundled (static) or a memory-mapped system font.
 pub(crate) type FontData = Arc<dyn AsRef<[u8]> + Send + Sync>;
@@ -19,6 +24,10 @@ pub(crate) struct Face {
     pub(crate) ascender: f32,
     pub(crate) descender: f32,
     pub(crate) line_gap: f32,
+    /// Glyph and advance (font units) of each character below [`NOMINAL_CACHED`],
+    /// filled in as they're first used: looking them up in the font each time (a variable
+    /// font's advances need its variation tables) costs several times as much.
+    nominal: Box<[AtomicU64]>,
 }
 
 impl Face {
@@ -52,7 +61,30 @@ impl Face {
             line_gap: line.line_gap.to_f32(),
             font,
             data,
+            nominal: (0..NOMINAL_CACHED)
+                .map(|_| AtomicU64::new(UNCACHED))
+                .collect(),
         })
+    }
+
+    /// The glyph for `c` without shaping, and its advance in font units.
+    pub(crate) fn nominal(&self, shaper: &ShaperFont<'_, '_>, c: char) -> (GlyphId, f32) {
+        let slot = self.nominal.get(c as usize);
+        if let Some(slot) = slot {
+            let v = slot.load(Ordering::Relaxed);
+            if v != UNCACHED {
+                return (GlyphId::new(v as u32), f32::from_bits((v >> 32) as u32));
+            }
+        }
+        let gid = shaper.nominal_glyph(c as u32).unwrap_or(GlyphId::NOTDEF);
+        let advance = shaper.glyph_h_advance(gid) as f32;
+        if let Some(slot) = slot {
+            slot.store(
+                u64::from(gid.to_u32()) | (u64::from(advance.to_bits()) << 32),
+                Ordering::Relaxed,
+            );
+        }
+        (gid, advance)
     }
 
     pub(crate) fn from_static(data: &'static [u8], weight: f32) -> Option<Face> {

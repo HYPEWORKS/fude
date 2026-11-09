@@ -135,6 +135,21 @@ impl<S> Buffer<S> {
         }
     }
 
+    /// Starts over with `text`, as if just loaded: no history, saved. The version is new,
+    /// so work done for the old text is never taken for the new.
+    pub fn reset(&mut self, text: Rope, format: Format) {
+        self.current = State {
+            text,
+            format,
+            version: Version(self.next_version),
+        };
+        self.next_version += 1;
+        self.undo.clear();
+        self.redo.clear();
+        self.open = false;
+        self.saved = Some(self.current.version);
+    }
+
     pub fn text(&self) -> &Rope {
         &self.current.text
     }

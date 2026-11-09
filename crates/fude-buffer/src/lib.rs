@@ -15,6 +15,6 @@ mod utf8;
 pub use buffer::{Bias, Buffer, Edit, Snapshot, Version, map_offset};
 pub use format::{Encoding, Format};
 pub use line_ending::{LineEnding, LineEndingCounts, convert_line_endings};
-pub use load::{FileStamp, Loaded, decode, load, load_with, read};
+pub use load::{FileStamp, LoadObserver, Loaded, decode, load, load_observed, load_with, read};
 pub use rope::{Chunks, LineSpan, Lines, Rope, RopeBuilder};
 pub use save::{SaveError, encode, save};

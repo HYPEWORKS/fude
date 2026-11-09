@@ -1,6 +1,18 @@
 use crate::FontId;
 use crate::face::Face;
-use harfrust::{Feature, GlyphId, ShapeOptions};
+use harfrust::{Feature, ShapeOptions, ShapePlan, ShapePlanKey};
+
+/// Plans kept per font and segment properties.
+const MAX_PLANS: usize = 32;
+
+/// Reused shaping state: the buffer, and shaping plans. Building a plan compiles the
+/// font's features, which for a large font (CJK) costs far more than shaping a short run,
+/// and text that mixes fonts shapes many short runs.
+#[derive(Default)]
+pub(crate) struct Shaping {
+    buffer: Option<harfrust::Buffer>,
+    plans: Vec<(FontId, ShapePlan)>,
+}
 
 /// A glyph placed on a line.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -42,7 +54,8 @@ pub(crate) fn continues_cluster(c: char) -> bool {
 }
 
 /// Maps characters straight to glyphs: correct for the bundled monospace font when
-/// [`needs_shaping`] is false.
+/// [`needs_shaping`] is false. Stops once past `max_x`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fast_run(
     face: &Face,
     font: FontId,
@@ -50,11 +63,16 @@ pub(crate) fn fast_run(
     cluster_base: usize,
     mut pen: f32,
     scale: f32,
+    max_x: f32,
     out: &mut LineLayout,
 ) -> f32 {
     let shaper = face.shaper();
+    out.glyphs.reserve(text.len().min(4096));
     for (off, ch) in text.char_indices() {
-        let gid = shaper.nominal_glyph(ch as u32).unwrap_or(GlyphId::NOTDEF);
+        if pen > max_x {
+            break;
+        }
+        let (gid, advance) = face.nominal(&shaper, ch);
         out.glyphs.push(PositionedGlyph {
             glyph: gid.to_u32(),
             font,
@@ -62,7 +80,7 @@ pub(crate) fn fast_run(
             y: 0.0,
             cluster: (cluster_base + off) as u32,
         });
-        pen += shaper.glyph_h_advance(gid) as f32 * scale;
+        pen += advance * scale;
     }
     pen
 }
@@ -73,7 +91,7 @@ pub(crate) fn shaped_run(
     face: &Face,
     font: FontId,
     features: &[Feature],
-    buffer: &mut harfrust::Buffer,
+    shaping: &mut Shaping,
     text: &str,
     cluster_base: usize,
     pen: f32,
@@ -82,9 +100,10 @@ pub(crate) fn shaped_run(
 ) -> f32 {
     let start = out.glyphs.len();
     let pen = shape_segment(
-        &face.shaper(),
+        face,
+        font,
         features,
-        buffer,
+        shaping,
         text,
         cluster_base,
         pen,
@@ -99,9 +118,10 @@ pub(crate) fn shaped_run(
 
 #[allow(clippy::too_many_arguments)]
 fn shape_segment(
-    shaper: &harfrust::ShaperFont<'_, '_>,
+    face: &Face,
+    font: FontId,
     features: &[Feature],
-    buffer: &mut harfrust::Buffer,
+    shaping: &mut Shaping,
     seg: &str,
     start: usize,
     mut pen: f32,
@@ -111,10 +131,35 @@ fn shape_segment(
     if seg.is_empty() {
         return pen;
     }
+    let Shaping { buffer, plans } = shaping;
+    let buffer = buffer.get_or_insert_with(harfrust::Buffer::new);
     buffer.clear();
     buffer.push_str(seg);
     buffer.guess_segment_properties();
-    if harfrust::shape(shaper, buffer, ShapeOptions::new().features(features)).is_err() {
+    let cached = {
+        let key = ShapePlanKey::new(&face.font, buffer.script(), buffer.direction())
+            .language(buffer.language())
+            .features(features);
+        plans.iter().position(|(f, p)| *f == font && key.matches(p))
+    };
+    let i = cached.unwrap_or_else(|| {
+        if plans.len() == MAX_PLANS {
+            plans.remove(0);
+        }
+        let plan = ShapePlan::new(
+            &face.font,
+            buffer.direction(),
+            buffer.script(),
+            buffer.language(),
+            features,
+        );
+        plans.push((font, plan));
+        plans.len() - 1
+    });
+    let options = ShapeOptions::new()
+        .plan(Some(&plans[i].1))
+        .features(features);
+    if harfrust::shape(&face.shaper(), buffer, options).is_err() {
         buffer.clear();
         return pen;
     }
@@ -137,10 +182,20 @@ fn shape_segment(
 pub(crate) fn shape_segment_for_test(
     face: &Face,
     features: &[Feature],
-    buffer: &mut harfrust::Buffer,
     text: &str,
     scale: f32,
     out: &mut LineLayout,
 ) -> f32 {
-    shape_segment(&face.shaper(), features, buffer, text, 0, 0.0, scale, out)
+    let mut shaping = Shaping::default();
+    shape_segment(
+        face,
+        FontId(0),
+        features,
+        &mut shaping,
+        text,
+        0,
+        0.0,
+        scale,
+        out,
+    )
 }

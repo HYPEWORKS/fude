@@ -3,11 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use fude_buffer::{Encoding, FileStamp, Format, Loaded, SaveError};
+use fude_buffer::{Encoding, FileStamp, Format, SaveError};
 use fude_platform::{Ctx, FileDialog};
 
 use crate::app::{Fude, Question};
 use crate::doc::{Doc, DocId, SaveJob, Then};
+use crate::loading::LoadKind;
 
 impl Fude {
     /// Opens `path` in a tab, or switches to it if it's already open. A path that
@@ -22,22 +23,44 @@ impl Fude {
             self.activate(i);
             return;
         }
-        let id = self.new_id();
-        match fude_buffer::load(&path) {
-            Ok(loaded) => {
-                let note = loaded_note(&loaded);
-                self.add_doc(Doc::loaded(id, loaded, path));
-                if let Some(note) = note {
-                    self.say(note, false);
-                }
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                self.say(format!("{} is a folder", path.display()), true);
             }
+            Ok(meta) if meta.len() > self.config.large_file_mb << 20 => {
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                let message = format!(
+                    "{name} is {}. An open file takes about as much memory as its size.",
+                    human_size(meta.len())
+                );
+                self.ask(
+                    Question::OpenLarge(path),
+                    "Open a large file?",
+                    &message,
+                    &["Open", "Cancel"],
+                    0,
+                    1,
+                );
+            }
+            Ok(_) => self.open_now(&path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let id = self.new_id();
                 let mut doc = Doc::untitled(id);
                 doc.path = Some(path);
                 self.add_doc(doc);
             }
             Err(e) => self.say(format!("Couldn't open {}: {e}", path.display()), true),
         }
+    }
+
+    /// Opens a file without asking, loading it in the background. A small file appears
+    /// whole; a large one shows its start while the rest is read.
+    fn open_now(&mut self, path: &Path) {
+        self.open_loading(LoadKind::Open, path, None);
+        self.settle_loads();
     }
 
     pub fn open_dialog(&mut self, ctx: &mut Ctx<'_>) {
@@ -118,6 +141,9 @@ impl Fude {
 
     pub fn save(&mut self, ctx: &mut Ctx<'_>, id: DocId, then: Option<Then>) {
         let Some(i) = self.index_of(id) else { return };
+        if self.still_loading(i) {
+            return;
+        }
         let Some(path) = self.docs[i].path.clone() else {
             self.save_as(ctx, id, then);
             return;
@@ -164,6 +190,9 @@ impl Fude {
 
     pub fn save_as(&mut self, ctx: &mut Ctx<'_>, id: DocId, then: Option<Then>) {
         let Some(i) = self.index_of(id) else { return };
+        if self.still_loading(i) {
+            return;
+        }
         let dir = self.directory(id);
         let name = self.docs[i].name();
         let options = FileDialog {
@@ -309,6 +338,7 @@ impl Fude {
             }
             (Question::ReadOnly(id, then), 0) => self.save_as(ctx, id, then),
             (Question::ChangedOnDisk(id), 0) => self.reload(id),
+            (Question::OpenLarge(path), 0) => self.open_now(&path),
             (Question::ChangedOnDisk(id), _) => {
                 // Keep the edited text; the file on disk no longer matches any version.
                 if let Some(i) = self.index_of(id) {
@@ -328,7 +358,7 @@ impl Fude {
         }
         for i in 0..self.docs.len() {
             let doc = &self.docs[i];
-            if doc.saving.is_some() {
+            if doc.saving.is_some() || doc.loading.is_some() {
                 continue;
             }
             let (Some(path), Some(stamp)) = (&doc.path, doc.stamp) else {
@@ -361,40 +391,42 @@ impl Fude {
         }
     }
 
+    /// Reads the file again (it changed on disk), in the background.
     fn reload(&mut self, id: DocId) {
         let Some(i) = self.index_of(id) else { return };
         let Some(path) = self.docs[i].path.clone() else {
             return;
         };
-        match fude_buffer::load(&path) {
-            Ok(loaded) => {
-                let doc = &mut self.docs[i];
-                let editor = &mut doc.view.editor;
-                editor.replace_content(loaded.text, loaded.format);
-                let version = editor.buffer().version();
-                editor.buffer_mut().mark_saved(version);
-                doc.stamp = loaded.stamp;
-                doc.inexact = !loaded.exact;
-                let name = doc.name();
-                self.say(format!("Reloaded {name} (changed on disk)"), false);
-            }
-            Err(e) => self.say(format!("Couldn't reload: {e}"), true),
-        }
+        self.start_load(id, &path, None, LoadKind::Reload);
+        self.settle_loads();
     }
 }
 
-/// Anything worth telling the user about how a file was read.
-fn loaded_note(loaded: &Loaded) -> Option<String> {
-    if loaded.binary {
-        Some("This looks like a binary file".to_owned())
-    } else if !loaded.exact {
-        Some(format!(
-            "Opened as {}; some bytes can't be represented exactly",
-            loaded.format.encoding.name()
-        ))
-    } else {
-        None
+impl Fude {
+    /// Says so if document `i` is still loading (it can't be saved or edited yet).
+    pub fn still_loading(&mut self, i: usize) -> bool {
+        if self.docs[i].loading.is_none() {
+            return false;
+        }
+        let name = self.docs[i].name();
+        self.say(
+            format!("{name} is still loading; it can be edited once it's read"),
+            false,
+        );
+        true
     }
+}
+
+/// A size in bytes for people: "3.4 GB".
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

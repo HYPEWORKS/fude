@@ -17,17 +17,9 @@ fn fast_path_matches_shaper() {
 
     // Force the same text through harfrust with the same features.
     let face = &ts.faces[0];
-    let mut buffer = harfrust::Buffer::new();
     let mut shaped = LineLayout::default();
     let scale = style.px / face.upem;
-    let width = layout::shape_segment_for_test(
-        face,
-        &ts.no_ligatures,
-        &mut buffer,
-        ASCII,
-        scale,
-        &mut shaped,
-    );
+    let width = layout::shape_segment_for_test(face, &ts.no_ligatures, ASCII, scale, &mut shaped);
 
     assert_eq!(fast.glyphs.len(), shaped.glyphs.len());
     for (a, b) in fast.glyphs.iter().zip(&shaped.glyphs) {

@@ -32,6 +32,16 @@ impl DisplayLine {
         self.text.clear();
         self.pieces.clear();
         self.preedit = None;
+        // Printable ASCII (and tabs) shows as it is: no chips, offsets the same both ways.
+        if preedit.is_none()
+            && bytes
+                .iter()
+                .all(|&b| (b' '..=b'~').contains(&b) || b == b'\t')
+        {
+            self.text
+                .push_str(std::str::from_utf8(bytes).expect("ASCII is UTF-8"));
+            return;
+        }
         let mut doc = 0;
         for chunk in bytes.utf8_chunks() {
             for c in chunk.valid().chars() {

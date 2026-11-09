@@ -1,5 +1,6 @@
 //! Development tasks. Run with `cargo xtask <task>`.
 
+mod corpus;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod ui_test;
 
@@ -22,6 +23,15 @@ Tasks:
       --check           Exit with an error if the median is over budget
       --no-build        Use the existing target/release/fude
 
+  corpus [--small]
+      Generate the large-file corpus into target/corpus (about 1 GB; with --small, a
+      tenth of that, into target/corpus-small). Files that exist are kept.
+
+  bench-large [--small] [--check] [--no-build] [FILE...]
+      Open each corpus file (or the files given) in the release build without a window,
+      and time the first screen, loading, scrolling and typing, and measure memory.
+      --check fails when a budget is missed.
+
   ui-test [--no-build]
       Drive the release build through X11 (typing, mouse, clipboard, saving, the
       unsaved-changes prompt) and check what it saves. Linux and BSD; run it on an X
@@ -32,6 +42,8 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("bench-startup") => bench_startup(&args[1..]),
         Some("ui-test") => ui_test(&args[1..]),
+        Some("corpus") => corpus_task(&args[1..]).map(|_| ()),
+        Some("bench-large") => bench_large(&args[1..]),
         Some("-h" | "--help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -44,6 +56,65 @@ fn main() -> ExitCode {
             eprintln!("xtask: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn corpus_task(args: &[String]) -> Result<Vec<PathBuf>, String> {
+    let small = match args {
+        [] => false,
+        [flag] if flag == "--small" => true,
+        _ => return Err(format!("unexpected arguments {args:?}\n\n{USAGE}")),
+    };
+    let files = corpus_files(small)?;
+    for (path, spec) in files.iter().zip(corpus::FILES) {
+        let mb = std::fs::metadata(path).map_or(0, |m| m.len()) as f64 / 1e6;
+        println!("  {:<40} {mb:>6.0} MB  {}", path.display(), spec.what);
+    }
+    Ok(files)
+}
+
+fn corpus_files(small: bool) -> Result<Vec<PathBuf>, String> {
+    let dir = workspace_root()
+        .join("target")
+        .join(if small { "corpus-small" } else { "corpus" });
+    corpus::ensure(&dir, small)
+}
+
+fn bench_large(args: &[String]) -> Result<(), String> {
+    let (mut small, mut check, mut build) = (false, false, true);
+    let mut files = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--small" => small = true,
+            "--check" => check = true,
+            "--no-build" => build = false,
+            f if f.starts_with('-') => return Err(format!("unknown option {f:?}\n\n{USAGE}")),
+            f => files.push(PathBuf::from(f)),
+        }
+    }
+    let exe = release_exe(build)?;
+    if files.is_empty() {
+        files = corpus_files(small)?;
+    }
+    let mut failed = Vec::new();
+    for file in &files {
+        let mut cmd = Command::new(&exe);
+        cmd.arg("--bench-file")
+            .arg(file)
+            .args(["--size", "1920x1080"]);
+        if check {
+            cmd.arg("--check");
+        }
+        let status = cmd.status().map_err(|e| format!("running fude: {e}"))?;
+        if !status.success() {
+            failed.push(file.display().to_string());
+        }
+        println!();
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("over budget: {}", failed.join(", ")))
     }
 }
 

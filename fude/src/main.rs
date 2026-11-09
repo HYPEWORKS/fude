@@ -6,11 +6,13 @@
 
 mod app;
 mod args;
+mod bench_file;
 mod config;
 mod doc;
 mod files;
 mod find;
 mod instance;
+mod loading;
 mod session;
 mod welcome;
 
@@ -47,6 +49,7 @@ fn main() -> ExitCode {
         Mode::Screenshot(path) => screenshot(&args, path),
         Mode::BenchRender => bench_render(&args),
         Mode::BenchTyping => bench_typing(&args),
+        Mode::BenchFile(path) => bench_file::run(&args, path, args.check),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -246,6 +249,8 @@ impl App for Window {
 
 fn screenshot(args: &Args, path: &Path) -> Result<(), String> {
     let mut app = initial_app(args, true)?;
+    // Without a window, wait for files to load: the frames are what's measured or shown.
+    app.finish_loading();
     let (w, h) = args.size;
     let mut pixels = vec![0u32; w as usize * h as usize];
     app.draw(
@@ -287,6 +292,8 @@ fn summary(times: &mut [Duration]) -> String {
 /// (no damage tracking, every pixel drawn).
 fn bench_render(args: &Args) -> Result<(), String> {
     let mut app = initial_app(args, true)?;
+    // Without a window, wait for files to load: the frames are what's measured or shown.
+    app.finish_loading();
     let (w, h) = args.size;
     let mut pixels = vec![0u32; w as usize * h as usize];
     let mut draw = |app: &mut Fude| {
@@ -324,6 +331,8 @@ fn bench_render(args: &Args) -> Result<(), String> {
 /// frame, so it measures fude's whole share of "key pressed → frame ready".
 fn bench_typing(args: &Args) -> Result<(), String> {
     let mut app = initial_app(args, true)?;
+    // Without a window, wait for files to load: the frames are what's measured or shown.
+    app.finish_loading();
     let (w, h) = args.size;
     let mut pixels = vec![0u32; w as usize * h as usize];
     let mut draw = |app: &mut Fude| {

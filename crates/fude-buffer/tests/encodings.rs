@@ -271,3 +271,43 @@ fn converting_line_endings_across_leaves() {
     let lf_only = Rope::from("a\nb\n");
     assert!(convert_line_endings(&lf_only, LineEnding::Lf).ptr_eq(&lf_only));
 }
+
+/// The detector sees a 1 MB sample; ending it in the middle of a character used to count
+/// against the right encoding (this file opened as windows-1252).
+#[test]
+fn detection_sample_ends_on_a_whole_character() {
+    let text = "2026-11-08 筆はブラシという意味です。テキストエディタ。\n".repeat(50_000);
+    let sjis = encoded(&text, SHIFT_JIS);
+    assert!(sjis.len() > 2 << 20);
+    assert_eq!(decode(&sjis, None).format.encoding, SHIFT_JIS);
+}
+
+/// A large legacy file is decoded as it's read (decided from its first megabyte), and
+/// checked for exactness the same way: one ambiguous character anywhere is caught.
+#[test]
+fn large_legacy_files_are_checked_as_they_stream() {
+    let text = "2026-11-08 筆はブラシという意味です。テキストエディタ。\n".repeat(60_000);
+    let sjis = encoded(&text, SHIFT_JIS);
+    assert!(sjis.len() > 3 << 20);
+    let loaded = decode(&sjis, None);
+    assert_eq!(loaded.format.encoding, SHIFT_JIS);
+    assert_eq!(loaded.text.to_vec(), text.as_bytes());
+    assert!(loaded.exact);
+    assert_round_trip(&sjis);
+
+    // An NEC-extension character (which encodes back as the IBM one) near the end, and
+    // across a read boundary.
+    for at in [sjis.len() - 100, (2 << 20) - 1] {
+        let at = at - sjis[..at].iter().rev().take_while(|&&b| b != b'\n').count();
+        let mut bytes = sjis.clone();
+        bytes.splice(at..at, *b"\xED\x40");
+        let loaded = decode(&bytes, None);
+        assert_eq!(loaded.format.encoding, SHIFT_JIS);
+        assert!(
+            !loaded.exact,
+            "the NEC character at {at} doesn't round-trip"
+        );
+        let forced = decode(&bytes, Some(SHIFT_JIS));
+        assert!(!forced.exact);
+    }
+}

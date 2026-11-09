@@ -1,14 +1,15 @@
 //! The editor view: draws the visible part of a document and turns keys, mouse and IME
 //! input into editor commands.
 //!
-//! Only visible lines are ever laid out, so a frame costs the same at any file size.
-//! The caret blinks for a while after input, then stays solid, so an idle window wakes
-//! no timers at all.
+//! Only visible text is ever laid out, so a frame costs the same at any file size: the
+//! view works in pieces of lines (see `pieces`), and its scroll position is a piece and a
+//! row in it, never a count of everything above. The caret blinks for a while after
+//! input, then stays solid, so an idle window wakes no timers at all.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use fude_buffer::{LineSpan, Rope};
+use fude_buffer::Rope;
 use fude_editor::{Editor, Layout, Motion, Searcher, Selection, Selections, nearest, text as nav};
 use fude_platform::{CursorShape, Ime, Key, KeyInput, Modifiers, ScrollUnit};
 use fude_render::Rect;
@@ -17,6 +18,7 @@ use fude_text::{Chip, FontId, LineLayout, TextStyle, TextSystem};
 use fude_syntax::Span;
 
 use crate::display::DisplayLine;
+use crate::pieces::{PIECE, Piece, first_piece, next_piece, piece_at, piece_of, prev_piece};
 
 /// Syntax highlighting for a range of lines, from a document version.
 #[derive(Clone, Debug)]
@@ -42,8 +44,6 @@ impl Highlights {
 }
 use crate::painter::Painter;
 
-/// Lines longer than this are cut off for display (long-line layout is phase 4 work).
-const MAX_DISPLAY_BYTES: usize = 16 * 1024;
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 const BLINK: Duration = Duration::from_millis(530);
 /// The caret stops blinking (and the view stops waking up) this long after input.
@@ -97,6 +97,23 @@ impl Default for Geometry {
     }
 }
 
+/// The top of the view: row `row` of the piece that starts at `at`, scrolled a further
+/// `sub` of a row (smooth scrolling). A byte offset, not a count of what's above, so it
+/// costs the same anywhere in any file, and stays put while a file finishes loading.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Top {
+    at: usize,
+    row: usize,
+    sub: f32,
+}
+
+/// A view's scroll position, to go back to later (after a preview).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollPosition {
+    top: Top,
+    x: f32,
+}
+
 /// Reused buffers for laying out one line.
 #[derive(Default)]
 struct Scratch {
@@ -123,24 +140,29 @@ impl Row {
     }
 }
 
-/// Lays out single lines for drawing, hit testing and vertical movement.
+/// Lays out single pieces of lines for drawing, hit testing and vertical movement.
 struct LineCtx<'a> {
     text: &'a mut TextSystem,
     style: TextStyle,
     s: &'a mut Scratch,
     /// Wrap width, if wrapping.
     wrap: Option<f32>,
+    /// Layout may stop past this x: for drawing a row of which only the start shows.
+    max_x: f32,
 }
 
 impl LineCtx<'_> {
-    fn prepare(&mut self, doc: &Rope, span: LineSpan, preedit: Option<(usize, &str)>) {
+    fn prepare(&mut self, doc: &Rope, piece: &Piece, preedit: Option<(usize, &str)>) {
         self.s.bytes.clear();
-        let end = span.end.min(span.start + MAX_DISPLAY_BYTES);
-        doc.copy_range(span.start..end, &mut self.s.bytes);
-        let preedit = preedit.map(|(at, text)| (at - span.start, text));
+        doc.copy_range(piece.start..piece.end, &mut self.s.bytes);
+        let preedit = preedit.map(|(at, text)| (at - piece.start, text));
         self.s.display.build(&self.s.bytes, preedit);
-        self.text
-            .layout_line(&self.s.display.text, &self.style, &mut self.s.layout);
+        self.text.layout_line_until(
+            &self.s.display.text,
+            &self.style,
+            &mut self.s.layout,
+            self.max_x,
+        );
     }
 
     /// x of a display offset in the prepared line.
@@ -227,42 +249,51 @@ impl LineCtx<'_> {
     }
 
     /// Cluster boundaries within a row, as (document offset, x within the row). The end
-    /// of the line is a stop on the last row only; on other rows it's the next row's start.
-    fn row_stops(&self, rows: &[Row], index: usize, line_start: usize) -> Vec<(usize, f32)> {
+    /// of the line is a stop on its last row only; elsewhere a row's end is the next row's
+    /// start.
+    fn row_stops(&self, rows: &[Row], index: usize, piece: &Piece) -> Vec<(usize, f32)> {
         let row = rows[index];
         let mut stops: Vec<(usize, f32)> = self
             .clusters()
             .into_iter()
             .filter(|&(c, _)| c >= row.start && c < row.end)
-            .map(|(c, x)| (line_start + self.s.display.to_doc(c), row.place(x)))
+            .map(|(c, x)| (piece.start + self.s.display.to_doc(c), row.place(x)))
             .collect();
-        if index + 1 == rows.len() {
+        if index + 1 == rows.len() && piece.is_last() {
             stops.push((
-                line_start + self.s.bytes.len(),
+                piece.start + self.s.bytes.len(),
                 row.place(self.s.layout.width),
             ));
         }
         if stops.is_empty() {
-            stops.push((line_start + self.s.display.to_doc(row.start), row.indent));
+            stops.push((piece.start + self.s.display.to_doc(row.start), row.indent));
         }
         stops
+    }
+
+    /// The row of the prepared piece that a cursor at `at` is drawn on.
+    fn row_at(&self, rows: &[Row], piece: &Piece, at: usize) -> usize {
+        LineCtx::row_of(
+            rows,
+            self.s.display.to_display(at.min(piece.end) - piece.start),
+        )
     }
 }
 
 impl Layout for LineCtx<'_> {
     fn x_of(&mut self, doc: &Rope, line: usize, at: usize) -> f32 {
-        let span = doc.line_span(line);
-        self.prepare(doc, span, None);
-        let d = self.s.display.to_display(at - span.start);
+        let piece = piece_at(doc, line, doc.line_span(line), at);
+        self.prepare(doc, &piece, None);
+        let d = self.s.display.to_display(at.min(piece.end) - piece.start);
         let rows = self.rows();
         rows[LineCtx::row_of(&rows, d)].place(self.x_at_display(d))
     }
 
     fn offset_at(&mut self, doc: &Rope, line: usize, x: f32) -> usize {
-        let span = doc.line_span(line);
-        self.prepare(doc, span, None);
+        let piece = first_piece(doc, line);
+        self.prepare(doc, &piece, None);
         let rows = self.rows();
-        nearest(&self.row_stops(&rows, 0, span.start), x)
+        nearest(&self.row_stops(&rows, 0, &piece), x)
     }
 
     fn vertical(
@@ -272,22 +303,27 @@ impl Layout for LineCtx<'_> {
         goal_x: Option<f32>,
         rows: isize,
     ) -> (usize, Option<f32>) {
-        let mut line = doc.byte_to_line(at);
-        let mut span = doc.line_span(line);
-        self.prepare(doc, span, None);
+        let mut piece = piece_of(doc, at);
+        self.prepare(doc, &piece, None);
         let mut rs = self.rows();
-        let d = self.s.display.to_display(at - span.start);
+        let d = self.s.display.to_display(at.min(piece.end) - piece.start);
         let mut r = LineCtx::row_of(&rs, d);
         let goal = goal_x.unwrap_or_else(|| rs[r].place(self.x_at_display(d)));
+        // Without wrapping, a piece is one row: the pieces passed need no layout, only
+        // the one arrived at.
+        let one_row = self.wrap.is_none();
+        let mut prepared = true;
         let mut left = rows;
         while left > 0 {
             if r + 1 < rs.len() {
                 r += 1;
-            } else if line + 1 < doc.line_count() {
-                line += 1;
-                span = doc.line_span(line);
-                self.prepare(doc, span, None);
-                rs = self.rows();
+            } else if let Some(next) = next_piece(doc, &piece) {
+                piece = next;
+                prepared = !one_row;
+                if !one_row {
+                    self.prepare(doc, &piece, None);
+                    rs = self.rows();
+                }
                 r = 0;
             } else {
                 return (doc.len(), None);
@@ -297,21 +333,24 @@ impl Layout for LineCtx<'_> {
         while left < 0 {
             if r > 0 {
                 r -= 1;
-            } else if line > 0 {
-                line -= 1;
-                span = doc.line_span(line);
-                self.prepare(doc, span, None);
-                rs = self.rows();
+            } else if let Some(prev) = prev_piece(doc, &piece) {
+                piece = prev;
+                prepared = !one_row;
+                if !one_row {
+                    self.prepare(doc, &piece, None);
+                    rs = self.rows();
+                }
                 r = rs.len() - 1;
             } else {
                 return (0, None);
             }
             left += 1;
         }
-        (
-            nearest(&self.row_stops(&rs, r, span.start), goal),
-            Some(goal),
-        )
+        if !prepared {
+            self.prepare(doc, &piece, None);
+            rs = self.rows();
+        }
+        (nearest(&self.row_stops(&rs, r, &piece), goal), Some(goal))
     }
 }
 
@@ -329,8 +368,16 @@ pub struct EditorView {
     pub highlights: Option<Highlights>,
     /// The lines drawn in the last frame.
     visible_lines: Range<usize>,
-    /// First visible line, fractional for smooth scrolling.
-    scroll_line: f32,
+    /// Bytes from the start of the first piece drawn in the last frame to the end of the
+    /// last, for sizing the scrollbar.
+    visible_bytes: usize,
+    /// The whole text fit on screen in the last frame (no scrollbar).
+    fits: bool,
+    top: Top,
+    /// How many rows the top piece has.
+    top_rows: usize,
+    /// Scroll to this line at the next draw.
+    goto_line: Option<f64>,
     /// Horizontal scroll, physical pixels.
     scroll_x: f32,
     /// Scroll the primary cursor into view at the next draw.
@@ -364,7 +411,11 @@ impl EditorView {
             wrap: false,
             highlights: None,
             visible_lines: 0..0,
-            scroll_line: 0.0,
+            visible_bytes: 0,
+            fits: true,
+            top: Top::default(),
+            top_rows: 1,
+            goto_line: None,
             scroll_x: 0.0,
             reveal: false,
             center: false,
@@ -403,43 +454,110 @@ impl EditorView {
             },
             wrap: self.wrap_width(),
             s: &mut self.scratch,
+            max_x: f32::INFINITY,
         }
     }
 
-    /// How many rows `line` takes (1 without wrapping).
-    fn line_rows(&mut self, text: &mut TextSystem, doc: &Rope, line: usize) -> usize {
+    /// How many rows a piece takes (1 without wrapping).
+    fn piece_rows(&mut self, text: &mut TextSystem, doc: &Rope, piece: &Piece) -> usize {
         if !self.wrap {
             return 1;
         }
         let mut ctx = self.line_ctx(text);
-        ctx.prepare(doc, doc.line_span(line), None);
+        ctx.prepare(doc, piece, None);
         ctx.rows().len()
     }
 
-    /// Scrolls by `delta` visual rows. The position is a line plus a fraction of that
-    /// line's rows, so scrolling only lays out the lines it passes.
+    /// The piece and row at the top of the view, after edits or a change of wrapping
+    /// have moved things.
+    fn top_piece(&mut self, text: &mut TextSystem, doc: &Rope) -> (Piece, usize, f32) {
+        let piece = piece_of(doc, self.top.at);
+        let rows = self.piece_rows(text, doc, &piece);
+        self.top_rows = rows;
+        let row = self.top.row.min(rows - 1);
+        let sub = if row == self.top.row {
+            self.top.sub
+        } else {
+            0.0
+        };
+        self.top = Top {
+            at: piece.start,
+            row,
+            sub,
+        };
+        (piece, row, sub)
+    }
+
+    /// Scrolls by `delta` visual rows, laying out only the pieces it passes. The last row
+    /// of the text can come up to the top, no further.
     fn scroll_rows(&mut self, text: &mut TextSystem, delta: f32) {
-        if !self.wrap {
-            self.scroll_lines(delta);
-            return;
-        }
         let doc = self.editor.text().clone();
-        let last = doc.line_count() - 1;
-        let mut line = (self.scroll_line.floor() as usize).min(last);
-        let mut n = self.line_rows(text, &doc, line) as f32;
-        let mut pos = (self.scroll_line - line as f32) * n + delta;
-        while pos >= n && line < last {
+        let (mut piece, row, sub) = self.top_piece(text, &doc);
+        let mut n = self.piece_rows(text, &doc, &piece) as f32;
+        let mut pos = row as f32 + sub + delta;
+        while pos >= n {
+            let Some(next) = next_piece(&doc, &piece) else {
+                pos = n - 1.0;
+                break;
+            };
             pos -= n;
-            line += 1;
-            n = self.line_rows(text, &doc, line) as f32;
+            piece = next;
+            n = self.piece_rows(text, &doc, &piece) as f32;
         }
-        while pos < 0.0 && line > 0 {
-            line -= 1;
-            n = self.line_rows(text, &doc, line) as f32;
+        while pos < 0.0 {
+            let Some(prev) = prev_piece(&doc, &piece) else {
+                pos = 0.0;
+                break;
+            };
+            piece = prev;
+            n = self.piece_rows(text, &doc, &piece) as f32;
             pos += n;
         }
-        let pos = pos.clamp(0.0, (n - 1.0).max(0.0));
-        self.scroll_line = line as f32 + pos / n;
+        let pos = pos.clamp(0.0, n - 1.0);
+        self.top = Top {
+            at: piece.start,
+            row: pos.floor() as usize,
+            sub: pos.fract(),
+        };
+        self.top_rows = n as usize;
+    }
+
+    /// Puts the top of the view at a fraction of the way through the text: lines, and
+    /// within a long line, bytes. What the scrollbar shows and its thumb sets.
+    fn scroll_to_fraction(&mut self, text: &mut TextSystem, frac: f64) {
+        let doc = self.editor.text().clone();
+        let lines = doc.line_count();
+        let pos = frac.clamp(0.0, 1.0) * (lines.max(2) - 1) as f64;
+        let line = (pos.floor() as usize).min(lines - 1);
+        let within = (pos - line as f64).clamp(0.0, 1.0);
+        let span = doc.line_span(line);
+        let at = span.start + ((span.end - span.start) as f64 * within) as usize;
+        let piece = piece_at(&doc, line, span, at);
+        self.top = Top {
+            at: piece.start,
+            row: 0,
+            sub: 0.0,
+        };
+        if piece.is_first() && piece.is_last() {
+            // A line of one piece: scroll smoothly through its rows.
+            let rows = self.piece_rows(text, &doc, &piece) as f64;
+            self.scroll_rows(text, (within * rows) as f32);
+        }
+    }
+
+    /// How far through the text the top of the view is, from 0 to 1 (see
+    /// [`EditorView::scroll_to_fraction`]).
+    fn scroll_fraction(&self) -> f64 {
+        let doc = self.editor.text();
+        let at = self.top.at.min(doc.len());
+        let line = doc.byte_to_line(at);
+        let span = doc.line_span(line);
+        let within = if span.end - span.start <= PIECE {
+            (self.top.row as f64 + f64::from(self.top.sub)) / self.top_rows.max(1) as f64
+        } else {
+            (at - span.start) as f64 / (span.end - span.start) as f64
+        };
+        ((line as f64 + within) / (doc.line_count().max(2) - 1) as f64).min(1.0)
     }
 
     /// Restarts the caret blink and scrolls the cursor into view.
@@ -587,6 +705,7 @@ impl EditorView {
                 style,
                 s: &mut self.scratch,
                 wrap,
+                max_x: f32::INFINITY,
             };
             self.editor.move_cursors(motion, m.shift, &mut ctx);
             self.touched(now);
@@ -681,17 +800,9 @@ impl EditorView {
         self.geo.px * 0.6
     }
 
-    fn scroll_lines(&mut self, lines: f32) {
-        self.scroll_line = (self.scroll_line + lines).clamp(0.0, self.max_scroll());
-    }
-
     fn scroll_px(&mut self, px: f32) {
         let limit = (self.max_width - (self.geo.text.w - self.geo.text_pad) as f32 / 2.0).max(0.0);
         self.scroll_x = (self.scroll_x + px).clamp(0.0, limit.max(self.scroll_x));
-    }
-
-    fn max_scroll(&self) -> f32 {
-        (self.editor.text().line_count() as f32 - 1.0).max(0.0)
     }
 
     /// Sets the font size (logical pixels), keeping the cursor in view.
@@ -714,14 +825,31 @@ impl EditorView {
         self.center = true;
     }
 
-    /// The scroll position, to restore after a preview.
-    pub fn scroll_position(&self) -> (f32, f32) {
-        (self.scroll_line, self.scroll_x)
+    /// The scroll position, to go back to after a preview.
+    pub fn scroll_position(&self) -> ScrollPosition {
+        ScrollPosition {
+            top: self.top,
+            x: self.scroll_x,
+        }
     }
 
-    pub fn set_scroll_position(&mut self, (line, x): (f32, f32)) {
-        self.scroll_line = line.clamp(0.0, self.max_scroll());
-        self.scroll_x = x.max(0.0);
+    pub fn set_scroll_position(&mut self, pos: ScrollPosition) {
+        self.top = pos.top;
+        self.scroll_x = pos.x.max(0.0);
+        self.reveal = false;
+        self.center = false;
+        self.goto_line = None;
+    }
+
+    /// The line at the top of the view, and how far into it: what a session remembers.
+    pub fn top_line(&self) -> f64 {
+        self.scroll_fraction() * (self.editor.text().line_count().max(2) - 1) as f64
+    }
+
+    /// Scrolls (at the next draw, once the view's size is known) so the top is where
+    /// [`EditorView::top_line`] said.
+    pub fn scroll_to_line(&mut self, line: f64) {
+        self.goto_line = Some(line.max(0.0));
         self.reveal = false;
         self.center = false;
     }
@@ -797,7 +925,7 @@ impl EditorView {
             let thumb_h = self.thumb().map_or(0, |t| t.h);
             let span = (track.h - thumb_h).max(1) as f32;
             let frac = ((y - grab - track.y as f32) / span).clamp(0.0, 1.0);
-            self.scroll_line = frac * self.max_scroll();
+            self.scroll_to_fraction(&mut p.text, f64::from(frac));
             return true;
         }
         let hover = self
@@ -845,16 +973,12 @@ impl EditorView {
         self.reveal = true;
     }
 
-    /// The first visible line, the row within it, and the y of the first drawn row.
-    fn top(&mut self, text: &mut TextSystem, doc: &Rope) -> (usize, usize, i32) {
+    /// The piece at the top, its first visible row, and the y of that row.
+    fn top(&mut self, text: &mut TextSystem, doc: &Rope) -> (Piece, usize, i32) {
         let g = self.geo;
-        let first = (self.scroll_line.floor() as usize).min(doc.line_count() - 1);
-        let n = self.line_rows(text, doc, first);
-        let rows_in = (self.scroll_line - first as f32) * n as f32;
-        let row = (rows_in.floor() as usize).min(n - 1);
-        let sub = rows_in - row as f32;
+        let (piece, row, sub) = self.top_piece(text, doc);
         (
-            first,
+            piece,
             row,
             g.text.y + g.pad_top - (sub * g.line_h as f32).round() as i32,
         )
@@ -865,21 +989,23 @@ impl EditorView {
         let g = self.geo;
         let doc = self.editor.text().clone();
         let (first, first_row, y0) = self.top(&mut p.text, &doc);
-        if (y as i32) < y0 && first == 0 && first_row == 0 {
+        if (y as i32) < y0 && first.start == 0 && first_row == 0 {
             return 0;
         }
         let mut target = ((y - y0 as f32) / g.line_h as f32).floor().max(0.0) as usize;
         let lx = x - (g.text.x + g.text_pad) as f32 + self.scroll_x;
         let mut ctx = self.line_ctx(&mut p.text);
-        for (i, span) in (first..).zip(doc.lines_from(first)) {
-            ctx.prepare(&doc, span, None);
+        let (mut piece, mut skip) = (Some(first), first_row);
+        while let Some(pc) = piece {
+            ctx.prepare(&doc, &pc, None);
             let rows = ctx.rows();
-            let skip = if i == first { first_row } else { 0 };
             let here = rows.len() - skip;
             if target < here {
-                return nearest(&ctx.row_stops(&rows, skip + target, span.start), lx);
+                return nearest(&ctx.row_stops(&rows, skip + target, &pc), lx);
             }
             target -= here;
+            skip = 0;
+            piece = next_piece(&doc, &pc);
         }
         doc.len()
     }
@@ -893,17 +1019,19 @@ impl EditorView {
     }
 
     fn thumb(&self) -> Option<Rect> {
-        let lines = self.editor.text().line_count() as f32;
-        let visible = self.geo.visible;
-        if lines <= visible.floor() {
+        if self.fits {
             return None;
         }
+        let doc = self.editor.text();
+        let visible = self.geo.visible;
         let track = self.track();
-        let total = lines - 1.0 + visible;
-        let h = ((track.h as f32 * visible / total) as i32)
+        // The share of the text on screen, by lines or, for long lines, by bytes.
+        let by_lines = visible / (doc.line_count() as f32 - 1.0 + visible);
+        let by_bytes = self.visible_bytes as f32 / doc.len().max(1) as f32;
+        let h = ((track.h as f32 * by_lines.min(by_bytes)) as i32)
             .max(self.geo.min_thumb)
             .min(track.h);
-        let frac = self.scroll_line / self.max_scroll().max(1.0);
+        let frac = self.scroll_fraction() as f32;
         let y = track.y + ((track.h - h) as f32 * frac).round() as i32;
         Some(Rect::new(track.x, y, track.w, h))
     }
@@ -939,27 +1067,61 @@ impl EditorView {
         };
     }
 
+    /// Scrolls so the primary cursor's row is on screen (in the middle, if asked), and,
+    /// without wrapping, its column too. Counts rows only between the top of the view and
+    /// the cursor, at most a screenful.
     fn scroll_to_cursor(&mut self, p: &mut Painter) {
         let doc = self.editor.text().clone();
         let head = self.editor.selections().primary().head;
-        let line = doc.byte_to_line(head);
-        let visible = self.geo.visible.floor().max(1.0);
+        let visible = self.geo.visible;
+        let center = std::mem::take(&mut self.center);
+        let piece = piece_of(&doc, head);
+        let row = {
+            let mut ctx = self.line_ctx(&mut p.text);
+            ctx.prepare(&doc, &piece, None);
+            let rows = ctx.rows();
+            ctx.row_at(&rows, &piece, head)
+        };
+        let (top, top_row, sub) = self.top_piece(&mut p.text, &doc);
+        let here = (piece.start, row);
+        let at_top = (top.start, top_row);
+        let back = if center {
+            Some((visible / 2.0).floor())
+        } else if here < at_top || (here == at_top && sub > 0.0) {
+            Some(0.0)
+        } else {
+            // Rows from the top of the view to the bottom of the cursor's row.
+            let mut below = -sub;
+            let (mut pc, mut r) = (top, top_row);
+            loop {
+                if pc.start == piece.start {
+                    below += (row + 1 - r) as f32;
+                    break;
+                }
+                below += (self.piece_rows(&mut p.text, &doc, &pc) - r) as f32;
+                match next_piece(&doc, &pc) {
+                    Some(next) if below <= visible => (pc, r) = (next, 0),
+                    _ => break,
+                }
+            }
+            (below > visible).then_some(visible - 1.0)
+        };
+        if let Some(back) = back {
+            self.top = Top {
+                at: piece.start,
+                row,
+                sub: 0.0,
+            };
+            self.scroll_rows(&mut p.text, -back);
+        }
+
         if self.wrap {
-            self.scroll_to_cursor_wrapped(p, &doc, head, line, visible);
+            self.scroll_x = 0.0;
             return;
         }
-        if std::mem::take(&mut self.center) {
-            self.scroll_line = line as f32 - (visible / 2.0).floor();
-        } else if (line as f32) < self.scroll_line {
-            self.scroll_line = line as f32;
-        } else if line as f32 + 1.0 > self.scroll_line + visible {
-            self.scroll_line = line as f32 + 1.0 - visible;
-        }
-        self.scroll_line = self.scroll_line.clamp(0.0, self.max_scroll());
-
         let style = self.style();
         let column = p.metrics(&style).space_advance;
-        let x = self.line_ctx(&mut p.text).x_of(&doc, line, head);
+        let x = self.line_ctx(&mut p.text).x_of(&doc, piece.line, head);
         let width = (self.geo.text.w - self.geo.text_pad) as f32;
         let margin = (column * 4.0).min(width / 3.0);
         if x < self.scroll_x + margin {
@@ -969,55 +1131,12 @@ impl EditorView {
         }
     }
 
-    /// Keeps the cursor's row visible, counting rows rather than lines.
-    fn scroll_to_cursor_wrapped(
-        &mut self,
-        p: &mut Painter,
-        doc: &Rope,
-        head: usize,
-        line: usize,
-        visible: f32,
-    ) {
-        self.scroll_x = 0.0;
-        let mut ctx = self.line_ctx(&mut p.text);
-        let span = doc.line_span(line);
-        ctx.prepare(doc, span, None);
-        let rows = ctx.rows();
-        let row = LineCtx::row_of(&rows, ctx.s.display.to_display(head - span.start));
-        let n = rows.len() as f32;
-        let at = line as f32 + row as f32 / n;
-        let center = std::mem::take(&mut self.center);
-        if !center && at >= self.scroll_line {
-            // Visible if the cursor's row is fewer than `visible` rows below the top.
-            let (first, first_row, _) = self.top(&mut p.text, doc);
-            let mut count = 0usize;
-            let mut ctx = self.line_ctx(&mut p.text);
-            for (i, span) in (first..=line).zip(doc.lines_from(first)) {
-                ctx.prepare(doc, span, None);
-                let n = if i == line { row + 1 } else { ctx.rows().len() };
-                count += n - if i == first { first_row.min(n) } else { 0 };
-                if count as f32 > visible {
-                    break;
-                }
-            }
-            if count as f32 <= visible {
-                return;
-            }
-        }
-        // Put the cursor's row `back` rows below the top.
-        let back = if center {
-            (visible / 2.0).floor()
-        } else if at < self.scroll_line {
-            0.0
-        } else {
-            visible - 1.0
-        };
-        self.scroll_line = at;
-        self.scroll_rows(&mut p.text, -back);
-    }
-
     pub fn draw(&mut self, p: &mut Painter, area: Rect, now: Instant) {
         self.update_geometry(p, area);
+        if let Some(line) = self.goto_line.take() {
+            let lines = self.editor.text().line_count().max(2) - 1;
+            self.scroll_to_fraction(&mut p.text, line / lines as f64);
+        }
         if std::mem::take(&mut self.reveal) {
             self.scroll_to_cursor(p);
         }
@@ -1036,30 +1155,49 @@ impl EditorView {
         let cursor_line = doc.byte_to_line(primary.head);
         let (first, first_row, y0) = self.top(&mut p.text, &doc);
 
-        // The visible lines and their rows, so matches can be found once for the range.
-        let mut visible: Vec<(LineSpan, usize)> = Vec::new();
+        // The visible pieces, so matches can be found once for the range.
+        let mut visible: Vec<Piece> = Vec::new();
+        let mut reached_end = false;
+        let mut rows_shown = 0usize;
         {
             let mut rows_left = ((g.text.bottom() - y0) / g.line_h + 1).max(0) as usize;
             let mut ctx = self.line_ctx(&mut p.text);
-            for (i, span) in (first..).zip(doc.lines_from(first)) {
+            let (mut piece, mut skip) = (Some(first), first_row);
+            while let Some(pc) = piece {
                 if rows_left == 0 {
                     break;
                 }
                 let n = if ctx.wrap.is_some() {
-                    ctx.prepare(&doc, span, None);
+                    ctx.prepare(&doc, &pc, None);
                     ctx.rows().len()
                 } else {
                     1
                 };
-                let shown = n - if i == first { first_row.min(n - 1) } else { 0 };
+                let shown = n - skip.min(n - 1);
                 rows_left = rows_left.saturating_sub(shown);
-                visible.push((span, n));
+                rows_shown += shown;
+                visible.push(pc);
+                skip = 0;
+                piece = next_piece(&doc, &pc);
+                reached_end = piece.is_none();
             }
         }
-        self.visible_lines = first..first + visible.len();
-        let matches = match (&self.search, visible.first(), visible.last()) {
-            (Some(s), Some((a, _)), Some((b, _))) => {
-                s.matches_in(&doc, a.start..b.next.max(b.end + 1).min(doc.len()))
+        let last = *visible.last().unwrap_or(&first);
+        self.visible_lines = first.line..last.line + 1;
+        self.visible_bytes = last.end - first.start;
+        self.fits = first.start == 0
+            && first_row == 0
+            && y0 == g.text.y + g.pad_top
+            && reached_end
+            && rows_shown as f32 <= g.visible;
+        let matches = match &self.search {
+            Some(s) if !visible.is_empty() => {
+                let end = if last.is_last() {
+                    last.span.next.max(last.end + 1)
+                } else {
+                    last.end + 1
+                };
+                s.matches_in(&doc, first.start..end.min(doc.len()))
             }
             _ => Vec::new(),
         };
@@ -1080,48 +1218,58 @@ impl EditorView {
         self.caret = None;
 
         p.list.push_clip(area);
+        // Without wrapping, a row only needs laying out as far as the view shows.
+        let layout_until = if wrap.is_none() {
+            self.scroll_x + g.text.w as f32 + 4.0 * m.space_advance
+        } else {
+            f32::INFINITY
+        };
         let mut y = y0;
-        for (i, (span, _)) in (first..).zip(visible) {
+        for (k, &piece) in visible.iter().enumerate() {
+            let span = piece.span;
             let composing = preedit
                 .as_ref()
-                .filter(|_| i == cursor_line)
+                .filter(|_| piece.holds(primary.head))
                 .map(|(s, _)| (primary.head, s.as_str()));
             let mut ctx = LineCtx {
                 text: &mut p.text,
                 style,
                 s: &mut self.scratch,
                 wrap,
+                max_x: layout_until,
             };
-            ctx.prepare(&doc, span, composing);
+            ctx.prepare(&doc, &piece, composing);
             let rows = ctx.rows();
             max_width = max_width.max(self.scratch.layout.width);
-            // Syntax colors as display ranges, in order.
+            // Syntax colors (line-relative) as display ranges of this piece, in order.
+            let (off, len) = (piece.offset(), piece.end - piece.start);
             let colored: Vec<(usize, usize, fude_render::Color)> = self
                 .highlights
                 .as_ref()
-                .and_then(|h| h.line(i))
+                .and_then(|h| h.line(piece.line))
                 .unwrap_or(&[])
                 .iter()
+                .filter(|s| s.end as usize > off && (s.start as usize) < off + len)
                 .map(|s| {
-                    let len = span.end - span.start;
                     let d = &self.scratch.display;
+                    let at = |x: u32| (x as usize).saturating_sub(off).min(len);
                     (
-                        d.to_display((s.start as usize).min(len)),
-                        d.to_display((s.end as usize).min(len)),
+                        d.to_display(at(s.start)),
+                        d.to_display(at(s.end)),
                         t.style(s.style),
                     )
                 })
                 .collect();
-            let skip = if i == first {
+            let skip = if k == 0 {
                 first_row.min(rows.len() - 1)
             } else {
                 0
             };
             let line_top = y;
-            let line_rows = (rows.len() - skip) as i32;
-            if i == cursor_line && primary.is_empty() {
+            let piece_rows = (rows.len() - skip) as i32;
+            if piece.line == cursor_line && primary.is_empty() {
                 p.rect(
-                    Rect::new(area.x, y, area.w, g.line_h * line_rows),
+                    Rect::new(area.x, y, area.w, g.line_h * piece_rows),
                     t.line_highlight,
                 );
             }
@@ -1138,6 +1286,7 @@ impl EditorView {
                     style,
                     s: &mut self.scratch,
                     wrap,
+                    max_x: f32::INFINITY,
                 };
                 let extent = |a: usize, b: usize| -> Option<(f32, f32)> {
                     let (a, b) = (a.max(row.start), b.min(row.end));
@@ -1152,13 +1301,13 @@ impl EditorView {
                 p.list.push_clip(g.text);
                 for m in matches
                     .iter()
-                    .filter(|m| m.start <= span.end && m.end > span.start)
+                    .filter(|m| m.start <= piece.end && m.end > piece.start)
                 {
                     let a = ctx
                         .s
                         .display
-                        .to_display(m.start.max(span.start) - span.start);
-                    let b = ctx.s.display.to_display(m.end.min(span.end) - span.start);
+                        .to_display(m.start.max(piece.start) - piece.start);
+                    let b = ctx.s.display.to_display(m.end.min(piece.end) - piece.start);
                     if let Some((x0, x1)) = extent(a, b).filter(|_| b > row.start || r == 0) {
                         p.list.rect(
                             Rect::new(
@@ -1173,24 +1322,27 @@ impl EditorView {
                 }
                 // Selections, extended a little past the line end when they include the break.
                 for s in sels.iter().filter(|s| !s.is_empty()) {
-                    if s.end() < span.start
-                        || s.start() > span.end
-                        || s.end() == span.start && span.start != span.end
+                    if s.end() < piece.start
+                        || s.start() > piece.end
+                        || s.end() == piece.start && piece.start != piece.end
                     {
                         continue;
                     }
                     let a = ctx
                         .s
                         .display
-                        .to_display(s.start().max(span.start) - span.start);
-                    let b = ctx.s.display.to_display(s.end().min(span.end) - span.start);
+                        .to_display(s.start().max(piece.start) - piece.start);
+                    let b = ctx
+                        .s
+                        .display
+                        .to_display(s.end().min(piece.end) - piece.start);
                     let Some((x0, mut x1)) = extent(a, b) else {
                         continue;
                     };
                     if b > row.end && !last_row {
                         x1 = origin + row.place(ctx.x_at_display(row.end));
                     }
-                    if last_row && s.end() > span.end && span.next > span.end {
+                    if last_row && piece.is_last() && s.end() > span.end && span.next > span.end {
                         x1 += gap;
                     }
                     if x1 > x0 {
@@ -1200,12 +1352,23 @@ impl EditorView {
                         );
                     }
                 }
-                // The row's glyphs, moved to the row's start.
+                // The row's glyphs on screen, moved to the row's start. Glyphs advance
+                // left to right (shaped runs come in visual order), so a row of a long
+                // piece scrolled sideways is cut to what shows by binary search.
+                let visible_x = (g.text.x as f32, g.text.right() as f32);
+                let glyphs = &ctx.s.layout.glyphs;
+                let shown = if rows.len() == 1 {
+                    let lo = visible_x.0 - origin + row.x - row.indent - 4.0 * m.space_advance;
+                    let hi = visible_x.1 - origin + row.x - row.indent;
+                    let a = glyphs.partition_point(|gl| gl.x < lo);
+                    let b = glyphs.partition_point(|gl| gl.x <= hi);
+                    &glyphs[a..b.max(a)]
+                } else {
+                    &glyphs[..]
+                };
                 row_layout.glyphs.clear();
                 row_layout.glyphs.extend(
-                    ctx.s
-                        .layout
-                        .glyphs
+                    shown
                         .iter()
                         .filter(|gl| {
                             (gl.cluster as usize) >= row.start && (gl.cluster as usize) < row.end
@@ -1215,7 +1378,6 @@ impl EditorView {
                             ..*gl
                         }),
                 );
-                let visible_x = (g.text.x as f32, g.text.right() as f32);
                 // Runs of glyphs with the same color.
                 let mut run = LineLayout::default();
                 let mut run_color = t.text;
@@ -1264,6 +1426,7 @@ impl EditorView {
                         style,
                         s: &mut self.scratch,
                         wrap,
+                        max_x: f32::INFINITY,
                     };
                     let (a, b) = (range.start.max(row.start), range.end.min(row.end));
                     if a < b {
@@ -1283,9 +1446,7 @@ impl EditorView {
                 }
                 // Carets on this row.
                 for s in sels.iter() {
-                    let on_line = s.head >= span.start
-                        && (s.head < span.next || (s.head == span.end && span.next == span.end));
-                    if !on_line {
+                    if !piece.holds(s.head) {
                         continue;
                     }
                     let ctx = LineCtx {
@@ -1293,8 +1454,9 @@ impl EditorView {
                         style,
                         s: &mut self.scratch,
                         wrap,
+                        max_x: f32::INFINITY,
                     };
-                    let mut display = ctx.s.display.to_display(s.head - span.start);
+                    let mut display = ctx.s.display.to_display(s.head - piece.start);
                     if *s == primary
                         && let (Some(range), Some((_, Some((c, _))))) =
                             (&ctx.s.display.preedit, &preedit)
@@ -1318,10 +1480,10 @@ impl EditorView {
             }
 
             // Line number, on the line's first row.
-            if skip == 0 {
+            if piece.is_first() && skip == 0 {
                 let baseline = p.center_baseline(line_top, g.line_h, &style);
-                let active = sels.iter().any(|s| doc.byte_to_line(s.head) == i);
-                let number = (i + 1).to_string();
+                let active = sels.iter().any(|s| doc.byte_to_line(s.head) == piece.line);
+                let number = (piece.line + 1).to_string();
                 let w = p.measure(&number, &style);
                 let x = (g.text.x - p.px(16.0)) as f32 - w;
                 let color = if active {
@@ -1409,7 +1571,10 @@ mod tests {
         let none = Modifiers::default();
         view.scroll(&mut p, 0.0, 30.0, ScrollUnit::Lines, none);
         let scrolled = view.scroll_position();
-        assert!(scrolled.0 > 50.0, "scrolled well past the caret: {scrolled:?}");
+        assert!(
+            view.top_line() > 50.0,
+            "scrolled well past the caret: {scrolled:?}"
+        );
 
         for ime in [
             Ime::Enabled,
@@ -1425,10 +1590,119 @@ mod tests {
 
         // Composing does bring the caret back, like typing.
         assert!(view.ime(Ime::Preedit("か".into(), None), now));
-        assert!(!view.ime(Ime::Preedit("か".into(), None), now), "the same again");
+        assert!(
+            !view.ime(Ime::Preedit("か".into(), None), now),
+            "the same again"
+        );
         p.begin(1.0);
         view.draw(&mut p, area, now);
-        assert_eq!(view.scroll_position().0, 0.0);
-        assert!(view.ime(Ime::Preedit(String::new(), None), now), "composition ends");
+        assert_eq!(view.top_line(), 0.0);
+        assert!(
+            view.ime(Ime::Preedit(String::new(), None), now),
+            "composition ends"
+        );
+    }
+
+    fn view_of(text: &str, wrap: bool) -> (EditorView, Painter, Rect) {
+        let editor = Editor::new(Rope::from(text), Format::default());
+        let mut view = EditorView::new(editor);
+        view.wrap = wrap;
+        let mut p = Painter::new(&SUMI);
+        let area = Rect::new(0, 0, 800, 600);
+        p.begin(1.0);
+        view.draw(&mut p, area, Instant::now());
+        (view, p, area)
+    }
+
+    fn key(view: &mut EditorView, p: &mut Painter, key: Key, ctrl: bool) {
+        let input = KeyInput {
+            key,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl,
+                ..Modifiers::default()
+            },
+            text: None,
+        };
+        view.key(p, &input, Instant::now());
+    }
+
+    fn draw(view: &mut EditorView, p: &mut Painter, area: Rect) {
+        p.begin(1.0);
+        view.draw(p, area, Instant::now());
+    }
+
+    /// A line of 1 MB: drawing, moving and clicking anywhere in it only lays out pieces.
+    #[test]
+    fn long_lines_work_anywhere_in_them() {
+        let line = "{\"key\":\"value\",\"n\":12345},".repeat(40_000);
+        for wrap in [false, true] {
+            let (mut view, mut p, area) = view_of(&format!("first\n{line}\nlast"), wrap);
+            assert!(
+                view.thumb().is_some(),
+                "a long line needs a scrollbar (wrap {wrap})"
+            );
+
+            // To the end and back: the caret is on screen each time.
+            key(&mut view, &mut p, Key::End, true);
+            draw(&mut view, &mut p, area);
+            let caret = view.caret_rect().expect("caret drawn");
+            assert!(area.contains(caret.x, caret.y), "{caret:?}");
+            assert!(
+                view.top_line() > 1.5,
+                "scrolled into the long line: {}",
+                view.top_line()
+            );
+            key(&mut view, &mut p, Key::Home, true);
+            draw(&mut view, &mut p, area);
+            assert_eq!(view.top_line(), 0.0);
+
+            // Down from the first line goes into the long one, a row (piece) at a time.
+            key(&mut view, &mut p, Key::Down, false);
+            key(&mut view, &mut p, Key::Down, false);
+            draw(&mut view, &mut p, area);
+            let head = view.editor.selections().primary().head;
+            assert!(
+                head > 6 + 16 && head < 6 + 2 * PIECE + 256,
+                "second row: {head}"
+            );
+            key(&mut view, &mut p, Key::Up, false);
+            key(&mut view, &mut p, Key::Up, false);
+            assert!(view.editor.selections().primary().head <= 5);
+            draw(&mut view, &mut p, area);
+
+            // A click on the third row lands in the long line, past its first row.
+            let caret = view.caret_rect().unwrap();
+            let y = caret.y + 2 * view.geo.line_h + view.geo.line_h / 2;
+            let at = view.hit(&mut p, caret.x as f32 + 30.0, y as f32);
+            assert!(at > 6 + 16 && at < 6 + 3 * (PIECE + 256), "clicked {at}");
+
+            // Scrolling stops with the last row at the top.
+            view.scroll(&mut p, 0.0, 1e9, ScrollUnit::Pixels, Modifiers::default());
+            draw(&mut view, &mut p, area);
+            assert!(
+                view.visible_lines().contains(&2),
+                "{:?}",
+                view.visible_lines()
+            );
+            assert_eq!(view.top_line(), 2.0);
+        }
+    }
+
+    /// Without wrapping, the row a long line's piece is drawn in fills the screen's width
+    /// even when laid out only as far as it shows.
+    #[test]
+    fn long_rows_draw_to_the_edge() {
+        let line = "x".repeat(3 * PIECE);
+        let (mut view, mut p, area) = view_of(&line, false);
+        key(&mut view, &mut p, Key::End, false);
+        draw(&mut view, &mut p, area);
+        let caret = view.caret_rect().unwrap();
+        assert!(
+            area.contains(caret.x, caret.y),
+            "the caret at the end shows: {caret:?}"
+        );
+        assert!(view.max_width > area.w as f32, "rows extend past the view");
     }
 }

@@ -4,7 +4,7 @@
 
 A cross-platform text editor that sits between Notepad and Notepad++. It should start instantly, respond instantly at any file size, use little memory, and look and feel polished on every platform.
 
-> Status: phase 3 (core features) done. Next: phase 4, large files. Last updated 2026-11-08.
+> Status: phase 4 (large files) done. Next: phase 5, power features. Last updated 2026-11-08.
 
 ---
 
@@ -31,15 +31,15 @@ A cross-platform text editor that sits between Notepad and Notepad++. It should 
 
 | Metric | Target | Measured |
 |---|---|---|
-| Launch → first frame, warm cache | < 40 ms | 10.6 ms median (Linux, X11); a launch that hands its files to a running fude exits in under 10 ms |
+| Launch → first frame, warm cache | < 40 ms | 10.3 ms median (Linux, X11); a launch that hands its files to a running fude exits in under 10 ms |
 | Launch → first frame, cold | < 150 ms | |
-| Open a 500 MB file → first screen | < 100 ms | 190 ms, loading synchronously (background loading is phase 4) |
-| Open a 500 MB file → fully loaded and editable | < 1 s (SSD or warm cache) | 141 ms |
-| Keypress → frame submitted | < 4 ms of fude's own work | 0.3 ms at 1080p, 1.1 ms at 4K (edit plus a full redraw, with syntax colors); file size doesn't change it |
-| Idle RAM, empty document, 1080p | < 30 MB | 14.5 MB (Linux, X11) |
-| RAM for an open, unedited file | ≈ 1.1 × file size | 1.04 × |
+| Open a 500 MB file → first screen | < 100 ms | 23 ms (its first 64 KB, while the rest loads in the background) |
+| Open a 500 MB file → fully loaded and editable | < 1 s (SSD or warm cache) | 0.2 s |
+| Keypress → frame submitted | < 4 ms of fude's own work | 0.5 ms at 1080p, 1.4 ms at 4K (edit plus a full redraw, with syntax colors); file size doesn't change it, and inside a 100 MB line it's 1.3 ms |
+| Idle RAM, empty document, 1080p | < 30 MB | 14.6 MB (Linux, X11) |
+| RAM for an open, unedited file | ≈ 1.1 × file size | 1.04 × the text (UTF-8); 1.2 × for Shift_JIS, UTF-16 and Japanese text, most of the difference being the CJK fallback font |
 | Idle CPU | 0 % | 0 CPU ticks over 5 s once the caret stops blinking (10 s after input) |
-| Release binary | < 10 MB | 9.2 MB (Linux x86-64): encodings added 0.3 MB in phase 1; font fallback, clipboard and file dialogs 1.1 MB in phase 2; syntax highlighting (syntect and its grammars) 2.4 MB and search 0.4 MB in phase 3. Little room is left. |
+| Release binary | < 10 MB | 9.4 MB (Linux x86-64): encodings added 0.3 MB in phase 1; font fallback, clipboard and file dialogs 1.1 MB in phase 2; syntax highlighting (syntect and its grammars) 2.4 MB and search 0.4 MB in phase 3; 0.2 MB in phase 4. Little room is left. |
 
 Measurements are from a fast desktop (32 threads, NVMe, warm page cache): startup with `cargo xtask bench-startup` under Xvfb, the buffer with `cargo run --release -p fude-buffer --example bench` on a generated 500 MB log, keystrokes with `fude --bench-typing`. They are a best case; laptops and Wayland/Windows/macOS numbers come next.
 
@@ -55,6 +55,20 @@ Measurements are from a fast desktop (32 threads, NVMe, warm page cache): startu
 | 5120×2880 @2× | 2.43 ms | 15.3 ms |
 
 Even the 5K worst case fits a 120 Hz frame (8.3 ms) several times over, so CPU rendering is a go. Presenting the frame (copying to the compositor) isn't included and needs measuring per platform, macOS especially.
+
+**Large files (phase 4),** the generated corpus (`cargo xtask bench-large`, §16), each opened without a window at 1920×1080; keystrokes are an edit plus a full frame, medians:
+
+| File | First screen | Loaded | RAM ÷ text | Type in the middle | Page Down | Wrapped: type |
+|---|---|---|---|---|---|---|
+| 500 MB log, 5.8 M lines | 23 ms | 0.20 s | 1.04 | 0.60 ms | 0.57 ms | 0.71 ms |
+| 100 MB of JSON on one line | 22 ms | 0.06 s | 1.05 | 1.28 ms | 1.91 ms | 1.28 ms |
+| 100 MB CSV, 50 KB lines | 22 ms | 0.04 s | 1.05 | 1.31 ms | 1.40 ms | 1.52 ms |
+| 50 MB Shift_JIS (78 MB as UTF-8) | 57 ms | 0.56 s | 1.19 | 0.66 ms | 0.67 ms | 0.99 ms |
+| 50 MB UTF-16LE | 51 ms | 0.06 s | 1.28 | 0.72 ms | 0.71 ms | 1.09 ms |
+| 100 MB UTF-8 log with bad bytes | 22 ms | 0.11 s | 1.06 | 0.45 ms | 0.43 ms | 0.52 ms |
+| 21 MB of Rust | 10 ms | 0.01 s | 1.09 | 0.36 ms | 0.32 ms | 0.41 ms |
+
+The first screen includes a 20 ms wait that lets files of up to about 100 MB appear whole instead of as a preview; the Japanese files spend another 30 ms opening the CJK fallback font. Loading Shift_JIS is decoding-bound (and checks that every character re-encodes exactly). Before phase 4, a keystroke in the middle of the JSON line took 12 ms and every frame of the CSV 10 ms, and both lines were cut off at 16 KB.
 
 **Startup breakdown (Linux, X11):** about 8 ms is winit creating the event loop, more than half of it libX11 and xkbcommon each parsing the X11 Compose table. fude's own work (fonts, layout, rasterizing the first frame) is about 2 ms. Deferring the Compose table until the first key press is a possible later optimization.
 
@@ -128,6 +142,8 @@ Most of an editor's UI is the text view, and no general-purpose toolkit has a te
 - **Draw list:** the UI produces a flat list of rectangles and glyph instances from an atlas, which is also what a GPU backend would consume. If CPU rendering can't keep up (most likely on 5K Retina at 120 Hz), a Metal or Direct3D 11 backend can be added behind the same interface without touching the UI.
 - **Native pieces:** file dialogs (`rfd`, using the XDG portal on Linux, so no GTK) and the macOS menu bar. Questions like "Save changes?" are drawn in the window, like menus on other platforms, so they look the same everywhere and need no helper programs.
 - **Every text input is an editor.** The find box, go-to-line and the command palette reuse `fude-editor`, so they get IME, undo, selection and clipboard for free.
+- **Lines in pieces.** The view lays out *pieces*: a line up to 4 KB is one; a longer one (minified code, a CSV row, a single-line JSON file) is cut into pieces of about 4 KB, each laid out on its own and starting a new row, so no frame lays out more than a screenful of pieces however long a line is. The k-th break of a line falls near `start + k × 4 KB`, moved back to just after a space or punctuation if one is within 256 bytes, and never inside a character or grapheme, so pieces need no index and nothing to update when text changes. Without word wrap, a long line shows as rows of one piece each (classic Notepad also wrapped long lines when wrap was off, at 1024 columns); with it, each piece wraps at the window's edge. A row that is wider than the window is laid out only as far as it shows.
+- **The scroll position is a byte anchor:** the piece at the top, a row in it and a fraction of a row. Scrolling lays out only the pieces it passes, keeping the cursor in view counts rows only between the top and the cursor, and the position stays put while a file loads. The scrollbar shows lines, and within a long line, bytes.
 - **Accessibility:** the widget tree carries roles and labels from the start, so AccessKit can be wired up in v1.x without restructuring.
 
 ## 7. Text stack (`fude-text`)
@@ -169,16 +185,17 @@ Detection order:
 1. A byte order mark (UTF-8, UTF-16LE/BE).
 2. UTF-16 without a BOM: mostly-ASCII UTF-16 has a zero in every other byte.
 3. UTF-8, checked as the file streams in. A file that is mostly valid UTF-8 with some damage (at least 4 valid multi-byte sequences per invalid one, e.g. a log with stray bytes) stays UTF-8, as does anything with zero bytes near the start (binary).
-4. Otherwise `chardetng` (Firefox's detector) guesses a legacy encoding from up to 1 MB of the text, starting where UTF-8 first failed.
+4. Otherwise `chardetng` (Firefox's detector) guesses a legacy encoding from up to 1 MB of the text, starting at a line near where UTF-8 first failed and ending at a line break (a sample cut mid-character counts against the encoding it's in; that once made a large Shift_JIS file open as windows-1252).
 
-UTF-8 is stored raw, so invalid bytes round-trip untouched (they will render as `<FF>`-style chips). Other encodings are decoded to UTF-8 with `encoding_rs` and encoded back on save; UTF-16 is encoded by fude, since `encoding_rs` only decodes it. After decoding a legacy encoding, fude re-encodes it and compares with the file. If it doesn't match (malformed bytes, or encodings like Shift_JIS with two byte sequences for one character), the document is flagged as not exact, so the UI can warn before a save changes bytes the user didn't touch. Saving a character the encoding can't represent is an error naming the character and its position; fude never writes replacement characters or HTML entities silently.
+UTF-8 is stored raw, so invalid bytes round-trip untouched (they will render as `<FF>`-style chips). Other encodings are decoded to UTF-8 with `encoding_rs` and encoded back on save; UTF-16 is encoded by fude, since `encoding_rs` only decodes it. While decoding a legacy encoding, fude re-encodes it and compares with the file. If it doesn't match (malformed bytes, or encodings like Shift_JIS with two byte sequences for one character), the document is flagged as not exact, so the UI can warn before a save changes bytes the user didn't touch. Saving a character the encoding can't represent is an error naming the character and its position; fude never writes replacement characters or HTML entities silently.
 
 ### v1: in memory, loaded in the background
 
-1. Read the first 64 KB, detect encoding and line endings, and show the first screen as a read-only preview.
-2. A worker reads the rest in ~1 MB chunks, transcodes if needed, counts line breaks, and builds the rope bottom-up.
-3. When it finishes, the full rope replaces the preview. The scroll position is a byte-offset anchor, so the view stays put. Editing is enabled.
-4. Files above a configurable size (default 1 GB) ask before opening.
+1. A thread per file reads the first 1 MB. If there's more, the first 64 KB of it is decoded (cut at a line break) and shown right away as a read-only preview.
+2. The thread reads the rest in 1 MB chunks, decodes if needed, and builds the rope bottom-up, reporting progress ("Loading 42%…" in the status bar). A legacy encoding is decided from the first megabyte when that's clear (it nearly always is), so the text is decoded as it streams in and the raw bytes are never all held; whether saving would reproduce the file exactly is checked the same way, by encoding each piece back.
+3. When it finishes, the full rope replaces the preview (a new version, no undo step). The view keeps its place, since the preview is the start of the same text. Editing is enabled; typing before then says the file is still loading. Closing the tab stops the read.
+4. Opening waits up to 20 ms for the load, so a file of up to about 100 MB appears whole, without a flash of preview.
+5. Files over a configurable size (`large_file_mb`, default 1 GB) ask before opening. Reloading a file changed on disk and restoring a session (backups included) go through the same loader.
 
 ### Later: paged mode for multi-GB files
 
@@ -221,7 +238,7 @@ UI thread (winit event loop)                         Worker pool
 - **Motions follow the platform:** Ctrl+Right moves to the start of the next word on Windows and Linux, Option+Right to the end of the word on macOS; Cmd+arrows go to line and document ends on macOS. Home toggles between the first non-blank character and the line start. Enter keeps the line's indentation.
 - **Everything is a named command** (`edit.duplicate_line`, `view.toggle_wrap`, …). Keybindings, menus and the command palette are front-ends that invoke commands with arguments.
 - **Fault isolation:** event handling runs inside `catch_unwind`. A bug in a feature shows an error in the status bar instead of losing unsaved text.
-- **Hot exit and crash recovery:** two seconds after anything changes, a worker writes the session (`session.toml`: tabs, files, cursors, scroll positions, formats) to the state directory, plus the text of each document with unsaved changes (`backups/`, only those whose version changed, with the same safe save as documents). With hot exit on (the default), quitting writes it right away and exits without asking; the next launch restores everything, unsaved changes included. After a crash, the last write (at most two seconds old) is restored the same way.
+- **Hot exit and crash recovery:** two seconds after anything changes, a worker writes the session (`session.toml`: tabs, files, cursors, scroll positions, formats) to the state directory, plus the text of each document with unsaved changes (`backups/`, only those whose version changed, with the same safe save as documents). With hot exit on (the default), quitting writes it right away and exits without asking; the next launch restores everything, unsaved changes included. After a crash, the last write (at most two seconds old) is restored the same way. Unsaved text over 32 MB is backed up at most every 30 seconds while typing (and always on quit), so a huge document doesn't keep the disk busy; a crash can lose that much more in it.
 - **Unicode:** cursor movement steps over grapheme clusters; an invalid byte is one step.
 
 ## 12. Syntax highlighting (`fude-syntax`)
@@ -282,9 +299,9 @@ Single instance: opening a file while fude is running sends it to the existing w
 - **Pixel snapshot tests** for the renderer and widgets.
 - **Startup:** a `--bench-startup` flag exits right after the first frame is presented and prints timings; measured with `hyperfine`.
 - **RAM:** peak and idle RSS measured for an empty document and for the large-file corpus.
-- **Large-file corpus,** generated by a script rather than committed: a 500 MB log, a 100 MB single-line JSON file, UTF-16 and Shift-JIS files, invalid UTF-8, mixed line endings.
+- **Large-file corpus,** generated rather than committed (`cargo xtask corpus`, about 1 GB in `target/corpus`; `--small` makes a tenth of that): a 500 MB log, 100 MB of JSON on one line, a CSV of 50 KB lines, Japanese text in UTF-8 and Shift_JIS, UTF-16LE, UTF-8 with stray bytes, mixed line endings, and 20 MB of Rust. `cargo xtask bench-large` opens each with `fude --bench-file` (no window) and measures the first screen, loading, memory, and keystrokes, scrolling and paging at the start, middle and end, with and without word wrap, against the budgets in §3. CI runs it on the small corpus and fails a missed budget on Linux.
 - **Micro benchmarks** for rope edits, line lookups, layout and search.
-- **UI test:** `cargo xtask ui-test` drives the real window through X11 (XTest) under Xvfb and checks the files it saves: typing, mouse selection, clipboard, undo, the unsaved-changes prompt, find and replace, tabs, go to line, the command palette, word wrap, hot exit, single instance, and recovery after the process is killed (17 checks). It uses its own settings and state directories. Runs in CI on every push.
+- **UI test:** `cargo xtask ui-test` drives the real window through X11 (XTest) under Xvfb and checks the files it saves: typing, mouse selection, clipboard, undo, the unsaved-changes prompt, find and replace, tabs, go to line, the command palette, word wrap, hot exit, single instance, recovery after the process is killed, and editing the end of a 40 MB file's 2 MB last line once it has loaded (18 checks). It uses its own settings and state directories. Runs in CI on every push.
 - **Keystroke latency:** `fude --bench-typing` times an edit plus a full frame per key, without a window.
 - **CI:** Windows, macOS and Linux; a FreeBSD build in a VM. Budget regressions fail the build.
 
@@ -335,7 +352,7 @@ panic = "unwind"   # commands run under catch_unwind (§11)
 | CPU rendering on high-DPI, high-refresh displays | Damage tracking, scroll blits; measured in phase 0; GPU backend as plan B |
 | Linux without GTK: Wayland client-side decorations, X11 IME, systems without an XDG portal | Our own title bar on Wayland; dialog fallbacks |
 | Accessibility in a custom-drawn UI is real work | Semantic widget tree from day one; AccessKit |
-| Very long lines (minified files) | Lay out only visible slices; x-position checkpoints along long lines |
+| Very long lines (minified files) | Done in phase 4: lines are laid out in pieces (§6); a keystroke in a 100 MB line costs 1.3 ms |
 
 ## 20. Candidate dependencies
 
@@ -388,8 +405,14 @@ Each is evaluated for startup, RAM and binary size when introduced, and pinned t
 | 2026-11-08 | Search windows of 64 KB moved onto character boundaries, so `regex-cursor` gets UTF-8-safe chunks (and Unicode word boundaries work) without the rope having to guarantee them. |
 | 2026-11-08 | Single instance over loopback TCP with a token file, on every platform, instead of a named pipe, Unix socket and Apple events: one code path, standard library only. |
 | 2026-11-08 | Hot exit on by default; the session is written two seconds after changes, so it doubles as crash recovery. |
-| 2026-11-08 | Word wrap keeps the scroll position as a line plus a fraction of its rows, so scrolling only lays out the lines it passes; the scrollbar stays line-based. Continuation rows keep the line's indentation. |
+| 2026-11-08 | Word wrap keeps the scroll position as a line plus a fraction of its rows, so scrolling only lays out the lines it passes; the scrollbar stays line-based. Continuation rows keep the line's indentation. (Replaced in phase 4 by a byte anchor.) |
 | 2026-11-08 | Find bar docked at the bottom of the editor (like Sublime), so it never covers the text being searched. |
 | 2026-11-08 | Launching from a terminal detaches (new process group, output to a log) and returns the terminal; `--wait` opts out, for git. |
 | 2026-11-08 | Wayland file drops through the core data device protocol on winit's own connection, until winit supports them. |
 | 2026-11-08 | Full redraws every frame for now: 0.6 ms at 1080p, 1.4 ms at 4K including the edit. Damage tracking waits until something needs it. |
+| 2026-11-08 | Long lines are laid out in pieces of about 4 KB, breaking near spaces, each starting a new row: without word wrap a long line shows as wide rows, like classic Notepad, rather than being cut off (VS Code stops drawing at 10,000 characters) or laid out whole. Breaks depend only on nearby bytes, so there's no index to keep up to date. |
+| 2026-11-08 | The scroll position is a byte anchor (piece, row, fraction): independent of what's above, exact at any line count (the old fractional line number lost precision past a few million lines), and stable while a file loads. |
+| 2026-11-08 | A loading file is read-only until it's all in, rather than accepting edits to the preview and replaying them: simpler, and loading takes a fraction of a second up to hundreds of MB. |
+| 2026-11-08 | A legacy encoding is decided from the first megabyte when it's clear, so the file decodes as it's read (with a streaming exactness check) instead of being held raw and decoded at the end: half the memory for a Shift_JIS file, and a bit faster. |
+| 2026-11-08 | harfrust shaping plans are cached per font and segment properties (building one compiles the font's features: 11× slower CJK layout without the cache), and glyphs and advances for characters below U+0300 are cached per face. |
+| 2026-11-08 | Hot-exit backups of documents over 32 MB are written at most every 30 seconds while typing. |

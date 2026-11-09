@@ -21,10 +21,16 @@ use crate::config::{self, Config};
 use crate::doc::{Doc, DocId, Then};
 use crate::find::FindState;
 use crate::instance;
+use crate::loading::LoadKind;
 use crate::session::{self, Session, Tab};
 
 /// How long after a change the session (and unsaved text) is written.
 const SESSION_DELAY: Duration = Duration::from_secs(2);
+/// Unsaved text longer than this is backed up at most every [`BIG_BACKUP_EVERY`] (and on
+/// quitting): rewriting hundreds of MB every couple of seconds of typing would keep the
+/// disk busy. A crash can lose that much more typing in such a file.
+const BIG_BACKUP: usize = 32 << 20;
+const BIG_BACKUP_EVERY: Duration = Duration::from_secs(30);
 
 /// Lines highlighted beyond the visible ones, so short scrolls are already colored.
 const HIGHLIGHT_MARGIN: usize = 60;
@@ -41,7 +47,7 @@ pub enum Focus {
 struct PaletteOrigin {
     doc: DocId,
     selections: Selections,
-    scroll: (f32, f32),
+    scroll: fude_ui::ScrollPosition,
 }
 
 /// How long a status bar message stays.
@@ -59,6 +65,8 @@ pub enum Question {
     ReadOnly(DocId, Option<Then>),
     /// Reload, Keep Mine.
     ChangedOnDisk(DocId),
+    /// Open, Cancel: a file over the size that asks first.
+    OpenLarge(PathBuf),
     /// OK.
     Info,
 }
@@ -95,11 +103,15 @@ pub struct Fude {
     session_print: Vec<(u64, u64, Option<PathBuf>)>,
     /// The version of each document whose unsaved text is in its backup.
     backed_up: HashMap<DocId, u64>,
+    /// When each document's backup was last written.
+    backup_at: HashMap<DocId, Instant>,
     session_writing: Arc<AtomicBool>,
     /// Files are being dragged over the window.
     drop_hover: bool,
     /// The caret area last given to the input method.
     ime_area: Option<Rect>,
+    /// Files loading on worker threads report here.
+    pub loads: crate::loading::Loads,
     os_theme: Option<OsTheme>,
     /// Zoom steps from the configured font size, for every document.
     zoom: f32,
@@ -132,9 +144,11 @@ impl Fude {
             session_due: None,
             session_print: Vec::new(),
             backed_up: HashMap::new(),
+            backup_at: HashMap::new(),
             session_writing: Arc::new(AtomicBool::new(false)),
             drop_hover: false,
             ime_area: None,
+            loads: Default::default(),
             os_theme: None,
             zoom: 0.0,
             last_frame: Duration::ZERO,
@@ -349,7 +363,11 @@ impl Fude {
         };
         let items = [format.encoding_label(), line_endings, doc.language.clone()];
         let position = doc.view.position_label();
-        let message = self.message.as_ref().map(|(m, _)| m);
+        let loading = doc.loading.as_ref().map(|l| StatusMessage {
+            text: format!("Loading {}%…", l.percent()),
+            error: false,
+        });
+        let message = loading.as_ref().or(self.message.as_ref().map(|(m, _)| m));
         status_bar(
             p,
             Rect::new(0, h - status_h, w, status_h),
@@ -473,8 +491,10 @@ impl Fude {
             if let Some(server) = &self.instance {
                 server.set_waker(ctx.waker());
             }
-            // Requests that arrived before there was a waker.
+            self.loads.set_waker(ctx.waker());
+            // Requests and loads that arrived before there was a waker.
             self.poll_instance(ctx);
+            self.poll_loads();
         }
         self.ensure_highlighter();
         let now = Instant::now();
@@ -614,7 +634,8 @@ impl Fude {
                 self.docs[self.active].view.tick(p, now)
             }
             Event::Wake => {
-                let opened = self.poll_instance(ctx);
+                let loads = self.poll_loads();
+                let opened = self.poll_instance(ctx) || loads;
                 let saves = self.poll_saves(ctx) || opened;
                 let colors = self.poll_highlights();
                 self.poll_find(now) || saves || colors
@@ -629,6 +650,13 @@ impl Fude {
                 true
             }
         };
+        // Typing into a file that's still loading does nothing; say why.
+        let refused = self.doc_mut().view.editor.take_refused();
+        if refused {
+            let active = self.active;
+            self.still_loading(active);
+        }
+        let redraw = redraw || refused;
         let find_timer = match self.focus {
             Focus::Find if self.find_state.open => self.find.next_timer(now),
             Focus::Palette => self.palette.next_timer(now),
@@ -1011,24 +1039,50 @@ impl Fude {
         let mut writes: Vec<(String, fude_buffer::Rope)> = Vec::new();
         let mut tabs = Vec::new();
         let mut active = 0;
+        let mut deferred: Option<Instant> = None;
         let Fude {
-            docs, backed_up, ..
+            docs,
+            backed_up,
+            backup_at,
+            ..
         } = self;
         for (i, doc) in docs.iter_mut().enumerate() {
-            let backup = if doc.modified() {
+            // A document still loading is saved as what it's loading: its backup stays,
+            // and the cursor goes back where the last session had it.
+            let pending = doc
+                .loading
+                .as_ref()
+                .filter(|l| !matches!(l.kind, LoadKind::Reload));
+            let backup = if let Some(loading) = pending {
+                match loading.kind {
+                    LoadKind::Backup { .. } => doc.backup.clone(),
+                    _ => None,
+                }
+            } else if doc.modified() {
                 let name = doc
                     .backup
                     .get_or_insert_with(session::new_backup_name)
                     .clone();
                 let version = doc.view.editor.buffer().version().get();
-                if backed_up.get(&doc.id) != Some(&version) {
+                let big = doc.view.editor.text().len() > BIG_BACKUP;
+                let due = match backup_at.get(&doc.id) {
+                    Some(&at) if big && !now => at + BIG_BACKUP_EVERY,
+                    _ => Instant::now(),
+                };
+                let stale = backed_up.get(&doc.id) != Some(&version);
+                if stale && due > Instant::now() {
+                    // Keep the older backup for now.
+                    deferred = Some(deferred.map_or(due, |d| d.min(due)));
+                } else if stale {
                     writes.push((name.clone(), doc.view.editor.text().clone()));
                     backed_up.insert(doc.id, version);
+                    backup_at.insert(doc.id, Instant::now());
                 }
                 Some(name)
             } else {
                 doc.backup = None;
                 backed_up.remove(&doc.id);
+                backup_at.remove(&doc.id);
                 None
             };
             if doc.path.is_none() && backup.is_none() {
@@ -1037,15 +1091,24 @@ impl Fude {
             if i <= self.active {
                 active = tabs.len();
             }
-            let format = doc.view.editor.format();
+            let format = match pending.map(|l| &l.kind) {
+                Some(LoadKind::Backup { format, .. }) => *format,
+                _ => *doc.view.editor.format(),
+            };
+            let (cursor, scroll) = pending.and_then(|l| l.restore).unwrap_or_else(|| {
+                (
+                    doc.view.editor.selections().primary().head,
+                    doc.view.top_line(),
+                )
+            });
             tabs.push(Tab {
                 path: doc.path.clone(),
                 backup,
                 encoding: format.encoding.name().to_owned(),
                 bom: format.bom,
                 line_ending: format.line_ending,
-                cursor: doc.view.editor.selections().primary().head,
-                scroll: doc.view.scroll_position().0,
+                cursor,
+                scroll,
             });
         }
         let session = Session { active, tabs };
@@ -1061,6 +1124,10 @@ impl Fude {
             })
             .chain([(u64::MAX, self.active as u64, None)])
             .collect();
+        // A backup put off comes due by itself, with nothing else changing.
+        if let Some(due) = deferred {
+            self.session_due = Some(self.session_due.map_or(due, |d| d.min(due)));
+        }
         let job = move || {
             for (name, text) in &writes {
                 if let Err(e) = session::write_backup(&state, name, text) {
@@ -1097,38 +1164,38 @@ impl Fude {
         let Some(session) = Session::read(&state) else {
             return;
         };
-        let mut restored = 0;
+        let mut restored = Vec::new();
         for tab in &session.tabs {
-            let id = self.new_id();
-            let mut doc = match (&tab.backup, &tab.path) {
-                (Some(name), path) => match session::read_backup(&state, name) {
-                    Ok(text) => {
-                        let mut doc = Doc::new(id, text, tab.format(), path.clone());
-                        doc.view.editor.buffer_mut().mark_unsaved();
-                        doc.stamp = path
-                            .as_deref()
-                            .and_then(|p| fude_buffer::FileStamp::of(p).ok());
-                        doc.backup = Some(name.clone());
-                        doc
+            let restore = Some((tab.cursor, tab.scroll));
+            let id = match (&tab.backup, &tab.path) {
+                (Some(name), path) => {
+                    let source = session::backup_dir(&state).join(name);
+                    if !source.is_file() {
+                        continue;
                     }
-                    Err(_) => continue,
-                },
-                (None, Some(path)) => match fude_buffer::load(path) {
-                    Ok(loaded) => Doc::loaded(id, loaded, path.clone()),
-                    Err(_) => continue,
-                },
-                (None, None) => continue,
+                    let kind = LoadKind::Backup {
+                        format: tab.format(),
+                        path: path.clone(),
+                    };
+                    let id = self.open_loading(kind, &source, restore);
+                    if let Some(i) = self.index_of(id) {
+                        self.docs[i].backup = Some(name.clone());
+                    }
+                    id
+                }
+                (None, Some(path)) if path.is_file() => {
+                    self.open_loading(LoadKind::Open, path, restore)
+                }
+                _ => continue,
             };
-            let len = doc.view.editor.text().len();
-            let at = fude_editor::text::floor_grapheme(doc.view.editor.text(), tab.cursor.min(len));
-            doc.view.editor.select(at..at);
-            doc.view.set_scroll_position((tab.scroll, 0.0));
-            self.add_doc(doc);
-            restored += 1;
+            restored.push(id);
         }
-        if restored > 0 {
-            let first = self.docs.len() - restored;
-            self.active = (first + session.active).min(self.docs.len() - 1);
+        self.settle_loads();
+        // Tabs whose file couldn't be read are gone by now, or go when their load fails.
+        if let Some(&id) = restored.get(session.active).or(restored.last())
+            && let Some(i) = self.index_of(id)
+        {
+            self.active = i;
             self.tabs.reveal_active();
         }
     }

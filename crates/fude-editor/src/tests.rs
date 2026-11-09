@@ -416,3 +416,31 @@ proptest! {
         prop_assert_eq!(e.text().to_vec(), initial.as_bytes());
     }
 }
+
+/// While a file loads, its preview can be read and selected but not changed; then the
+/// whole text replaces it without an undo step, keeping the cursor.
+#[test]
+fn loading_preview_is_read_only_until_the_text_arrives() {
+    let mut e = Editor::new(Rope::from("first line\nsecond"), lf());
+    e.set_read_only(true);
+    e.set_selections(Selections::single(Selection::cursor(6)));
+    let now = Instant::now();
+    e.insert("x", now);
+    e.backspace(now);
+    e.paste("pasted", now);
+    assert!(!e.undo());
+    assert_eq!(e.text().to_vec(), b"first line\nsecond");
+    assert!(e.take_refused());
+    assert!(!e.take_refused(), "reported once");
+    let before = e.buffer().version();
+
+    e.load(Rope::from("first line\nsecond line\nthird\n"), lf(), 11);
+    e.set_read_only(false);
+    assert_ne!(e.buffer().version(), before, "a new version");
+    assert!(!e.buffer().is_modified());
+    assert!(!e.buffer().can_undo());
+    assert_eq!(e.selections().primary().head, 6);
+    assert_eq!(e.take_changed(), Some(11));
+    e.insert("x", now);
+    assert_eq!(e.text().to_vec(), b"first xline\nsecond line\nthird\n");
+}

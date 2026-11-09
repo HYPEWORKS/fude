@@ -39,6 +39,13 @@ jobs:
           ./target/release/fude --bench-render --size 3840x2160 --scale 2
           ./target/release/fude --bench-typing --size 1920x1080
           ./target/release/fude --screenshot screenshot-${{ matrix.os }}.png --size 2200x1440 --scale 2
+      # Opens each file of the (small) large-file corpus without a window: first screen,
+      # loading, memory, and keystrokes in long lines and big files. Budgets are checked on
+      # Linux; elsewhere (where finding a CJK fallback font the first time can take a while)
+      # it's report-only for now.
+      - name: Large-file benchmark
+        shell: bash
+        run: cargo xtask bench-large --small --no-build ${{ matrix.os == 'ubuntu-latest' && '--check' || '' }}
       - uses: actions/upload-artifact@v7
         with:
           name: screenshot-${{ matrix.os }}
