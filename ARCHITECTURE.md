@@ -4,7 +4,7 @@
 
 A cross-platform text editor that sits between Notepad and Notepad++. It should start instantly, respond instantly at any file size, use little memory, and look and feel polished on every platform.
 
-> Status: phase 5 (power features) done. Next: phase 6, release. Last updated 2026-11-08.
+> Status: phase 5 (power features) done, plus a context menu and the application menus. Next: phase 6, release. Last updated 2026-11-09.
 
 ---
 
@@ -39,7 +39,7 @@ A cross-platform text editor that sits between Notepad and Notepad++. It should 
 | Idle RAM, empty document, 1080p | < 30 MB | 14.6 MB (Linux, X11) |
 | RAM for an open, unedited file | ≈ 1.1 × file size | 1.04 × the text (UTF-8); 1.2 × for Shift_JIS, UTF-16 and Japanese text, most of the difference being the CJK fallback font |
 | Idle CPU | 0 % | 0 CPU ticks over 5 s once the caret stops blinking (10 s after input) |
-| Release binary | < 10 MB | 9.6 MB (Linux x86-64): encodings added 0.3 MB in phase 1; font fallback, clipboard and file dialogs 1.1 MB in phase 2; syntax highlighting (syntect and its grammars) 2.4 MB and search 0.4 MB in phase 3; 0.2 MB each in phases 4 and 5. Little room is left: the next large feature has to pay for itself (dropping grammars, or `opt-level = "s"` for cold code). |
+| Release binary | < 10 MB | 9.6 MB (Linux x86-64): encodings added 0.3 MB in phase 1; font fallback, clipboard and file dialogs 1.1 MB in phase 2; syntax highlighting (syntect and its grammars) 2.4 MB and search 0.4 MB in phase 3; 0.2 MB each in phases 4 and 5; the menu bar 20 KB (`muda`, for the macOS menu bar, is only built there). Little room is left: the next large feature has to pay for itself (dropping grammars, or `opt-level = "s"` for cold code). |
 
 Measurements are from a fast desktop (32 threads, NVMe, warm page cache): startup with `cargo xtask bench-startup` under Xvfb, the buffer with `cargo run --release -p fude-buffer --example bench` on a generated 500 MB log, keystrokes with `fude --bench-typing`. They are a best case; laptops and Wayland/Windows/macOS numbers come next.
 
@@ -143,6 +143,7 @@ Most of an editor's UI is the text view, and no general-purpose toolkit has a te
 - **Renderer:** draws into a CPU framebuffer shown with `softbuffer`. Only damaged regions are redrawn; scrolling moves existing pixels and draws only the exposed strip. GPU device setup often costs 100 ms or more and tens of MB of driver memory, which by itself breaks the budgets. CPU output is also deterministic, so the renderer can have pixel snapshot tests.
 - **Draw list:** the UI produces a flat list of rectangles and glyph instances from an atlas, which is also what a GPU backend would consume. If CPU rendering can't keep up (most likely on 5K Retina at 120 Hz), a Metal or Direct3D 11 backend can be added behind the same interface without touching the UI.
 - **Native pieces:** file dialogs (`rfd`, using the XDG portal on Linux, so no GTK) and the macOS menu bar. Questions like "Save changes?" are drawn in the window, like menus on other platforms, so they look the same everywhere and need no helper programs.
+- **Menus:** one description of the menus (`fude_ui::menus`: File, Edit, Selection, View, Go, Tools, Help) drives both the menu bar drawn in the window (Windows, Linux, BSD) and the macOS menu bar, and each item shows its command's shortcut from the same table as the command palette, so the three can't disagree. The drawn bar's menus are the context menu widget; F10 or Alt and a menu's first letter open them from the keyboard. On macOS, `fude-platform` builds the menu bar with `muda`, moving About, Settings and Quit to the application menu and adding the standard items (Services, Hide, the Window menu); Quit is fude's own command, not `terminate:`, so quitting keeps hot exit. Items are enabled from the same state as the drawn menus, updated after each event.
 - **Every text input is an editor.** The find box, go-to-line and the command palette reuse `fude-editor`, so they get IME, undo, selection and clipboard for free.
 - **Lines in pieces.** The view lays out *pieces*: a line up to 4 KB is one; a longer one (minified code, a CSV row, a single-line JSON file) is cut into pieces of about 4 KB, each laid out on its own and starting a new row, so no frame lays out more than a screenful of pieces however long a line is. The k-th break of a line falls near `start + k × 4 KB`, moved back to just after a space or punctuation if one is within 256 bytes, and never inside a character or grapheme, so pieces need no index and nothing to update when text changes. Without word wrap, a long line shows as rows of one piece each (classic Notepad also wrapped long lines when wrap was off, at 1024 columns); with it, each piece wraps at the window's edge. A row that is wider than the window is laid out only as far as it shows.
 - **The scroll position is a byte anchor:** the piece at the top, a row in it and a fraction of a row. Scrolling lays out only the pieces it passes, keeping the cursor in view counts rows only between the top and the cursor, and the position stays put while a file loads. The scrollbar shows lines, and within a long line, bytes.
@@ -380,6 +381,7 @@ Each is evaluated for startup, RAM and binary size when introduced, and pinned t
 | `memchr` | Fast byte scanning |
 | `unicode-segmentation` | Grapheme and word boundaries |
 | `arboard` | Clipboard |
+| `muda` | The macOS menu bar (macOS only) |
 | `toml` | Config |
 | `accesskit` | Accessibility (v1.x) |
 
@@ -423,6 +425,8 @@ Each is evaluated for startup, RAM and binary size when introduced, and pinned t
 | 2026-11-08 | A loading file is read-only until it's all in, rather than accepting edits to the preview and replaying them: simpler, and loading takes a fraction of a second up to hundreds of MB. |
 | 2026-11-08 | A legacy encoding is decided from the first megabyte when it's clear, so the file decodes as it's read (with a streaming exactness check) instead of being held raw and decoded at the end: half the memory for a Shift_JIS file, and a bit faster. |
 | 2026-11-08 | harfrust shaping plans are cached per font and segment properties (building one compiles the font's features: 11× slower CJK layout without the cache), and glyphs and advances for characters below U+0300 are cached per face. |
+| 2026-11-09 | Application menus: drawn in the window on Windows, Linux and BSD, below which the tabs move down 28 px; the native menu bar on macOS through `muda` (Tauri's menu crate, macOS-only dependency) rather than hand-written AppKit code, which would be the workspace's second `unsafe` module. Shortcuts become key equivalents there, so a menu item and its key always do the same thing; a shortcut an external tool takes over is left off its built-in item. |
+| 2026-11-09 | The About dialog is a drawn prompt like the others (with a button that copies the version for bug reports), on macOS too, rather than the standard About panel. |
 | 2026-11-08 | Hot-exit backups of documents over 32 MB are written at most every 30 seconds while typing. |
 | 2026-11-08 | Multiple-cursor and line commands follow VS Code and Sublime (Ctrl+D, Ctrl+Shift+L, Alt+↑/↓, Ctrl+Shift+D/K, Ctrl+/); column selection follows Notepad++ (Alt+drag, Shift+Alt+arrows). |
 | 2026-11-08 | Shortcuts match a key's character without modifiers (winit's `key_without_modifiers`), so Ctrl+Shift+`\` matches whatever Shift turns the key into, and Option+letter shortcuts work on macOS. |

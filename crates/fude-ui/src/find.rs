@@ -146,6 +146,13 @@ impl FindBar {
         self.replace.set_focused(false, now);
     }
 
+    pub fn focused_field(&self) -> &TextInput {
+        match self.focus {
+            FindField::Find => &self.find,
+            FindField::Replace => &self.replace,
+        }
+    }
+
     pub fn focused_input(&mut self) -> &mut TextInput {
         match self.focus {
             FindField::Find => &mut self.find,

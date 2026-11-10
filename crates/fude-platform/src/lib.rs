@@ -9,6 +9,8 @@
 //! due ([`Ctx::set_timer`]), or another thread calls [`Waker::wake`].
 
 mod input;
+#[cfg(target_os = "macos")]
+mod mac_menu;
 mod memory;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod wayland_dnd;
@@ -129,6 +131,54 @@ pub enum Event {
     DroppedFile(PathBuf),
     /// Files are being dragged over the window (true), or the drag left or ended (false).
     FileHover(bool),
+    /// A native menu item was chosen, by its [`MenuCommand::id`].
+    Menu(u32),
+}
+
+/// Whether menus are the OS's own menu bar (macOS), set with [`Ctx::set_menu_bar`],
+/// rather than drawn in the window.
+pub const NATIVE_MENU_BAR: bool = cfg!(target_os = "macos");
+
+/// A native menu bar's contents: the menus, left to right. The platform adds its own
+/// items (on macOS the application and Window menus) and moves the commands with a
+/// [`MenuRole`] to where it keeps them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuBarSpec {
+    pub app_name: String,
+    pub menus: Vec<MenuSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuSpec {
+    pub title: String,
+    pub items: Vec<MenuItemSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MenuItemSpec {
+    Command(MenuCommand),
+    Separator,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuCommand {
+    /// Delivered as [`Event::Menu`].
+    pub id: u32,
+    pub label: String,
+    pub shortcut: Option<(Key, Modifiers)>,
+    pub enabled: bool,
+    /// `Some` for a command that is on or off.
+    pub checked: Option<bool>,
+    pub role: MenuRole,
+}
+
+/// Commands some platforms put in a place of their own (on macOS, the application menu).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuRole {
+    Normal,
+    About,
+    Settings,
+    Quit,
 }
 
 /// Mouse pointer shapes.
@@ -174,6 +224,10 @@ struct Shared {
     cursor: CursorShape,
     /// Created on first use, so startup doesn't pay for it.
     clipboard: Option<arboard::Clipboard>,
+    /// Native menu items chosen, by id (sent from the menu's handler, then a wake).
+    menu_events: (std::sync::mpsc::Sender<u32>, std::sync::mpsc::Receiver<u32>),
+    #[cfg(target_os = "macos")]
+    menu: Option<mac_menu::NativeMenu>,
 }
 
 /// Lets an [`App`] talk back to the platform.
@@ -267,6 +321,29 @@ impl Ctx<'_> {
         self.shared.clipboard.as_mut()
     }
 
+    /// Replaces the native menu bar (where there is one: [`NATIVE_MENU_BAR`]).
+    pub fn set_menu_bar(&mut self, spec: &MenuBarSpec) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.shared.menu.is_none() {
+                mac_menu::listen(self.shared.proxy.clone(), self.shared.menu_events.0.clone());
+            }
+            self.shared.menu = Some(mac_menu::NativeMenu::new(spec));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = spec;
+    }
+
+    /// Enables or disables, and checks or unchecks, an item of the native menu bar.
+    pub fn set_menu_item_state(&mut self, id: u32, enabled: bool, checked: Option<bool>) {
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = &self.shared.menu {
+            menu.set_state(id, enabled, checked);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (id, enabled, checked);
+    }
+
     /// Shows the system's open dialog. Blocks until it closes.
     pub fn open_file_dialog(&self, options: &FileDialog<'_>) -> Option<PathBuf> {
         self.dialog(options).pick_file()
@@ -321,9 +398,11 @@ fn err(context: &str, e: impl std::fmt::Display) -> PlatformError {
 
 /// Opens a window and runs `app` until it calls [`Ctx::exit`].
 pub fn run<A: App>(options: WindowOptions, app: A) -> Result<(), PlatformError> {
-    let event_loop = EventLoop::with_user_event()
-        .build()
-        .map_err(|e| err("creating event loop", e))?;
+    let mut builder = EventLoop::with_user_event();
+    // The app sets its own menu bar with its first event.
+    #[cfg(target_os = "macos")]
+    winit::platform::macos::EventLoopBuilderExtMacOS::with_default_menu(&mut builder, false);
+    let event_loop = builder.build().map_err(|e| err("creating event loop", e))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut runner = Runner {
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -341,6 +420,9 @@ pub fn run<A: App>(options: WindowOptions, app: A) -> Result<(), PlatformError> 
             timer: None,
             cursor: CursorShape::Default,
             clipboard: None,
+            menu_events: std::sync::mpsc::channel(),
+            #[cfg(target_os = "macos")]
+            menu: None,
         },
     };
     runner.app.startup_mark(StartupMark::EventLoopCreated);
@@ -580,6 +662,9 @@ impl<A: App> ApplicationHandler for Runner<A> {
             for path in paths {
                 self.dispatch(event_loop, Event::DroppedFile(path));
             }
+        }
+        while let Ok(id) = self.shared.menu_events.1.try_recv() {
+            self.dispatch(event_loop, Event::Menu(id));
         }
         self.dispatch(event_loop, Event::Wake);
     }

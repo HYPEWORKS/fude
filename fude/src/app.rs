@@ -8,13 +8,15 @@ use std::time::{Duration, Instant};
 
 use fude_editor::Selections;
 use fude_platform::{
-    Canvas, Ctx, CursorShape, Event, Key, KeyInput, MouseButton, OsTheme, ScrollUnit, Waker,
+    Canvas, Ctx, CursorShape, Event, Key, KeyInput, MenuBarSpec, MenuCommand, MenuItemSpec,
+    MenuRole, MouseButton, NATIVE_MENU_BAR, OsTheme, ScrollUnit, Waker,
 };
 use fude_render::Rect;
 use fude_ui::{
-    Action, ContextMenu, ContextMenuItem, EditorView, FindBar, Painter, Palette, PaletteAction,
-    PaletteItem, Prompt, PromptInput, STATUS_BAR_HEIGHT, StatusMessage, TAB_STRIP_HEIGHT, TabEvent,
-    TabInfo, TabStrip, action_for, status_bar,
+    Action, ContextMenu, ContextMenuItem, EditorView, FindBar, MENU_BAR_HEIGHT, MenuBar,
+    MenuBarEvent, MenuEntry, Painter, Palette, PaletteAction, PaletteItem, Prompt, PromptInput,
+    STATUS_BAR_HEIGHT, Shortcut, StatusMessage, TAB_STRIP_HEIGHT, TabEvent, TabInfo, TabStrip,
+    action_for, status_bar,
 };
 
 use crate::config::{self, Config};
@@ -69,7 +71,12 @@ pub enum Question {
     OpenLarge(PathBuf),
     /// OK.
     Info,
+    /// Copy, OK.
+    About,
 }
+
+/// Whether a command can run now, and for one that is on or off, whether it's on.
+type CommandState = (bool, Option<bool>);
 
 pub struct Fude {
     pub docs: Vec<Doc>,
@@ -92,6 +99,15 @@ pub struct Fude {
     palette_actions: Vec<Action>,
     palette_origin: Option<PaletteOrigin>,
     context_menu: ContextMenu,
+    /// The application menus, with the external tools from the settings.
+    menus: Vec<fude_ui::Menu>,
+    /// The menus drawn in the window, where the OS has no menu bar of its own.
+    menu_bar: MenuBar,
+    /// The OS's menu bar ([`NATIVE_MENU_BAR`]): each item's command, by id, and the state
+    /// it was last given.
+    native_menu: Vec<(Action, CommandState)>,
+    /// The OS's menu bar needs building (again).
+    native_menu_stale: bool,
     /// Window bounds from the last frame, for placing popups before they are drawn.
     window_area: Rect,
     /// Started on first use (it needs a waker), so startup doesn't pay for it.
@@ -125,6 +141,7 @@ pub struct Fude {
 
 impl Fude {
     pub fn new(config: Config) -> Fude {
+        let menus = menus(&config);
         let mut app = Fude {
             docs: Vec::new(),
             active: 0,
@@ -144,6 +161,10 @@ impl Fude {
             palette_actions: Vec::new(),
             palette_origin: None,
             context_menu: ContextMenu::new(),
+            menu_bar: MenuBar::new(menus.iter().map(|m| m.title)),
+            menus,
+            native_menu: Vec::new(),
+            native_menu_stale: true,
             window_area: Rect::default(),
             highlighter: None,
             state_dir: None,
@@ -189,6 +210,10 @@ impl Fude {
         let (config, problems) = Config::load();
         self.config = config;
         self.configure_all();
+        // The external tools may have changed.
+        self.close_menus();
+        self.menus = menus(&self.config);
+        self.native_menu_stale = true;
         match problems.first() {
             Some(p) => self.say(p.clone(), true),
             None => self.say("Settings applied", false),
@@ -234,7 +259,7 @@ impl Fude {
     /// Adds a document as a new tab after the active one (or in place of a blank active
     /// tab) and switches to it.
     pub fn add_doc(&mut self, mut doc: Doc) {
-        self.context_menu.close();
+        self.close_menus();
         self.configure(&mut doc.view);
         if self.doc().is_blank() {
             self.docs[self.active] = doc;
@@ -246,7 +271,7 @@ impl Fude {
     }
 
     pub fn new_doc(&mut self) {
-        self.context_menu.close();
+        self.close_menus();
         let id = self.new_id();
         let mut doc = Doc::untitled(id);
         self.configure(&mut doc.view);
@@ -257,7 +282,7 @@ impl Fude {
 
     pub fn activate(&mut self, index: usize) {
         if index < self.docs.len() && index != self.active {
-            self.context_menu.close();
+            self.close_menus();
             self.active = index;
             self.tabs.reveal_active();
             self.doc_mut().view.set_focused(true, Instant::now());
@@ -267,7 +292,7 @@ impl Fude {
     /// Removes a tab without asking. Closing the last tab leaves a new blank one.
     pub fn remove_doc(&mut self, id: DocId) {
         let Some(i) = self.index_of(id) else { return };
-        self.context_menu.close();
+        self.close_menus();
         self.docs.remove(i);
         if let Some(h) = &self.highlighter {
             h.close(id.0);
@@ -290,6 +315,12 @@ impl Fude {
         format!("{dot}{} · fude", doc.name())
     }
 
+    /// Closes the context menu and the menu bar's menu.
+    fn close_menus(&mut self) {
+        self.context_menu.close();
+        self.menu_bar.close();
+    }
+
     pub fn say(&mut self, text: impl Into<String>, error: bool) {
         self.message = Some((
             StatusMessage {
@@ -309,7 +340,7 @@ impl Fude {
         default: usize,
         cancel: usize,
     ) {
-        self.context_menu.close();
+        self.close_menus();
         self.prompt = Some((
             Prompt::new(title, message, buttons, default, cancel),
             question,
@@ -319,7 +350,7 @@ impl Fude {
     /// After a command panicked: says so, and leaves the documents as they are.
     pub fn recover(&mut self, ctx: &mut Ctx<'_>, message: &str) {
         self.prompt = None;
-        self.context_menu.close();
+        self.close_menus();
         self.say(
             format!("Internal error: {message}. Your text is still here; save it if you can."),
             true,
@@ -336,14 +367,21 @@ impl Fude {
         self.painter.theme = self.config.theme(self.os_theme);
         let p = &mut self.painter;
         p.begin(scale);
+        let menu_h = if NATIVE_MENU_BAR {
+            0
+        } else {
+            p.px(MENU_BAR_HEIGHT)
+        };
         let tabs_h = p.px(TAB_STRIP_HEIGHT);
+        let top = menu_h + tabs_h;
         let status_h = p.px(STATUS_BAR_HEIGHT);
         let find_h = if self.find_state.open {
             p.px(self.find.height())
         } else {
             0
         };
-        let editor = Rect::new(0, tabs_h, w, (h - tabs_h - status_h - find_h).max(0));
+        let editor = Rect::new(0, top, w, (h - top - status_h - find_h).max(0));
+        self.menu_bar.draw(p, Rect::new(0, 0, w, menu_h));
 
         let names: Vec<(String, bool)> =
             self.docs.iter().map(|d| (d.name(), d.modified())).collect();
@@ -355,7 +393,7 @@ impl Fude {
             })
             .collect();
         self.tabs
-            .draw(p, Rect::new(0, 0, w, tabs_h), &infos, self.active);
+            .draw(p, Rect::new(0, menu_h, w, tabs_h), &infos, self.active);
 
         let doc = &mut self.docs[self.active];
         doc.view.search = if self.find_state.open {
@@ -392,9 +430,10 @@ impl Fude {
         );
 
         if self.focus == Focus::Palette {
-            self.palette.draw(p, Rect::new(0, 0, w, h), tabs_h, now);
+            self.palette.draw(p, Rect::new(0, 0, w, h), top, now);
         }
         self.context_menu.draw(p);
+        self.menu_bar.draw_menu(p);
         if self.drop_hover {
             draw_drop_target(p, editor);
         }
@@ -528,41 +567,187 @@ impl Fude {
     }
 
     fn editor_context_menu_items(&self) -> Vec<ContextMenuItem> {
-        let editor = &self.doc().view.editor;
-        let writable = !editor.is_read_only();
-        let has_text = !editor.text().is_empty();
-        let commands = fude_ui::commands();
         [
-            Some(Action::Undo),
-            Some(Action::Redo),
+            Some((Action::Undo, "Undo")),
+            Some((Action::Redo, "Redo")),
             None,
-            Some(Action::Cut),
-            Some(Action::Copy),
-            Some(Action::Paste),
+            Some((Action::Cut, "Cut")),
+            Some((Action::Copy, "Copy")),
+            Some((Action::Paste, "Paste")),
             None,
-            Some(Action::SelectAll),
+            Some((Action::SelectAll, "Select All")),
         ]
         .into_iter()
-        .map(|action| {
-            let enabled = match action {
-                Some(Action::Undo) => writable && editor.buffer().can_undo(),
-                Some(Action::Redo) => writable && editor.buffer().can_redo(),
-                Some(Action::Cut) => writable && has_text,
-                Some(Action::Copy | Action::SelectAll) => has_text,
-                Some(Action::Paste) => writable,
-                _ => false,
-            };
-            let command = commands.iter().find(|c| Some(c.0) == action);
-            ContextMenuItem {
-                action,
-                label: command
-                    .map(|c| c.1.rsplit(": ").next().unwrap_or(&c.1).to_owned())
-                    .unwrap_or_default(),
-                shortcut: command.map(|c| c.2.clone()).unwrap_or_default(),
-                enabled,
-            }
+        .map(|item| match item {
+            Some((action, label)) => self.menu_item(action, label),
+            None => ContextMenuItem::separator(),
         })
         .collect()
+    }
+
+    fn menu_item(&self, action: Action, label: &str) -> ContextMenuItem {
+        let (enabled, checked) = self.command_state(action);
+        ContextMenuItem {
+            action: Some(action),
+            label: label.to_owned(),
+            shortcut: self
+                .shortcut(action)
+                .as_ref()
+                .map(Shortcut::label)
+                .unwrap_or_default(),
+            enabled,
+            checked,
+        }
+    }
+
+    /// Whether `action` can run now (and whether it's on, for one that toggles), for
+    /// menus. Editing commands act on the find bar's field while it has focus.
+    fn command_state(&self, action: Action) -> CommandState {
+        let doc = &self.doc().view.editor;
+        let target = if self.focus == Focus::Find {
+            &self.find.focused_field().editor
+        } else {
+            doc
+        };
+        let editable = !target.is_read_only();
+        let has_text = !target.text().is_empty();
+        let writable = !doc.is_read_only();
+        let enabled = match action {
+            Action::Undo => editable && target.buffer().can_undo(),
+            Action::Redo => editable && target.buffer().can_redo(),
+            Action::Cut => editable && has_text,
+            Action::Copy | Action::SelectAll => has_text,
+            Action::Paste => editable,
+            Action::NextTab | Action::PreviousTab => self.docs.len() > 1,
+            Action::Tool(tool) => writable || !tool.changes_text(),
+            Action::ToggleComment
+            | Action::ToggleBlockComment
+            | Action::MoveLineUp
+            | Action::MoveLineDown
+            | Action::DuplicateLine
+            | Action::DeleteLine
+            | Action::JoinLines
+            | Action::InsertLineAbove
+            | Action::InsertLineBelow
+            | Action::Indent
+            | Action::Outdent
+            | Action::LineEndings(_) => writable,
+            _ => true,
+        };
+        let checked = (action == Action::ToggleWrap).then_some(self.config.word_wrap);
+        (enabled, checked)
+    }
+
+    /// The keys that run `action`: an external tool's own, or the built-in shortcut
+    /// unless a tool has taken those keys.
+    fn shortcut(&self, action: Action) -> Option<Shortcut> {
+        if let Action::External(i) = action {
+            return self.config.tools.get(usize::from(i))?.key.clone();
+        }
+        let shortcut = fude_ui::shortcut(action)?;
+        let taken = self
+            .config
+            .tools
+            .iter()
+            .any(|t| t.key.as_ref() == Some(&shortcut));
+        (!taken).then_some(shortcut)
+    }
+
+    /// Opens a menu of the menu bar.
+    fn open_menu(&mut self, index: usize, now: Instant) {
+        self.context_menu.close();
+        if self.focus == Focus::Palette {
+            self.close_palette(true, now);
+        }
+        self.find.mouse_up();
+        self.doc_mut().view.mouse_up();
+        // Input method events are ignored while a menu is open, so drop a composition.
+        if self.focus == Focus::Find {
+            self.find.ime(fude_platform::Ime::Disabled, now);
+        } else {
+            self.doc_mut().view.ime(fude_platform::Ime::Disabled, now);
+        }
+        let items = match self.menus.get(index) {
+            Some(menu) => menu
+                .items
+                .iter()
+                .map(|entry| match entry {
+                    MenuEntry::Command { action, label } => self.menu_item(*action, label),
+                    MenuEntry::Separator => ContextMenuItem::separator(),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        self.menu_bar
+            .open(&mut self.painter, self.window_area, index, items);
+    }
+
+    /// Acts on what the menu bar did. Returns whether to redraw.
+    fn menu_bar_event(&mut self, ctx: &mut Ctx<'_>, event: MenuBarEvent, now: Instant) -> bool {
+        match event {
+            MenuBarEvent::Open(i) => {
+                self.open_menu(i, now);
+                ctx.set_cursor(CursorShape::Default);
+                true
+            }
+            MenuBarEvent::Run(action) => {
+                self.action(ctx, action, now);
+                true
+            }
+            MenuBarEvent::Redraw => true,
+            MenuBarEvent::Ignored => false,
+        }
+    }
+
+    /// Builds the OS's menu bar, or brings its items up to date with what can run.
+    fn sync_native_menu(&mut self, ctx: &mut Ctx<'_>) {
+        if !self.native_menu_stale {
+            for i in 0..self.native_menu.len() {
+                let (action, last) = self.native_menu[i];
+                let state = self.command_state(action);
+                if state != last {
+                    self.native_menu[i].1 = state;
+                    ctx.set_menu_item_state(i as u32, state.0, state.1);
+                }
+            }
+            return;
+        }
+        let mut ids: Vec<(Action, CommandState)> = Vec::new();
+        let mut menus = Vec::new();
+        for menu in &self.menus {
+            let mut items = Vec::new();
+            for entry in &menu.items {
+                let MenuEntry::Command { action, label } = entry else {
+                    items.push(MenuItemSpec::Separator);
+                    continue;
+                };
+                let (enabled, checked) = self.command_state(*action);
+                items.push(MenuItemSpec::Command(MenuCommand {
+                    id: ids.len() as u32,
+                    label: label.clone(),
+                    shortcut: self.shortcut(*action).map(|s| (s.key(), s.modifiers())),
+                    enabled,
+                    checked,
+                    role: match action {
+                        Action::About => MenuRole::About,
+                        Action::OpenSettings => MenuRole::Settings,
+                        Action::Quit => MenuRole::Quit,
+                        _ => MenuRole::Normal,
+                    },
+                }));
+                ids.push((*action, (enabled, checked)));
+            }
+            menus.push(fude_platform::MenuSpec {
+                title: menu.title.to_owned(),
+                items,
+            });
+        }
+        ctx.set_menu_bar(&MenuBarSpec {
+            app_name: "fude".to_owned(),
+            menus,
+        });
+        self.native_menu = ids;
+        self.native_menu_stale = false;
     }
 
     pub fn event(&mut self, ctx: &mut Ctx<'_>, event: Event) {
@@ -584,7 +769,7 @@ impl Fude {
                 true
             }
             Event::Resized { .. } | Event::ScaleChanged(_) => {
-                self.context_menu.close();
+                self.close_menus();
                 true
             }
             Event::ThemeChanged(theme) => {
@@ -593,7 +778,7 @@ impl Fude {
             }
             Event::Focused(focused) => {
                 if !focused {
-                    self.context_menu.close();
+                    self.close_menus();
                 }
                 self.doc_mut().view.set_focused(focused, now);
                 if focused {
@@ -604,10 +789,19 @@ impl Fude {
                 true
             }
             Event::Key(key) => self.key(ctx, &key, now),
+            Event::Menu(id) => {
+                // A dialog takes no commands, as it takes no shortcuts.
+                if self.prompt.is_none()
+                    && let Some(&(action, _)) = self.native_menu.get(id as usize)
+                {
+                    self.action(ctx, action, now);
+                }
+                true
+            }
             Event::Ime(ime) => {
                 // Only real changes redraw: an empty update redrawing would send the
                 // caret area again, which KWin answers with another empty update.
-                if self.prompt.is_some() || self.context_menu.is_open() {
+                if self.prompt.is_some() || self.context_menu.is_open() || self.menu_bar.is_open() {
                     false
                 } else if self.focus == Focus::Palette {
                     if let Some(action) = self.palette.ime(ime, now) {
@@ -633,18 +827,25 @@ impl Fude {
                 unit,
                 modifiers,
             } => {
-                if self.context_menu.is_open() {
-                    if self.context_menu.contains(self.pointer.0, self.pointer.1) {
-                        let rows = match unit {
-                            ScrollUnit::Lines => dy,
-                            ScrollUnit::Pixels => dy / (28.0 * self.painter.scale),
-                        };
-                        let rows = if rows > 0.0 {
-                            rows.ceil()
-                        } else {
-                            rows.floor()
-                        };
-                        self.context_menu.scroll(rows as i32);
+                let rows = match unit {
+                    ScrollUnit::Lines => dy,
+                    ScrollUnit::Pixels => dy / (28.0 * self.painter.scale),
+                };
+                let rows = if rows > 0.0 {
+                    rows.ceil()
+                } else {
+                    rows.floor()
+                } as i32;
+                let (px, py) = self.pointer;
+                if self.menu_bar.is_open() {
+                    if self.menu_bar.menu_contains(px, py) {
+                        self.menu_bar.scroll(rows);
+                    } else {
+                        self.menu_bar.close();
+                    }
+                } else if self.context_menu.is_open() {
+                    if self.context_menu.contains(px, py) {
+                        self.context_menu.scroll(rows);
                     } else {
                         self.context_menu.close();
                     }
@@ -675,13 +876,23 @@ impl Fude {
                 self.pointer = (x, y);
                 let context_click = button == MouseButton::Right
                     || (cfg!(target_os = "macos") && button == MouseButton::Left && modifiers.ctrl);
+                let primary_click = button == MouseButton::Left && !context_click;
                 if let Some((prompt, _)) = &mut self.prompt {
-                    if button == MouseButton::Left
-                        && !context_click
-                        && let Some(choice) = prompt.mouse_down(x, y)
-                    {
+                    if primary_click && let Some(choice) = prompt.mouse_down(x, y) {
                         self.answer(ctx, choice);
                     }
+                    true
+                } else if self.menu_bar.is_open() || (primary_click && self.menu_bar.contains(x, y))
+                {
+                    let event = if primary_click {
+                        self.menu_bar.mouse_down(x, y)
+                    } else if self.menu_bar.menu_contains(x, y) {
+                        MenuBarEvent::Ignored
+                    } else {
+                        self.menu_bar.close();
+                        MenuBarEvent::Redraw
+                    };
+                    self.menu_bar_event(ctx, event, now);
                     true
                 } else if self.focus == Focus::Palette {
                     if button == MouseButton::Left && !context_click {
@@ -750,8 +961,9 @@ impl Fude {
             }
             Event::MouseLeave => {
                 let menu = self.context_menu.mouse_move(-1.0, -1.0);
+                let bar = self.menu_bar.mouse_leave();
                 let tabs = self.tabs.mouse_leave();
-                self.doc_mut().view.mouse_leave() || tabs || menu
+                self.doc_mut().view.mouse_leave() || tabs || menu || bar
             }
             Event::Timer => {
                 if self.message.as_ref().is_some_and(|(_, at)| *at <= now) {
@@ -772,7 +984,7 @@ impl Fude {
                 let colors = self.poll_highlights();
                 let find = self.poll_find(now);
                 if saves || self.doc().view.editor.buffer().version() != version {
-                    self.context_menu.close();
+                    self.close_menus();
                 }
                 find || saves || colors
             }
@@ -793,6 +1005,9 @@ impl Fude {
             self.still_loading(active);
         }
         let redraw = redraw || refused;
+        if NATIVE_MENU_BAR {
+            self.sync_native_menu(ctx);
+        }
         let find_timer = match self.focus {
             Focus::Find if self.find_state.open => self.find.next_timer(now),
             Focus::Palette => self.palette.next_timer(now),
@@ -841,6 +1056,11 @@ impl Fude {
             ctx.set_cursor(CursorShape::Default);
             return prompt.mouse_move(x, y);
         }
+        if self.menu_bar.is_open() {
+            ctx.set_cursor(CursorShape::Default);
+            let event = self.menu_bar.mouse_move(x, y);
+            return self.menu_bar_event(ctx, event, Instant::now());
+        }
         if self.context_menu.is_open() {
             ctx.set_cursor(CursorShape::Default);
             return self.context_menu.mouse_move(x, y);
@@ -850,10 +1070,11 @@ impl Fude {
             let p = &mut self.painter;
             return self.palette.mouse_move(p, x, y);
         }
+        let redraw_bar = self.menu_bar.mouse_move(x, y) != MenuBarEvent::Ignored;
         let (redraw_tabs, event) = self.tabs.mouse_move(x, y);
         self.tab_event(ctx, event);
         let over_find = self.find_state.open && self.find.contains(x, y);
-        if self.tabs.contains(x, y) {
+        if self.tabs.contains(x, y) || self.menu_bar.contains(x, y) {
             ctx.set_cursor(CursorShape::Default);
         } else if over_find {
             ctx.set_cursor(CursorShape::Text);
@@ -863,7 +1084,7 @@ impl Fude {
         let p = &mut self.painter;
         let redraw_find = self.find_state.open && self.find.mouse_move(p, x, y);
         let redraw_view = self.docs[self.active].view.mouse_move(p, x, y);
-        redraw_tabs || redraw_view || redraw_find
+        redraw_tabs || redraw_view || redraw_find || redraw_bar
     }
 
     fn tab_event(&mut self, ctx: &mut Ctx<'_>, event: Option<TabEvent>) {
@@ -890,6 +1111,11 @@ impl Fude {
             if let PromptInput::Chose(choice) = prompt.key(key) {
                 self.answer(ctx, choice);
             }
+            return true;
+        }
+        if self.menu_bar.is_open() {
+            let event = self.menu_bar.key(key);
+            self.menu_bar_event(ctx, event, now);
             return true;
         }
         if self.context_menu.is_open() {
@@ -939,6 +1165,13 @@ impl Fude {
             self.action(ctx, action, now);
             return true;
         }
+        // F10, or Alt and a menu's first letter.
+        if !NATIVE_MENU_BAR {
+            let event = self.menu_bar.activation(key);
+            if event != MenuBarEvent::Ignored {
+                return self.menu_bar_event(ctx, event, now);
+            }
+        }
         if self.focus != Focus::Editor {
             return false;
         }
@@ -959,7 +1192,7 @@ impl Fude {
     }
 
     fn action(&mut self, ctx: &mut Ctx<'_>, action: Action, now: Instant) {
-        self.context_menu.close();
+        self.close_menus();
         let n = self.docs.len();
         match action {
             Action::New => self.new_doc(),
@@ -1064,6 +1297,7 @@ impl Fude {
                 self.configure_all();
             }
             Action::OpenSettings => self.open_settings(),
+            Action::About => self.about(),
             Action::Tool(tool) => self.run_tool(ctx, tool),
             Action::External(i) => self.run_external(usize::from(i)),
             Action::LineEndings(le) => self.convert_line_endings(ctx, le),
@@ -1133,6 +1367,17 @@ impl Fude {
                 self.say(format!("Word wrap {state}"), false);
             }
         }
+    }
+
+    fn about(&mut self) {
+        let message = format!(
+            "{}\nVersion {}\n\nLicensed under {}\n{}",
+            env!("CARGO_PKG_DESCRIPTION"),
+            platform_version(),
+            env!("CARGO_PKG_LICENSE"),
+            env!("CARGO_PKG_REPOSITORY"),
+        );
+        self.ask(Question::About, "fude 筆", &message, &["Copy", "OK"], 1, 1);
     }
 
     /// Toggles line comments (or with `block`, block comments) in the document's language.
@@ -1474,6 +1719,31 @@ impl Fude {
     }
 }
 
+/// The application menus, with the settings' external tools in the Tools menu.
+fn menus(config: &Config) -> Vec<fude_ui::Menu> {
+    let tools: Vec<&str> = config.tools.iter().map(|t| t.name.as_str()).collect();
+    fude_ui::menus(&tools)
+}
+
+/// "0.0.1 (Linux, x86_64)": the version and what it was built for, for bug reports.
+pub fn platform_version() -> String {
+    let os = match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "freebsd" => "FreeBSD",
+        "openbsd" => "OpenBSD",
+        "netbsd" => "NetBSD",
+        "dragonfly" => "DragonFly BSD",
+        other => other,
+    };
+    format!(
+        "{} ({os}, {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH
+    )
+}
+
 /// What the editor shows while files are dragged over the window.
 fn draw_drop_target(p: &mut Painter, area: Rect) {
     let t = p.theme;
@@ -1593,18 +1863,114 @@ mod tests {
         let now = Instant::now();
         app.doc_mut().view.ime(Ime::Preedit("か".into(), None), now);
         draw(&mut app);
-        assert!(app.open_editor_context_menu(100.0, 60.0, now));
+        assert!(app.open_editor_context_menu(100.0, 100.0, now));
         assert!(!app.doc_mut().view.ime(Ime::Disabled, now));
         assert!(app.doc().view.editor.text().is_empty());
         app.new_doc();
         assert!(!app.context_menu.is_open());
 
         draw(&mut app);
-        assert!(app.open_editor_context_menu(100.0, 60.0, now));
+        assert!(app.open_editor_context_menu(100.0, 100.0, now));
         app.activate(0);
         assert!(!app.context_menu.is_open());
-        app.show_editor_context_menu(100.0, 60.0, now);
+        app.show_editor_context_menu(100.0, 100.0, now);
         app.ask(Question::Info, "Test", "Message", &["OK"], 0, 0);
         assert!(!app.context_menu.is_open());
+    }
+
+    #[test]
+    fn menu_commands_follow_focus_tabs_wrap_and_read_only_state() {
+        let mut app = Fude::new(Config::default());
+        let now = Instant::now();
+        let enabled = |app: &Fude, action| app.command_state(action).0;
+        assert_eq!(
+            app.command_state(Action::ToggleWrap),
+            (true, Some(app.config.word_wrap))
+        );
+        assert_eq!(app.command_state(Action::Save), (true, None));
+        assert!(!enabled(&app, Action::NextTab));
+        app.new_doc();
+        assert!(enabled(&app, Action::NextTab));
+
+        app.doc_mut().view.editor.insert("alpha", now);
+        assert!(enabled(&app, Action::Undo));
+        // Editing commands act on the find field while it has focus.
+        app.find_state.open = true;
+        app.find.open(false, None, now);
+        app.focus = Focus::Find;
+        assert!(!enabled(&app, Action::Undo));
+        assert!(!enabled(&app, Action::Copy));
+        assert!(enabled(&app, Action::Paste));
+        app.focus = Focus::Editor;
+
+        app.doc_mut().view.editor.set_read_only(true);
+        for action in [
+            Action::Undo,
+            Action::Paste,
+            Action::DuplicateLine,
+            Action::ToggleComment,
+            Action::Tool(fude_tools::Tool::SortLines),
+            Action::LineEndings(fude_buffer::LineEnding::CrLf),
+        ] {
+            assert!(!enabled(&app, action), "{action:?}");
+        }
+        // Hashes only read the text.
+        assert!(enabled(&app, Action::Tool(fude_tools::Tool::Sha256)));
+        assert!(enabled(&app, Action::Copy));
+    }
+
+    #[test]
+    fn an_external_tool_takes_over_a_shortcut_in_the_menus() {
+        let mut config = Config::default();
+        let key = Shortcut::parse("mod+d").unwrap();
+        config.tools.push(config::ExternalTool {
+            name: "Date".into(),
+            command: vec!["date".into()],
+            input: config::ToolInput::Nothing,
+            output: config::ToolOutput::Insert,
+            key: Some(key.clone()),
+            timeout: Duration::from_secs(1),
+        });
+        let app = Fude::new(config);
+        assert_eq!(app.shortcut(Action::SelectNextOccurrence), None);
+        assert_eq!(app.shortcut(Action::External(0)), Some(key));
+        assert!(app.shortcut(Action::DuplicateLine).is_some());
+        let tools = app.menus.iter().find(|m| m.title == "Tools").unwrap();
+        assert_eq!(
+            tools.items.last(),
+            Some(&MenuEntry::Command {
+                action: Action::External(0),
+                label: "Date".into()
+            })
+        );
+    }
+
+    #[test]
+    fn opening_a_menu_closes_the_palette_and_context_menu_and_dialogs_close_it() {
+        if NATIVE_MENU_BAR {
+            return;
+        }
+        let mut app = Fude::new(Config::default());
+        let now = Instant::now();
+        draw(&mut app);
+        assert!(app.open_editor_context_menu(100.0, 100.0, now));
+        app.open_menu(0, now);
+        assert!(!app.context_menu.is_open());
+        assert!(app.menu_bar.is_open());
+        draw(&mut app);
+
+        app.close_menus();
+        app.open_palette("", now);
+        app.open_menu(1, now);
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.menu_bar.is_open());
+
+        app.about();
+        assert!(!app.menu_bar.is_open());
+        let (prompt, question) = app.prompt.as_ref().unwrap();
+        assert!(matches!(question, Question::About));
+        assert!(prompt.message.contains(env!("CARGO_PKG_VERSION")));
+        assert_eq!(prompt.buttons[prompt.default], "OK");
+        draw(&mut app);
     }
 }

@@ -1,9 +1,12 @@
-//! A transient command menu, positioned at the pointer and kept inside the window.
+//! A transient command menu, positioned at the pointer and kept inside the window. The
+//! menu bar's menus are these too.
 
 use fude_platform::{Key, KeyInput};
 use fude_render::Rect;
 
 use crate::{Action, Painter};
+
+const CHECK: &str = "✓";
 
 #[derive(Clone, Debug)]
 pub struct ContextMenuItem {
@@ -12,6 +15,8 @@ pub struct ContextMenuItem {
     pub label: String,
     pub shortcut: String,
     pub enabled: bool,
+    /// `Some` for a command that is on or off, shown with a check mark when on.
+    pub checked: Option<bool>,
 }
 
 impl ContextMenuItem {
@@ -26,6 +31,7 @@ impl ContextMenuItem {
             label: label.into(),
             shortcut: shortcut.into(),
             enabled,
+            checked: None,
         }
     }
 
@@ -35,6 +41,7 @@ impl ContextMenuItem {
             label: String::new(),
             shortcut: String::new(),
             enabled: false,
+            checked: None,
         }
     }
 
@@ -56,6 +63,8 @@ pub struct ContextMenu {
     pad: i32,
     border: i32,
     shortcut_width: i32,
+    /// Room for check marks before the labels, when any item can be checked.
+    check_width: i32,
 }
 
 impl ContextMenu {
@@ -88,7 +97,17 @@ impl ContextMenu {
         } else {
             0
         };
-        let width = (label_width + self.shortcut_width + gap + 2 * self.pad + 2 * self.border)
+        self.check_width = if self.items.iter().any(|item| item.checked.is_some()) {
+            p.measure(CHECK, &style).ceil() as i32 + self.pad / 2
+        } else {
+            0
+        };
+        let width = (self.check_width
+            + label_width
+            + self.shortcut_width
+            + gap
+            + 2 * self.pad
+            + 2 * self.border)
             .max(p.px(200.0));
         self.place(window, x, y, width, p.px(28.0).max(1), p.px(9.0).max(1));
     }
@@ -211,6 +230,28 @@ impl ContextMenu {
         changed
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
+    #[cfg(test)]
+    pub(crate) fn area(&self) -> Rect {
+        self.area
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row_area(&self, index: usize) -> Rect {
+        self.row_rect(index)
+    }
+
+    /// Selects the first item that can run, as when a menu is opened from the keyboard.
+    pub fn select_first(&mut self) {
+        if let Some(index) = self.items.iter().position(ContextMenuItem::selectable) {
+            self.select(index);
+        }
+    }
+
     fn select(&mut self, index: usize) {
         self.selected = Some(index);
         let row = self.rows[index];
@@ -316,7 +357,10 @@ impl ContextMenu {
                 t.chrome_text_muted
             };
             let baseline = p.center_baseline(row.y, row.h, &style);
-            let available = (row.w - 2 * self.pad).max(0);
+            if item.checked == Some(true) {
+                p.text(CHECK, &style, (row.x + self.pad) as f32, baseline, color);
+            }
+            let available = (row.w - 2 * self.pad - self.check_width).max(0);
             let shortcut_width = self.shortcut_width.min(available / 2);
             let gap = if shortcut_width > 0 { self.pad } else { 0 };
             let label = p.fit(
@@ -324,7 +368,13 @@ impl ContextMenu {
                 &style,
                 (available - shortcut_width - gap).max(0) as f32,
             );
-            p.text(&label, &style, (row.x + self.pad) as f32, baseline, color);
+            p.text(
+                &label,
+                &style,
+                (row.x + self.pad + self.check_width) as f32,
+                baseline,
+                color,
+            );
             if !item.shortcut.is_empty() && shortcut_width > 0 {
                 let shortcut = p.fit(&item.shortcut, &style, shortcut_width as f32);
                 let width = p.measure(&shortcut, &style);

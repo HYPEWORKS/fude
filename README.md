@@ -4,7 +4,7 @@
 
 A cross-platform text editor somewhere between Notepad and Notepad++: instant startup, instant response at any file size, low memory use. Windows, macOS and Linux, with BSD as a bonus.
 
-> **Status: early.** Phases 0–4 are done: tabs, find and replace, syntax highlighting for 75 languages, word wrap, a command palette, settings and light/dark themes, single instance, hot exit (quitting never asks; unsaved work comes back), large files (a 500 MB file shows in 23 ms and loads in the background; lines of any length edit as quickly as short ones), multiple cursors and column selection, line commands, comments, bracket matching, auto-indent, and text tools, built in or your own. Packaging and release are phase 6. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design, roadmap and measurements.
+> **Status: early.** Phases 0–4 are done: tabs, find and replace, syntax highlighting for 75 languages, word wrap, menus and a command palette, settings and light/dark themes, single instance, hot exit (quitting never asks; unsaved work comes back), large files (a 500 MB file shows in 23 ms and loads in the background; lines of any length edit as quickly as short ones), multiple cursors and column selection, line commands, comments, bracket matching, auto-indent, and text tools, built in or your own. Packaging and release are phase 6. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design, roadmap and measurements.
 
 ## Building
 
@@ -21,6 +21,7 @@ cargo run --release -- some/file.txt
 | Select | Shift + any move, drag, double-click a word, triple-click a line, click the gutter |
 | Edit | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) undo and redo, Ctrl+X / C / V, Ctrl+A, Ctrl+/ comment, Shift+Alt+A block comment |
 | Context menu | Right-click (or Control-click on macOS), Shift+F10 or the menu key; arrows to choose, Enter to run, Escape to dismiss |
+| Menus | File, Edit, Selection, View, Go, Tools and Help (the menu bar on macOS). F10, or Alt and a menu's first letter (Alt+F for File), opens one; arrows move through the items and across the menus, Enter runs, Escape closes. Help → About shows the version |
 | Cursors | Ctrl+Click add or remove, Ctrl+D next occurrence, Ctrl+Shift+L all occurrences, Ctrl+Alt+↑/↓ add above or below, Shift+Alt+I one per line, Alt+drag or Shift+Alt+arrows column selection, Escape back to one |
 | Lines | Alt+↑/↓ move, Ctrl+Shift+D duplicate, Ctrl+Shift+K delete, Ctrl+J join, Ctrl+Enter / Ctrl+Shift+Enter new line below / above, Tab / Shift+Tab (or Ctrl+] / Ctrl+[) indent / outdent, Ctrl+Shift+\ matching bracket |
 | Files | Ctrl+N new tab, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+W close tab, Ctrl+Q quit |

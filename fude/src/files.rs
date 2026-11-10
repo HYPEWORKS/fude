@@ -339,6 +339,10 @@ impl Fude {
             (Question::ReadOnly(id, then), 0) => self.save_as(ctx, id, then),
             (Question::ChangedOnDisk(id), 0) => self.reload(id),
             (Question::OpenLarge(path), 0) => self.open_now(&path),
+            (Question::About, 0) => {
+                ctx.set_clipboard_text(format!("fude {}", crate::app::platform_version()));
+                self.say("Copied the version", false);
+            }
             (Question::ChangedOnDisk(id), _) => {
                 // Keep the edited text; the file on disk no longer matches any version.
                 if let Some(i) = self.index_of(id) {

@@ -37,7 +37,9 @@ const ALT: u32 = 0xffe9;
 const TAB: u32 = 0xff09;
 const DOWN: u32 = 0xff54;
 
-/// Layout at scale 1 with a 14 px font: where line `n` (0-based) and column `c` are.
+/// Layout at scale 1 with a 14 px font: where line `n` (0-based) and column `c` are,
+/// below the menu bar and the tab strip.
+const MENU_BAR: i16 = 28;
 const TAB_STRIP: i16 = 36;
 const PAD_TOP: i16 = 6;
 const LINE_H: i16 = 21;
@@ -107,10 +109,18 @@ impl Driver {
         Ok(())
     }
 
+    /// Clicks at a point of the window.
+    fn click_at(&self, x: i16, y: i16) -> Result<(), String> {
+        let (x, y) = (self.origin.0 + x, self.origin.1 + y);
+        self.fake(MOTION, 0, x, y)?;
+        self.fake(BUTTON_PRESS, 1, x, y)?;
+        self.fake(BUTTON_RELEASE, 1, x, y)
+    }
+
     /// Clicks at a line and column of the text, `count` times.
     fn click(&self, line: usize, column: f32, count: u8) -> Result<(), String> {
         let x = self.origin.0 + (TEXT_X + column * COLUMN) as i16;
-        let y = self.origin.1 + TAB_STRIP + PAD_TOP + LINE_H * line as i16 + LINE_H / 2;
+        let y = self.origin.1 + MENU_BAR + TAB_STRIP + PAD_TOP + LINE_H * line as i16 + LINE_H / 2;
         self.fake(MOTION, 0, x, y)?;
         for _ in 0..count {
             self.fake(BUTTON_PRESS, 1, x, y)?;
@@ -292,6 +302,28 @@ fn power_features(
     check(
         d,
         "Enter indents after {, and } outdents",
+        "# ALPHA\n>ALPHA\n>BETA\n>COW DOG COW\nif x {\n\ty\n}",
+    )?;
+
+    // Alt+T opens the Tools menu on its first item; lowercase is ten items down.
+    d.key(&[ALT], 't' as u32)?;
+    for _ in 0..10 {
+        d.key(&[], DOWN)?;
+    }
+    d.key(&[], RETURN)?;
+    check(
+        d,
+        "Alt+T, then Down to lowercase and Enter, runs it from the Tools menu",
+        "# alpha\n>alpha\n>beta\n>cow dog cow\nif x {\n\ty\n}",
+    )?;
+
+    // Edit is the second title (13 px font: "File" ends near x = 56); Undo is its first
+    // item, just below the bar.
+    d.click_at(82, MENU_BAR / 2)?;
+    d.click_at(90, MENU_BAR + 21)?;
+    check(
+        d,
+        "clicking Edit, then Undo, undoes it",
         "# ALPHA\n>ALPHA\n>BETA\n>COW DOG COW\nif x {\n\ty\n}",
     )?;
 
