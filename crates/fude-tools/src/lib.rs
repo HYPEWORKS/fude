@@ -1,5 +1,5 @@
-//! Built-in text tools (ARCHITECTURE.md §14): pure functions from text to text, so they
-//! can run on a worker over a snapshot and be tested without an editor.
+//! Built-in text tools (ARCHITECTURE.md, "Extensibility"): pure functions from text to
+//! text, so they can run on a worker over a snapshot and be tested without an editor.
 //!
 //! Text is bytes: the document's raw UTF-8, which may hold invalid bytes. Tools that need
 //! characters (case changes, formatters) leave invalid bytes as they are or refuse with

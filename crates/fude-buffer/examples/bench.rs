@@ -1,4 +1,4 @@
-//! Large-file benchmark for the buffer, against the budgets in ARCHITECTURE.md §3.
+//! Large-file benchmark for the buffer, against the budgets in ARCHITECTURE.md.
 //!
 //!     cargo run --release -p fude-buffer --example bench -- [--size-mb 500]
 //!

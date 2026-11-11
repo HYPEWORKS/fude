@@ -1,5 +1,5 @@
 //! `fude --bench-file <PATH>`: opens one file without a window and measures what the
-//! large-file budgets (ARCHITECTURE.md §3) are about: the first screen, loading, memory,
+//! large-file budgets (ARCHITECTURE.md) are about: the first screen, loading, memory,
 //! and the cost of scrolling, jumping, moving and typing, each step including a full
 //! frame. `cargo xtask bench-large` runs it over the generated corpus.
 

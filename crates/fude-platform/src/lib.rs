@@ -3,7 +3,7 @@
 //! This is the only crate that knows about `winit`, `softbuffer`, the clipboard and file
 //! dialogs. Everything above it sees fude's own [`Event`] types and draws into a
 //! [`Canvas`], so the windowing layer can be replaced per OS later without touching the
-//! editor (`ARCHITECTURE.md` §6).
+//! editor (`ARCHITECTURE.md`, "Rendering").
 //!
 //! The loop is event-driven: it sleeps until input arrives, a timer the app set comes
 //! due ([`Ctx::set_timer`]), or another thread calls [`Waker::wake`].

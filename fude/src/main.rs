@@ -231,7 +231,7 @@ impl App for Window {
 
     fn event(&mut self, ctx: &mut Ctx<'_>, event: Event) {
         // A bug in a command shouldn't take unsaved text down with it: report it and keep
-        // going, so the user can still save (ARCHITECTURE.md §11).
+        // going, so the user can still save (fude/README.md, "Fault isolation").
         let app = &mut self.app;
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.event(ctx, event)));

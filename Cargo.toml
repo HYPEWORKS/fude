@@ -53,7 +53,7 @@ all = { level = "warn", priority = -1 }
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "unwind" # commands will run under catch_unwind (ARCHITECTURE.md §11)
+panic = "unwind" # events and drawing run under catch_unwind (fude/README.md, "Fault isolation")
 
 # Keep debug builds usable: rasterization and shaping are slow unoptimized.
 [profile.dev.package."*"]

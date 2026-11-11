@@ -3,7 +3,7 @@
 //! The UI describes a frame as a flat [`DrawList`] of rectangles and images (glyph masks,
 //! color glyphs). [`rasterize`] turns that list into pixels on a [`Canvas`]. The same list
 //! is what a GPU backend would consume, so a future backend can replace the rasterizer
-//! without touching the UI (see `ARCHITECTURE.md` §6).
+//! without touching the UI (see `ARCHITECTURE.md`, "Rendering").
 //!
 //! Pixels are `0x00RRGGBB`, the format `softbuffer` presents on every platform.
 

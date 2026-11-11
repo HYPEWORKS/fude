@@ -1,4 +1,4 @@
-//! The large-file corpus (ARCHITECTURE.md §16): generated, never committed.
+//! The large-file corpus (xtask/README.md): generated, never committed.
 //!
 //! Every file is made from a fixed seed, so runs compare like with like. `small` makes
 //! each file a tenth of the size, for quick runs.
