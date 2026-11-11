@@ -6,6 +6,21 @@ A cross-platform text editor somewhere between Notepad and Notepad++: instant st
 
 > **Status: early.** Phases 0–5 of the [roadmap](ARCHITECTURE.md#roadmap) are done. Packaging and release are next.
 
+![fude editing a Rust file in the dark theme, with three tabs open](docs/screenshots/editor-dark.png)
+
+<table>
+  <tr>
+    <td width="33%"><img src="docs/screenshots/command-palette.png" alt="The command palette filtered to the sort commands"></td>
+    <td width="33%"><img src="docs/screenshots/find-replace-regex.png" alt="Find and replace with a regex and a capture group, matches highlighted"></td>
+    <td width="33%"><img src="docs/screenshots/multiple-cursors.png" alt="Six cursors renaming every occurrence of a field at once, in the light theme"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Every command in the palette</sub></td>
+    <td align="center"><sub>Find and replace with regex</sub></td>
+    <td align="center"><sub>Multiple cursors, light theme</sub></td>
+  </tr>
+</table>
+
 - Tabs, find and replace with regex, go to line, menus and a command palette
 - Syntax highlighting for 75 languages, word wrap, zoom, light and dark themes
 - Multiple cursors, column selection, line commands, comments, bracket matching, auto-indent
