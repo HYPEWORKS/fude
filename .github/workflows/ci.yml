@@ -59,7 +59,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install X server and runtime libraries
-        run: sudo apt-get update && sudo apt-get install -y xvfb libxkbcommon-x11-0 libxcursor1 libx11-xcb1
+        run: sudo apt-get -o Acquire::Retries=5 update && sudo apt-get -o Acquire::Retries=5 install -y xvfb libxkbcommon-x11-0 libxcursor1 libx11-xcb1
       # Report-only until we have a baseline for runner noise; then add --check.
       # -noreset: by default Xvfb resets whenever its last client exits, which would add
       # ~30 ms to every launch after the first.

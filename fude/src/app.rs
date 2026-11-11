@@ -1787,6 +1787,11 @@ mod tests {
         Part::of(tree.state().focus()?.locate().0)
     }
 
+    /// The line break new documents use (and typed text is normalized to): CRLF on Windows.
+    fn nl() -> &'static str {
+        std::str::from_utf8(fude_buffer::LineEnding::PLATFORM.as_bytes()).unwrap()
+    }
+
     #[test]
     fn the_tree_holds_the_document_and_its_selection() {
         let mut app = Fude::new(Config::default());
@@ -1798,7 +1803,10 @@ mod tests {
         let editor = node(&tree, Part::Editor);
         assert_eq!(editor.role(), Role::MultilineTextInput);
         assert_eq!(editor.label().as_deref(), Some("Untitled"));
-        assert_eq!(editor.document_range().text(), "alpha beta\ngamma\n");
+        assert_eq!(
+            editor.document_range().text(),
+            format!("alpha beta{nl}gamma{nl}", nl = nl())
+        );
         let selection = editor.text_selection().unwrap();
         assert_eq!(selection.text(), "pha be");
         // Where it is on screen, for magnifiers and highlight cursors.
@@ -1839,7 +1847,8 @@ mod tests {
         let runs = editor.children().count();
         assert!((10..100).contains(&runs), "{runs} runs");
         let shown = editor.document_range().text();
-        assert!(shown.contains("line 50000\n"), "{shown}");
+        let line = format!("line 50000{}", nl());
+        assert!(shown.contains(&line), "{shown}");
         let caret = editor.text_selection().unwrap();
         assert!(caret.is_degenerate());
         assert!(
@@ -1847,7 +1856,7 @@ mod tests {
                 .start()
                 .inner_node()
                 .value()
-                .is_some_and(|v| v == "line 50000\n")
+                .is_some_and(|v| v == line)
         );
     }
 
