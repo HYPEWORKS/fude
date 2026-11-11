@@ -1,6 +1,6 @@
 # xtask
 
-Development tasks: benchmarks, the large-file corpus and the UI test. Run with `cargo xtask <task>` (`cargo xtask` alone lists them). The tasks that run fude build the release binary first unless given `--no-build`.
+Development tasks: benchmarks, the large-file corpus, the UI test and the README's screenshots. Run with `cargo xtask <task>` (`cargo xtask` alone lists them). The tasks that run fude build the release binary first unless given `--no-build`.
 
 Dependencies: `encoding_rs` (to write the corpus's Shift_JIS file); `x11rb` with XTest on Linux and the BSDs, for the UI test.
 
@@ -72,6 +72,14 @@ It covers typing, mouse selection, clipboard, undo, the unsaved-changes prompt, 
 
 Pixel positions assume scale 1 and the default 14 px font. With `FUDE_UI_SHOTS=<dir>`, it also saves screenshots of a selection and the unsaved-changes prompt there (needs ImageMagick's `import`).
 
+## Screenshots
+
+```sh
+env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 2600x1700x24 -noreset" cargo xtask screenshots [--no-build] [--out DIR] [NAME...]
+```
+
+Takes the [README](../README.md)'s screenshots from the real window, into `docs/screenshots` (or `DIR`): all four, or only the scenes named (`editor-dark`, `command-palette`, `find-replace-regex`, `multiple-cursors`). Each scene opens the files in [`docs/screenshots/demo`](../docs/screenshots/demo) in a fresh fude with its own settings and session, at scale 2, drives it with the UI test's XTest driver, and saves the window with ImageMagick's `import`. The screen has to be larger than the 2200×1440 window. Each scene waits out the 10 s of caret blinking so the carets show, so the run takes about a minute. Run it again when the UI changes.
+
 ## Other benchmarks
 
 These don't need xtask:
@@ -92,3 +100,4 @@ Results: [rendering](../crates/fude-render/README.md#performance), [the buffer](
 | `main.rs` | Task dispatch, `bench-startup`, `bench-large` |
 | `corpus.rs` | The corpus generator |
 | `ui_test.rs` | The UI test (Linux and the BSDs) |
+| `screenshots.rs` | The README's screenshots (Linux and the BSDs) |

@@ -2,6 +2,8 @@
 
 mod corpus;
 #[cfg(all(unix, not(target_os = "macos")))]
+mod screenshots;
+#[cfg(all(unix, not(target_os = "macos")))]
 mod ui_test;
 
 use std::io::{BufRead, BufReader};
@@ -35,13 +37,19 @@ Tasks:
   ui-test [--no-build]
       Drive the release build through X11 (typing, mouse, clipboard, saving, the
       unsaved-changes prompt) and check what it saves. Linux and BSD; run it on an X
-      server without a window manager, such as Xvfb.";
+      server without a window manager, such as Xvfb.
+
+  screenshots [--no-build] [--out DIR] [NAME...]
+      Take the README's screenshots from the release build's real window, into
+      docs/screenshots (or DIR): all of them, or the scenes named. Linux and BSD, on
+      an X server without a window manager; needs ImageMagick's import.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("bench-startup") => bench_startup(&args[1..]),
         Some("ui-test") => ui_test(&args[1..]),
+        Some("screenshots") => screenshots(&args[1..]),
         Some("corpus") => corpus_task(&args[1..]).map(|_| ()),
         Some("bench-large") => bench_large(&args[1..]),
         Some("-h" | "--help") | None => {
@@ -222,6 +230,29 @@ fn ui_test(args: &[String]) -> Result<(), String> {
     {
         let _ = exe;
         Err("ui-test drives the app through X11, so it runs on Linux and the BSDs".into())
+    }
+}
+
+fn screenshots(args: &[String]) -> Result<(), String> {
+    let (mut build, mut out, mut only) = (true, None, Vec::new());
+    let mut args = args.iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--no-build" => build = false,
+            "--out" => out = Some(PathBuf::from(args.next().ok_or("--out needs a value")?)),
+            f if f.starts_with('-') => return Err(format!("unknown option {f:?}\n\n{USAGE}")),
+            name => only.push(name.to_owned()),
+        }
+    }
+    let exe = release_exe(build)?;
+    let root = workspace_root();
+    let out = out.unwrap_or_else(|| root.join("docs").join("screenshots"));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    return screenshots::run(&exe, &root, &out, &only);
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = (exe, out, only);
+        Err("screenshots drives the app through X11, so it runs on Linux and the BSDs".into())
     }
 }
 

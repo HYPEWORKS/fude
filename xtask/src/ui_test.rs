@@ -27,14 +27,14 @@ const BUTTON_PRESS: u8 = 4;
 const BUTTON_RELEASE: u8 = 5;
 const MOTION: u8 = 6;
 
-const RETURN: u32 = 0xff0d;
-const ESCAPE: u32 = 0xff1b;
+pub(crate) const RETURN: u32 = 0xff0d;
+pub(crate) const ESCAPE: u32 = 0xff1b;
 const HOME: u32 = 0xff50;
-const END: u32 = 0xff57;
-const SHIFT: u32 = 0xffe1;
-const CONTROL: u32 = 0xffe3;
-const ALT: u32 = 0xffe9;
-const TAB: u32 = 0xff09;
+pub(crate) const END: u32 = 0xff57;
+pub(crate) const SHIFT: u32 = 0xffe1;
+pub(crate) const CONTROL: u32 = 0xffe3;
+pub(crate) const ALT: u32 = 0xffe9;
+pub(crate) const TAB: u32 = 0xff09;
 const DOWN: u32 = 0xff54;
 
 /// Layout at scale 1 with a 14 px font: where line `n` (0-based) and column `c` are,
@@ -46,7 +46,7 @@ const LINE_H: i16 = 21;
 const TEXT_X: f32 = 62.0;
 const COLUMN: f32 = 8.4;
 
-struct Driver {
+pub(crate) struct Driver {
     conn: RustConnection,
     root: Window,
     window: Window,
@@ -56,6 +56,38 @@ struct Driver {
 }
 
 impl Driver {
+    /// A driver for `window`, whose top-left corner is at `origin` on the root window.
+    pub(crate) fn new(
+        conn: RustConnection,
+        root: Window,
+        window: Window,
+        origin: (i16, i16),
+    ) -> Result<Self, String> {
+        let setup = conn.setup();
+        let (min, max) = (setup.min_keycode, setup.max_keycode);
+        let map = conn
+            .get_keyboard_mapping(min, max - min + 1)
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map_err(|e| e.to_string())?;
+        let per = map.keysyms_per_keycode as usize;
+        let mut keys = Vec::new();
+        for (i, syms) in map.keysyms.chunks(per).enumerate() {
+            for (level, &sym) in syms.iter().take(2).enumerate() {
+                if sym != 0 && !keys.iter().any(|k: &(u32, u8, bool)| k.0 == sym) {
+                    keys.push((sym, min + i as u8, level == 1));
+                }
+            }
+        }
+        Ok(Self {
+            conn,
+            root,
+            window,
+            origin,
+            keys,
+        })
+    }
+
     fn sync(&self) -> Result<(), String> {
         self.conn.sync().map_err(|e| e.to_string())
     }
@@ -78,7 +110,7 @@ impl Driver {
     }
 
     /// Presses `keysym` with modifiers held.
-    fn key(&self, mods: &[u32], keysym: u32) -> Result<(), String> {
+    pub(crate) fn key(&self, mods: &[u32], keysym: u32) -> Result<(), String> {
         let (code, shift) = self.keycode(keysym)?;
         let mut held: Vec<u8> = mods
             .iter()
@@ -98,11 +130,11 @@ impl Driver {
         Ok(())
     }
 
-    fn ctrl(&self, c: char) -> Result<(), String> {
+    pub(crate) fn ctrl(&self, c: char) -> Result<(), String> {
         self.key(&[CONTROL], c as u32)
     }
 
-    fn type_text(&self, s: &str) -> Result<(), String> {
+    pub(crate) fn type_text(&self, s: &str) -> Result<(), String> {
         for c in s.chars() {
             self.key(&[], c as u32)?;
         }
@@ -159,7 +191,7 @@ fn shot(window: Window, name: &str) {
 }
 
 /// Waits up to 10 s for a window whose title mentions `name`.
-fn wait_window(conn: &RustConnection, root: Window, name: &str) -> Option<Window> {
+pub(crate) fn wait_window(conn: &RustConnection, root: Window, name: &str) -> Option<Window> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(w) = find_window(conn, root, name) {
@@ -391,29 +423,7 @@ pub fn run(exe: &Path) -> Result<(), String> {
         .reply()
         .map_err(|e| e.to_string())?;
 
-    let setup = conn.setup();
-    let (min, max) = (setup.min_keycode, setup.max_keycode);
-    let map = conn
-        .get_keyboard_mapping(min, max - min + 1)
-        .map_err(|e| e.to_string())?
-        .reply()
-        .map_err(|e| e.to_string())?;
-    let per = map.keysyms_per_keycode as usize;
-    let mut keys = Vec::new();
-    for (i, syms) in map.keysyms.chunks(per).enumerate() {
-        for (level, &sym) in syms.iter().take(2).enumerate() {
-            if sym != 0 && !keys.iter().any(|k: &(u32, u8, bool)| k.0 == sym) {
-                keys.push((sym, min + i as u8, level == 1));
-            }
-        }
-    }
-    let d = Driver {
-        conn,
-        root,
-        window,
-        origin: (origin.dst_x, origin.dst_y),
-        keys,
-    };
+    let d = Driver::new(conn, root, window, (origin.dst_x, origin.dst_y))?;
     let _ = d.window;
 
     let mut failures = 0;

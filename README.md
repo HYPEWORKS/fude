@@ -67,7 +67,7 @@ cargo clippy --workspace --all-targets
 ```
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): goals, budgets, how the crates fit together. Each crate has a README with its own design.
-- [xtask](xtask/README.md): benchmarks, the large-file corpus and the UI test (`cargo xtask`).
+- [xtask](xtask/README.md): benchmarks, the large-file corpus, the UI test and the screenshots above (`cargo xtask`).
 - [fuzz](fuzz/README.md): fuzzing the buffer.
 
 ## License
