@@ -3,9 +3,11 @@
 //! programs. Keyboard first: Enter picks the default, Escape cancels, a button's first
 //! letter picks it, Tab and the arrow keys move focus.
 
+use accesskit::{Action, ActionRequest, NodeId, Role};
 use fude_platform::{Key, KeyInput};
 use fude_render::Rect;
 
+use crate::access::{self, AccessTree, Part};
 use crate::painter::Painter;
 
 pub struct Prompt {
@@ -20,6 +22,9 @@ pub struct Prompt {
     hover: Option<usize>,
     /// Button rectangles from the last draw.
     rects: Vec<Rect>,
+    /// The dialog and its message, from the last draw.
+    area: Rect,
+    message_rect: Rect,
 }
 
 /// What a key or click did to a prompt.
@@ -48,6 +53,56 @@ impl Prompt {
             focus: default,
             hover: None,
             rects: Vec::new(),
+            area: Rect::default(),
+            message_rect: Rect::default(),
+        }
+    }
+
+    /// Describes the dialog for assistive technologies: a modal alert, its title as its
+    /// name, its message, and the buttons, the focused one having focus.
+    pub fn access(&self, tree: &mut AccessTree) -> NodeId {
+        let message = tree.push(
+            Part::PromptMessage,
+            access::text_node(&self.message, self.message_rect),
+        );
+        let mut children = vec![message];
+        for (i, (label, rect)) in self.buttons.iter().zip(&self.rects).enumerate() {
+            let role = if i == self.default {
+                Role::DefaultButton
+            } else {
+                Role::Button
+            };
+            let mut button = access::clickable(role, label, *rect);
+            button.add_action(Action::Focus);
+            children.push(tree.push(Part::PromptButton(i), button));
+        }
+        let mut dialog = access::labeled(Role::AlertDialog, &self.title, self.area);
+        dialog.set_modal();
+        dialog.set_described_by(vec![message]);
+        dialog.set_children(children);
+        tree.push(Part::Prompt, dialog)
+    }
+
+    /// What has focus in the dialog.
+    pub fn access_focus(&self) -> Part {
+        Part::PromptButton(self.focus)
+    }
+
+    /// Does what an assistive technology asks: clicks or focuses a button.
+    pub fn access_action(&mut self, part: Part, request: &ActionRequest) -> PromptInput {
+        let Part::PromptButton(i) = part else {
+            return PromptInput::Ignored;
+        };
+        if i >= self.buttons.len() {
+            return PromptInput::Ignored;
+        }
+        match request.action {
+            Action::Click => PromptInput::Chose(i),
+            Action::Focus => {
+                self.focus = i;
+                PromptInput::Handled
+            }
+            _ => PromptInput::Ignored,
         }
     }
 
@@ -117,6 +172,7 @@ impl Prompt {
             pad + line_h + p.px(8.0) + lines.len() as i32 * line_h + p.px(20.0) + button_h + pad;
         let x = window.x + (window.w - width) / 2;
         let y = window.y + (window.h - height) / 2;
+        self.area = Rect::new(x, y, width, height);
         p.rect(Rect::new(x - 1, y - 1, width + 2, height + 2), t.border);
         p.rect(Rect::new(x, y, width, height), t.dialog_bg);
 
@@ -130,6 +186,7 @@ impl Prompt {
             t.text,
         );
         ty += line_h + p.px(8.0);
+        self.message_rect = Rect::new(x + pad, ty, width - 2 * pad, lines.len() as i32 * line_h);
         for line in &lines {
             let baseline = p.center_baseline(ty, line_h, &body);
             p.text(line, &body, (x + pad) as f32, baseline, t.chrome_text);

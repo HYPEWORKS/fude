@@ -92,7 +92,7 @@ Opening a file while fude is running sends it to the existing window as a new ta
 
 ## Fault isolation
 
-Event handling and drawing run inside `catch_unwind` (`main.rs`). A bug in a command shows an error in the status bar, and a bug in drawing costs a frame, instead of losing unsaved text. The release profile keeps `panic = "unwind"` for this.
+Event handling, drawing and building the accessibility tree run inside `catch_unwind` (`main.rs`). A bug in a command shows an error in the status bar, and a bug in drawing costs a frame, instead of losing unsaved text. The release profile keeps `panic = "unwind"` for this.
 
 ## Modules
 

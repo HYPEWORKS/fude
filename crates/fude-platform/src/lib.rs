@@ -7,7 +7,11 @@
 //!
 //! The loop is event-driven: it sleeps until input arrives, a timer the app set comes
 //! due ([`Ctx::set_timer`]), or another thread calls [`Waker::wake`].
+//!
+//! Screen readers and other assistive technologies see the tree [`App::access_tree`]
+//! builds, through AccessKit, and act on it through [`Event::Access`].
 
+mod access;
 mod input;
 #[cfg(target_os = "macos")]
 mod mac_menu;
@@ -28,6 +32,7 @@ use winit::event::{
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Cursor, CursorIcon, Window, WindowId};
 
+pub use accesskit;
 pub use fude_render::Canvas;
 pub use input::{Key, KeyInput, Modifiers};
 pub use memory::{MemoryUsage, memory_usage};
@@ -133,6 +138,9 @@ pub enum Event {
     FileHover(bool),
     /// A native menu item was chosen, by its [`MenuCommand::id`].
     Menu(u32),
+    /// An assistive technology (a screen reader, voice control) asks for something to be
+    /// done to a node of [`App::access_tree`]: focus it, click it, select text in it.
+    Access(accesskit::ActionRequest),
 }
 
 /// Whether menus are the OS's own menu bar (macOS), set with [`Ctx::set_menu_bar`],
@@ -379,6 +387,12 @@ pub trait App {
     fn presented(&mut self, _ctx: &mut Ctx<'_>) {}
 
     fn startup_mark(&mut self, _mark: StartupMark) {}
+
+    /// The accessibility tree: what screen readers and other assistive technologies see,
+    /// with bounds in physical pixels from the window's top left. Asked for when one starts
+    /// listening and after each frame while it is, and never otherwise, so it costs nothing
+    /// when none is.
+    fn access_tree(&mut self) -> accesskit::TreeUpdate;
 }
 
 #[derive(Debug)]
@@ -436,7 +450,9 @@ pub fn run<A: App>(options: WindowOptions, app: A) -> Result<(), PlatformError> 
 }
 
 struct WinState {
-    // Field order is drop order: the surface must go before the context and window.
+    // Field order is drop order: the surface and the accessibility adapter must go before
+    // the context and window.
+    access: access::Access,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
     _context: softbuffer::Context<Rc<Window>>,
     window: Rc<Window>,
@@ -476,15 +492,19 @@ struct Runner<A> {
 
 impl<A: App> Runner<A> {
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<WinState, PlatformError> {
+        // Hidden until the accessibility adapter is in place, as AccessKit requires.
         let attrs = Window::default_attributes()
             .with_title(self.options.title.clone())
             .with_inner_size(LogicalSize::new(self.options.width, self.options.height))
-            .with_min_inner_size(LogicalSize::new(320.0, 200.0));
+            .with_min_inner_size(LogicalSize::new(320.0, 200.0))
+            .with_visible(false);
         let window = Rc::new(
             event_loop
                 .create_window(attrs)
                 .map_err(|e| err("creating window", e))?,
         );
+        let access = access::Access::new(event_loop, &window, self.shared.proxy.clone());
+        window.set_visible(true);
         self.app.startup_mark(StartupMark::WindowCreated);
         window.set_ime_allowed(true);
         let context = softbuffer::Context::new(window.clone())
@@ -493,6 +513,7 @@ impl<A: App> Runner<A> {
             .map_err(|e| err("creating draw surface", e))?;
         self.app.startup_mark(StartupMark::SurfaceCreated);
         Ok(WinState {
+            access,
             surface,
             _context: context,
             window,
@@ -568,7 +589,32 @@ impl<A: App> Runner<A> {
             window: &window,
             shared: &mut self.shared,
         });
+        // The tree describes what was just drawn.
+        self.update_access();
         Ok(())
+    }
+
+    /// Sends the app's accessibility tree, if an assistive technology is listening.
+    fn update_access(&mut self) {
+        if let Some(win) = &mut self.win {
+            let app = &mut self.app;
+            win.access.update(|| app.access_tree());
+        }
+    }
+
+    /// Answers the accessibility adapter's requests.
+    fn access_requests(&mut self, event_loop: &ActiveEventLoop) {
+        loop {
+            let Some(request) = self.win.as_ref().and_then(|w| w.access.try_recv()) else {
+                return;
+            };
+            match request {
+                access::Request::Tree => self.update_access(),
+                access::Request::Action(action) => {
+                    self.dispatch(event_loop, Event::Access(action));
+                }
+            }
+        }
     }
 
     fn mouse_button(&mut self, event_loop: &ActiveEventLoop, state: ElementState, button: WButton) {
@@ -666,6 +712,7 @@ impl<A: App> ApplicationHandler for Runner<A> {
         while let Ok(id) = self.shared.menu_events.1.try_recv() {
             self.dispatch(event_loop, Event::Menu(id));
         }
+        self.access_requests(event_loop);
         self.dispatch(event_loop, Event::Wake);
     }
 
@@ -678,6 +725,9 @@ impl<A: App> ApplicationHandler for Runner<A> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let Some(win) = &mut self.win {
+            win.access.window_event(&win.window, &event);
+        }
         match event {
             WindowEvent::RedrawRequested => {
                 if let Err(e) = self.redraw(event_loop) {

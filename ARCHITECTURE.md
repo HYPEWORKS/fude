@@ -4,7 +4,7 @@
 
 A cross-platform text editor that sits between Notepad and Notepad++. It should start instantly, respond instantly at any file size, use little memory, and look and feel polished on every platform.
 
-> Status: phase 5 (power features) done, plus a context menu and the application menus. Next: phase 6, release. Last updated 2026-11-10.
+> Status: phase 5 (power features) done, plus a context menu, the application menus and accessibility (screen readers, through AccessKit). Next: the rest of phase 6, release. Last updated 2026-11-11.
 >
 > This is the high-level design: goals, how the system fits together, and the decisions that cut across crates. Each crate's README has its own design, measurements and decisions ([Crates](#crates)). Parts that aren't built yet are marked *(planned)*.
 
@@ -38,14 +38,14 @@ A cross-platform text editor that sits between Notepad and Notepad++. It should 
 | Open a 500 MB file → first screen | < 100 ms | 23 ms (its first 64 KB, while the rest loads in the background) |
 | Open a 500 MB file → fully loaded and editable | < 1 s (SSD or warm cache) | 0.2 s |
 | Keypress → frame submitted | < 4 ms of fude's own work | 0.5 ms at 1080p, 1.4 ms at 4K (edit plus a full redraw, with syntax colors); file size doesn't change it, and inside a 100 MB line it's 1.3 ms |
-| Idle RAM, empty document, 1080p | < 30 MB | 14.6 MB (Linux, X11) |
+| Idle RAM, empty document, 1080p | < 30 MB | 14.6 MB (Linux, X11) before accessibility; the AccessKit adapter adds 2.3 MB (RSS at the first frame: 16.6 → 18.9 MB) |
 | RAM for an open, unedited file | ≈ 1.1 × file size | 1.04 × the text (UTF-8); 1.2 × for Shift_JIS, UTF-16 and Japanese text, most of the difference being the CJK fallback font |
 | Idle CPU | 0 % | 0 CPU ticks over 5 s once the caret stops blinking (10 s after input) |
-| Release binary | < 10 MB | 9.6 MB (Linux x86-64) |
+| Release binary | < 12 MB | 11.6 MB (Linux x86-64) |
 
 Measurements are from a fast desktop (32 threads, NVMe, warm page cache) and are a best case; laptops and Wayland/Windows/macOS numbers come next. The details and how to reproduce them are next to the code: [startup](crates/fude-platform/README.md#startup), [rendering](crates/fude-render/README.md#performance), [the buffer](crates/fude-buffer/README.md#performance), [large files](xtask/README.md#large-file-benchmark), [multiple cursors](crates/fude-editor/README.md#performance).
 
-**Binary size is the tightest budget.** Syntax highlighting (syntect and its grammars) is 2.4 MB of it; font fallback, clipboard and file dialogs 1.1 MB; search 0.4 MB; encodings 0.3 MB; phases 4 and 5 0.2 MB each; the menu bar 20 KB (`muda` is only built on macOS). The next large feature has to pay for itself (dropping grammars, or `opt-level = "s"` for cold code).
+**Binary size is the tightest budget.** It was 10 MB until accessibility, which is a release requirement and costs 1.9 MB on Linux (nearly all AT-SPI's D-Bus stack: `zbus`, async I/O, serde), even built with `opt-level = "z"` (2.8 MB without); the binary went from 9.7 MB to 11.6 MB, and the budget to 12 MB. Syntax highlighting (syntect and its grammars) is 2.4 MB of it; font fallback, clipboard and file dialogs 1.1 MB; search 0.4 MB; encodings 0.3 MB; phases 4 and 5 0.2 MB each; the menu bar 20 KB (`muda` is only built on macOS). That leaves 0.4 MB: the next large feature has to pay for itself. Trimming the 75 bundled grammars is the obvious place, deferred for now.
 
 ## UX principles
 
@@ -55,7 +55,7 @@ Measurements are from a fast desktop (32 threads, NVMe, warm page cache) and are
 - **Minimal chrome.** No toolbar. Tabs on top, status bar at the bottom. Status bar items (encoding, line endings, language, indentation) are to double as controls: click one to change it *(planned)*.
 - **Only modal when necessary.** Find/replace and go-to-line are inline bars, not dialogs. Long operations show progress and can be cancelled.
 - **Never lose work.** Hot exit, background backups of unsaved changes, atomic saves.
-- **Themes.** Light and dark follow the OS by default. Text contrast meets WCAG AA. Everything is crisp on high-DPI displays.
+- **Themes.** Light and dark follow the OS by default. Text contrast meets WCAG AA (4.5:1) on every background it's drawn on, which a test checks. Everything is crisp on high-DPI displays.
 
 ## Crates
 
@@ -127,7 +127,7 @@ Most of an editor's UI is the text view, and no general-purpose toolkit has a te
 - **The draw list is the seam.** The UI produces a flat list of rectangles and glyph images, which is also what a GPU backend would consume. If CPU rendering can't keep up (most likely on 5K Retina at 120 Hz), a Metal or Direct3D 11 backend can be added without touching the UI.
 - **Native where it matters:** file dialogs (`rfd`, using the XDG portal on Linux, so no GTK) and the macOS menu bar. Questions like "Save changes?" are drawn in the window, like menus on other platforms, so they look the same everywhere and need no helper programs.
 - **Every text input is an editor.** The find box, go to line and the command palette reuse `fude-editor`, so they get IME, undo, selection and the clipboard for free.
-- **Accessibility** *(planned, phase 6)*: widgets are to carry roles and labels so AccessKit can be wired up.
+- **Accessibility:** a custom-drawn UI is invisible to screen readers unless it describes itself, so every widget does, as an [AccessKit](https://accesskit.dev) tree: roles, names, states, bounds, and text with its selection ([fude-ui](crates/fude-ui/README.md#accessibility)). AccessKit answers each OS's accessibility API (UI Automation, NSAccessibility, AT-SPI) from it ([fude-platform](crates/fude-platform/README.md#accessibility)). The tree is built only while an assistive technology is listening, after each frame, so without one it costs nothing; with one, a document describes only the rows on screen, so it costs the same at any file size.
 
 ## Commands
 
@@ -179,6 +179,7 @@ Details: [fude-platform](crates/fude-platform/README.md) (windowing, Wayland dro
 - **Fuzzing:** three `cargo-fuzz` targets for the buffer ([fuzz](fuzz/README.md)).
 - **Benchmarks:** startup, rendering, typing, the buffer, and a generated large-file corpus ([xtask](xtask/README.md)).
 - **UI test:** `cargo xtask ui-test` drives the real window through X11 and checks the files it saves (26 checks).
+- **Accessibility tests** read the tree back with `accesskit_consumer` (what the OS adapters use), which also checks it's valid: the document's text and selection, focus through the find bar, palette, menus and dialogs, and that only the rows on screen are described.
 - **Pixel snapshot tests** for the renderer and widgets *(planned; CI uploads a screenshot per platform, nothing compares them yet)*.
 - **CI** on Windows, macOS and Linux: formatting, clippy, tests, a release build, the render and typing benchmarks, and the large-file benchmark on the small corpus, which fails a missed budget on Linux. On Linux under Xvfb, the startup benchmark (report-only until there's a baseline for runner noise) and the UI test. A FreeBSD build and tests in a VM, and a 45-second fuzz run per target.
 
@@ -193,7 +194,7 @@ Details: [fude-platform](crates/fude-platform/README.md) (windowing, Wayland dro
 - Formats: encoding and line-ending detection and conversion, syntax highlighting (75 bundled grammars), large files up to hundreds of MB.
 - Tools: built-in text tools and external tools.
 
-**v1.x:** find in files, split view, compare files (side-by-side diff), bookmarks, code folding, highlight all occurrences, macros, spell check, screen reader support via AccessKit.
+**v1.x:** find in files, split view, compare files (side-by-side diff), bookmarks, code folding, highlight all occurrences, macros, spell check.
 
 **Later:** paged mode for multi-GB files, hex view, GPU rendering backend (only if measurements call for it).
 
@@ -218,7 +219,7 @@ Details: [fude-platform](crates/fude-platform/README.md) (windowing, Wayland dro
 | Text rendering quality from a pure-Rust stack (ClearType expectations; CJK and emoji fallback) | Native rasterizers (DirectWrite, CoreText) inside `fude-text` if needed |
 | CPU rendering on high-DPI, high-refresh displays | Damage tracking, scroll blits; measured in phase 0; GPU backend as plan B |
 | Linux without GTK: Wayland client-side decorations, X11 IME, systems without an XDG portal | Our own title bar on Wayland; dialog fallbacks |
-| Accessibility in a custom-drawn UI is real work | Roles and labels on widgets; AccessKit (phase 6) |
+| Accessibility in a custom-drawn UI is real work | Done through AccessKit: every widget describes itself, tested by reading the tree back with AccessKit's own consumer, and on Linux over AT-SPI. Not yet tried with NVDA, Narrator or VoiceOver |
 | Very long lines (minified files) | Done in phase 4: lines are laid out in pieces; a keystroke in a 100 MB line costs 1.3 ms |
 
 ## Dependencies
@@ -241,7 +242,7 @@ Each is evaluated for startup, RAM and binary size when introduced.
 | `encoding_rs`, `chardetng` | Encodings and detection | fude-buffer |
 | `memchr` | Fast byte scanning | fude-buffer |
 | `toml` | Settings | fude |
-| `accesskit` | Accessibility (planned) | |
+| `accesskit`, `accesskit_winit` | Accessibility: the tree, and each OS's API for it | fude-ui (the tree), fude-platform (the adapter) |
 
 ## Decision log
 
@@ -257,4 +258,6 @@ Decisions that shape the whole project. Each crate's README logs its own.
 | 2026-11-07 | No plugin API in v1. Extensibility through built-in tools, data files and external tools. |
 | 2026-11-07 | CPU rendering confirmed by phase 0 measurements. |
 | 2026-11-07 | Apache-2.0 license. |
+| 2026-11-11 | Accessibility through AccessKit (`accesskit_winit`, as egui and Bevy use) rather than code per OS: it does the hard part, each OS's API and its text interfaces. The tree is built after each frame, only while an assistive technology listens; documents describe the rows on screen, not the file. Its crates are built with `opt-level = "z"`; on Linux it costs 1.9 MB of binary. |
+| 2026-11-11 | The binary budget goes from 10 MB to 12 MB, for accessibility's 1.9 MB on Linux, rather than paying for it now by dropping syntax grammars (deferred). |
 | 2026-11-09 | Application menus: drawn in the window on Windows, Linux and BSD, below which the tabs move down 28 px; the native menu bar on macOS through `muda` (Tauri's menu crate, macOS-only dependency) rather than hand-written AppKit code, which would be another `unsafe` module. Shortcuts become key equivalents there, so a menu item and its key always do the same thing; a shortcut an external tool takes over is left off its built-in item. |

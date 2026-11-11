@@ -28,6 +28,9 @@ harfrust = "0.15.0"
 rustc-hash = "2"
 arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
 rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal", "wayland"] }
+# Accessibility: the tree screen readers read, through each OS's API.
+accesskit = "0.25.2"
+accesskit_winit = { version = "0.34.2", default-features = false, features = ["accesskit_unix", "async-io", "rwh_06"] }
 # The macOS menu bar (only built there).
 muda = { version = "0.21.2", default-features = false }
 fontique = { version = "0.12.0", features = ["fontconfig-dlopen"] }
@@ -54,6 +57,77 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "unwind" # events and drawing run under catch_unwind (fude/README.md, "Fault isolation")
+
+# Accessibility is cold code next to the editor, and on Linux most of it is AT-SPI's D-Bus
+# stack (zbus): optimized for size, it adds 1.9 MB to the binary instead of 2.8 MB.
+[profile.release.package.accesskit]
+opt-level = "z"
+[profile.release.package.accesskit_atspi_common]
+opt-level = "z"
+[profile.release.package.accesskit_consumer]
+opt-level = "z"
+[profile.release.package.accesskit_unix]
+opt-level = "z"
+[profile.release.package.accesskit_winit]
+opt-level = "z"
+[profile.release.package.async-broadcast]
+opt-level = "z"
+[profile.release.package.async-channel]
+opt-level = "z"
+[profile.release.package.async-executor]
+opt-level = "z"
+[profile.release.package.async-io]
+opt-level = "z"
+[profile.release.package.async-lock]
+opt-level = "z"
+[profile.release.package.async-process]
+opt-level = "z"
+[profile.release.package.async-signal]
+opt-level = "z"
+[profile.release.package.async-task]
+opt-level = "z"
+[profile.release.package.atomic-waker]
+opt-level = "z"
+[profile.release.package.atspi]
+opt-level = "z"
+[profile.release.package.atspi-common]
+opt-level = "z"
+[profile.release.package.atspi-proxies]
+opt-level = "z"
+[profile.release.package.blocking]
+opt-level = "z"
+[profile.release.package.concurrent-queue]
+opt-level = "z"
+[profile.release.package.endi]
+opt-level = "z"
+[profile.release.package.enumflags2]
+opt-level = "z"
+[profile.release.package.event-listener]
+opt-level = "z"
+[profile.release.package.event-listener-strategy]
+opt-level = "z"
+[profile.release.package.futures-core]
+opt-level = "z"
+[profile.release.package.futures-io]
+opt-level = "z"
+[profile.release.package.futures-lite]
+opt-level = "z"
+[profile.release.package.futures-util]
+opt-level = "z"
+[profile.release.package.ordered-stream]
+opt-level = "z"
+[profile.release.package.parking]
+opt-level = "z"
+[profile.release.package.piper]
+opt-level = "z"
+[profile.release.package.polling]
+opt-level = "z"
+[profile.release.package.zbus]
+opt-level = "z"
+[profile.release.package.zbus_names]
+opt-level = "z"
+[profile.release.package.zvariant]
+opt-level = "z"
 
 # Keep debug builds usable: rasterization and shaping are slow unoptimized.
 [profile.dev.package."*"]

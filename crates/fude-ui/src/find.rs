@@ -7,10 +7,13 @@
 
 use std::time::Instant;
 
+use accesskit::{ActionRequest, Live, NodeId, Role};
 use fude_editor::Query;
 use fude_platform::{Ime, Key, KeyInput, Modifiers};
 use fude_render::Rect;
 
+use crate::Shortcut;
+use crate::access::{self, AccessTree, Field, Part};
 use crate::input::{ImeChange, InputKey, TextInput, button};
 use crate::painter::Painter;
 
@@ -61,6 +64,39 @@ enum Button {
     ReplaceAll,
 }
 
+/// Every button, in the order assistive technologies see them (reading order).
+const BUTTONS: [Button; 9] = [
+    Button::ToggleReplace,
+    Button::Case,
+    Button::Word,
+    Button::Regex,
+    Button::Previous,
+    Button::Next,
+    Button::Close,
+    Button::Replace,
+    Button::ReplaceAll,
+];
+
+impl Button {
+    /// What assistive technologies call it, and its keys (as [`FindBar::key`] takes
+    /// them), in the platform's notation.
+    fn describe(self) -> (&'static str, String) {
+        let (label, keys) = match self {
+            Button::ToggleReplace => ("Replace mode", ""),
+            Button::Case => ("Match case", "alt+c"),
+            Button::Word => ("Whole word", "alt+w"),
+            Button::Regex => ("Regular expression", "alt+r"),
+            Button::Previous => ("Previous match", "shift+enter"),
+            Button::Next => ("Next match", "enter"),
+            Button::Close => ("Close", "escape"),
+            Button::Replace => ("Replace", "enter"),
+            Button::ReplaceAll => ("Replace all", "ctrl+alt+enter"),
+        };
+        let keys = Shortcut::parse(keys).map_or_else(|_| String::new(), |s| s.label());
+        (label, keys)
+    }
+}
+
 const ROW: f32 = 34.0;
 const PAD: f32 = 6.0;
 
@@ -76,6 +112,8 @@ pub struct FindBar {
     buttons: Vec<(Rect, Button)>,
     hover: Option<Button>,
     area: Rect,
+    /// Where the match count shows.
+    status_rect: Rect,
 }
 
 impl Default for FindBar {
@@ -98,6 +136,7 @@ impl FindBar {
             buttons: Vec::new(),
             hover: None,
             area: Rect::default(),
+            status_rect: Rect::default(),
         }
     }
 
@@ -246,35 +285,7 @@ impl FindBar {
             .find(|(r, _)| r.contains(x as i32, y as i32))
             .map(|&(_, b)| b);
         if let Some(b) = hit {
-            return Some(match b {
-                Button::ToggleReplace => {
-                    self.show_replace = !self.show_replace;
-                    let field = if self.show_replace {
-                        FindField::Replace
-                    } else {
-                        FindField::Find
-                    };
-                    self.set_focus(field, now);
-                    FindAction::Redraw
-                }
-                Button::Case => {
-                    self.case_sensitive = !self.case_sensitive;
-                    FindAction::QueryChanged
-                }
-                Button::Word => {
-                    self.whole_word = !self.whole_word;
-                    FindAction::QueryChanged
-                }
-                Button::Regex => {
-                    self.regex = !self.regex;
-                    FindAction::QueryChanged
-                }
-                Button::Previous => FindAction::Previous,
-                Button::Next => FindAction::Next,
-                Button::Close => FindAction::Close,
-                Button::Replace => FindAction::ReplaceOne,
-                Button::ReplaceAll => FindAction::ReplaceAll,
-            });
+            return Some(self.press(b, now));
         }
         let field = if self.find.contains(x, y) {
             FindField::Find
@@ -287,6 +298,39 @@ impl FindBar {
         self.focused_input()
             .mouse_down(p, x, clicks, modifiers, now);
         Some(FindAction::Redraw)
+    }
+
+    /// What a button does.
+    fn press(&mut self, b: Button, now: Instant) -> FindAction {
+        match b {
+            Button::ToggleReplace => {
+                self.show_replace = !self.show_replace;
+                let field = if self.show_replace {
+                    FindField::Replace
+                } else {
+                    FindField::Find
+                };
+                self.set_focus(field, now);
+                FindAction::Redraw
+            }
+            Button::Case => {
+                self.case_sensitive = !self.case_sensitive;
+                FindAction::QueryChanged
+            }
+            Button::Word => {
+                self.whole_word = !self.whole_word;
+                FindAction::QueryChanged
+            }
+            Button::Regex => {
+                self.regex = !self.regex;
+                FindAction::QueryChanged
+            }
+            Button::Previous => FindAction::Previous,
+            Button::Next => FindAction::Next,
+            Button::Close => FindAction::Close,
+            Button::Replace => FindAction::ReplaceOne,
+            Button::ReplaceAll => FindAction::ReplaceAll,
+        }
     }
 
     pub fn mouse_move(&mut self, p: &mut Painter, x: f32, y: f32) -> bool {
@@ -305,6 +349,116 @@ impl FindBar {
     pub fn mouse_up(&mut self) {
         self.find.mouse_up();
         self.replace.mouse_up();
+    }
+
+    /// What the status area says, and whether it's a problem.
+    fn status_text(&self) -> (String, bool) {
+        match &self.status {
+            FindStatus::Empty => (String::new(), false),
+            FindStatus::Counting => ("…".to_owned(), false),
+            FindStatus::NoMatches => ("No results".to_owned(), true),
+            FindStatus::Error(_) => ("Invalid regex".to_owned(), true),
+            FindStatus::Count {
+                current: Some(c),
+                total,
+            } => (format!("{c} of {total}"), false),
+            FindStatus::Count {
+                current: None,
+                total,
+            } => (format!("{total} found"), false),
+        }
+    }
+
+    /// Describes the bar for assistive technologies, from the last frame, in reading
+    /// order: the replace mode button, the find field, the options, the match count and
+    /// the find buttons, then the replace field and its buttons.
+    pub fn access(&mut self, p: &mut Painter, tree: &mut AccessTree) -> NodeId {
+        let invalid = matches!(self.status, FindStatus::Error(_));
+        let find = self
+            .find
+            .access(p, tree, Field::Find, "Find", "Find", invalid);
+        let replace = self.show_replace.then(|| {
+            self.replace
+                .access(p, tree, Field::Replace, "Replace with", "Replace", false)
+        });
+        let mut children = Vec::new();
+        for (index, &b) in BUTTONS.iter().enumerate() {
+            match b {
+                Button::Case => children.push(find),
+                Button::Replace => children.extend(replace),
+                _ => {}
+            }
+            if let Some(&(rect, _)) = self.buttons.iter().find(|(_, x)| *x == b) {
+                let (label, keys) = b.describe();
+                let mut button = access::clickable(Role::Button, label, rect);
+                match b {
+                    Button::Case => button.set_toggled(self.case_sensitive.into()),
+                    Button::Word => button.set_toggled(self.whole_word.into()),
+                    Button::Regex => button.set_toggled(self.regex.into()),
+                    Button::ToggleReplace => button.set_expanded(self.show_replace),
+                    _ => {}
+                }
+                if !keys.is_empty() {
+                    button.set_keyboard_shortcut(keys);
+                }
+                children.push(tree.push(Part::FindButton(index), button));
+            }
+            if b == Button::Regex {
+                // The match count, read out as it changes.
+                let value = match &self.status {
+                    FindStatus::Error(e) => format!("Invalid regex: {e}"),
+                    FindStatus::Counting => "Counting matches".to_owned(),
+                    _ => self.status_text().0,
+                };
+                let mut status = access::text_node(&value, self.status_rect);
+                status.set_live(Live::Polite);
+                children.push(tree.push(Part::FindStatus, status));
+            }
+        }
+        let mut bar = access::labeled(Role::Group, "Find", self.area);
+        bar.set_children(children);
+        tree.push(Part::FindBar, bar)
+    }
+
+    /// Does what an assistive technology asks of a part of the bar.
+    pub fn access_action(
+        &mut self,
+        part: Part,
+        request: &ActionRequest,
+        now: Instant,
+    ) -> Option<FindAction> {
+        match part {
+            Part::FindButton(i) if request.action == accesskit::Action::Click => {
+                let &b = BUTTONS.get(i)?;
+                // A button only works while it's on screen.
+                self.buttons.iter().any(|(_, x)| *x == b).then_some(())?;
+                Some(self.press(b, now))
+            }
+            Part::Field(field @ (Field::Find | Field::Replace)) => {
+                let which = if field == Field::Find {
+                    FindField::Find
+                } else {
+                    FindField::Replace
+                };
+                if which == FindField::Replace && !self.show_replace {
+                    return None;
+                }
+                if request.action == accesskit::Action::Focus {
+                    self.set_focus(which, now);
+                    return Some(FindAction::Redraw);
+                }
+                let input = match which {
+                    FindField::Find => &mut self.find,
+                    FindField::Replace => &mut self.replace,
+                };
+                match input.access_action(field, request, now) {
+                    InputKey::Changed if which == FindField::Find => Some(FindAction::QueryChanged),
+                    InputKey::Changed | InputKey::Moved => Some(FindAction::Redraw),
+                    InputKey::Ignored => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     pub fn draw(&mut self, p: &mut Painter, area: Rect, now: Instant) {
@@ -350,6 +504,7 @@ impl FindBar {
         let prev = place(small, Some(Button::Previous), &mut self.buttons);
         let status_w = p.px(120.0);
         let status = place(status_w, None, &mut self.buttons);
+        self.status_rect = status;
         let regex = place(small, Some(Button::Regex), &mut self.buttons);
         let word = place(small, Some(Button::Word), &mut self.buttons);
         let case = place(small, Some(Button::Case), &mut self.buttons);
@@ -376,20 +531,7 @@ impl FindBar {
             false,
         );
 
-        let (text, error) = match &self.status {
-            FindStatus::Empty => (String::new(), false),
-            FindStatus::Counting => ("…".to_owned(), false),
-            FindStatus::NoMatches => ("No results".to_owned(), true),
-            FindStatus::Error(_) => ("Invalid regex".to_owned(), true),
-            FindStatus::Count {
-                current: Some(c),
-                total,
-            } => (format!("{c} of {total}"), false),
-            FindStatus::Count {
-                current: None,
-                total,
-            } => (format!("{total} found"), false),
-        };
+        let (text, error) = self.status_text();
         let fitted = p.fit(&text, &style, status.w as f32);
         let w = p.measure(&fitted, &style);
         let baseline = p.center_baseline(status.y, status.h, &style);

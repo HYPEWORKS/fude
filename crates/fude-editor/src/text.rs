@@ -97,11 +97,20 @@ impl Unit {
 
 /// What word motions stop between.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Class {
+pub enum Class {
     Word,
     Punct,
     Space,
     LineBreak,
+}
+
+/// The class of a character, as word motions see it. A byte that isn't valid UTF-8 is
+/// punctuation.
+pub fn class_of(c: Option<char>) -> Class {
+    match c {
+        Some(c) => Unit::Char(c).class(),
+        None => Unit::Invalid(0).class(),
+    }
 }
 
 /// Decodes `bytes` into units, starting each window on a character boundary.

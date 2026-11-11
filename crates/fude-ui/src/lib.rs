@@ -1,6 +1,7 @@
 //! fude's UI: the editor view, the window chrome and dialogs, drawn into a
 //! `fude-render` draw list with one theme.
 
+mod access;
 mod chrome;
 mod context_menu;
 mod display;
@@ -17,7 +18,8 @@ mod tabs;
 mod theme;
 mod view;
 
-pub use chrome::{STATUS_BAR_HEIGHT, StatusMessage, status_bar};
+pub use access::{AccessTree, Field, Part, Text, bounds};
+pub use chrome::{STATUS_BAR_HEIGHT, StatusBarRects, StatusMessage, status_bar, status_bar_access};
 pub use context_menu::{ContextMenu, ContextMenuItem};
 pub use find::{FindAction, FindBar, FindField, FindStatus};
 pub use input::{ImeChange, InputKey, TextInput};

@@ -4,16 +4,18 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use fude_editor::Selections;
+use fude_platform::accesskit::{self, ActionRequest, Node, Role, TreeUpdate};
 use fude_platform::{
     Canvas, Ctx, CursorShape, Event, Key, KeyInput, MenuBarSpec, MenuCommand, MenuItemSpec,
     MenuRole, MouseButton, NATIVE_MENU_BAR, OsTheme, ScrollUnit, Waker,
 };
 use fude_render::Rect;
 use fude_ui::{
-    Action, ContextMenu, ContextMenuItem, EditorView, FindBar, MENU_BAR_HEIGHT, MenuBar,
-    MenuBarEvent, MenuEntry, Painter, Palette, PaletteAction, PaletteItem, Prompt, PromptInput,
-    STATUS_BAR_HEIGHT, Shortcut, StatusMessage, TAB_STRIP_HEIGHT, TabEvent, TabInfo, TabStrip,
-    action_for, status_bar,
+    AccessTree, Action, ContextMenu, ContextMenuItem, EditorView, Field, FindBar, FindField,
+    MENU_BAR_HEIGHT, MenuBar, MenuBarEvent, MenuEntry, Painter, Palette, PaletteAction,
+    PaletteItem, Part, Prompt, PromptInput, STATUS_BAR_HEIGHT, Shortcut, StatusBarRects,
+    StatusMessage, TAB_STRIP_HEIGHT, TabEvent, TabInfo, TabStrip, Text, action_for, status_bar,
+    status_bar_access,
 };
 
 use crate::config::{self, Config};
@@ -66,6 +68,17 @@ pub enum Question {
 /// Whether a command can run now, and for one that is on or off, whether it's on.
 type CommandState = (bool, Option<bool>);
 
+/// What the status bar shows.
+#[derive(Clone, Debug, Default)]
+struct Status {
+    position: String,
+    message: Option<StatusMessage>,
+    /// The message is loading progress (not read out as it changes).
+    loading: bool,
+    /// Encoding, line endings, language.
+    items: Vec<String>,
+}
+
 pub struct Fude {
     pub docs: Vec<Doc>,
     pub active: usize,
@@ -98,6 +111,9 @@ pub struct Fude {
     native_menu_stale: bool,
     /// Window bounds from the last frame, for placing popups before they are drawn.
     window_area: Rect,
+    /// The status bar in the last frame: what it said and where, for assistive
+    /// technologies.
+    status_shown: (Status, StatusBarRects),
     /// Started on first use (it needs a waker), so startup doesn't pay for it.
     highlighter: Option<fude_syntax::Highlighter>,
     /// Where the session and backups live.
@@ -147,6 +163,7 @@ impl Fude {
             native_menu: Vec::new(),
             native_menu_stale: true,
             window_area: Rect::default(),
+            status_shown: Default::default(),
             highlighter: None,
             state_dir: None,
             instance: None,
@@ -385,27 +402,15 @@ impl Fude {
                 .draw(p, Rect::new(0, editor.bottom(), w, find_h), now);
         }
 
-        let editor_state = &doc.view.editor;
-        let format = editor_state.format();
-        let line_endings = if editor_state.text().line_ending_counts().is_mixed() {
-            "Mixed".to_owned()
-        } else {
-            format.line_ending.name().to_owned()
-        };
-        let items = [format.encoding_label(), line_endings, doc.language.clone()];
-        let position = doc.view.position_label();
-        let loading = doc.loading.as_ref().map(|l| StatusMessage {
-            text: format!("Loading {}%…", l.percent()),
-            error: false,
-        });
-        let message = loading.as_ref().or(self.message.as_ref().map(|(m, _)| m));
-        status_bar(
+        let status = status(doc, self.message.as_ref().map(|(m, _)| m));
+        let rects = status_bar(
             p,
             Rect::new(0, h - status_h, w, status_h),
-            &position,
-            message,
-            &items,
+            &status.position,
+            status.message.as_ref(),
+            &status.items,
         );
+        self.status_shown = (status, rects);
 
         if self.focus == Focus::Palette {
             self.palette.draw(p, Rect::new(0, 0, w, h), top, now);
@@ -977,6 +982,7 @@ impl Fude {
                 self.drop_hover = on;
                 true
             }
+            Event::Access(request) => self.access_action(ctx, request, now),
         };
         // Typing into a file that's still loading does nothing; say why.
         let refused = self.doc_mut().view.editor.take_refused();
@@ -1011,6 +1017,188 @@ impl Fude {
         }
         if redraw {
             ctx.request_redraw();
+        }
+    }
+
+    // --- Accessibility -------------------------------------------------------------
+
+    /// The accessibility tree: the window as the last frame drew it.
+    pub fn access_tree(&mut self) -> TreeUpdate {
+        let mut tree = AccessTree::new();
+        let mut children = Vec::new();
+        if !NATIVE_MENU_BAR {
+            children.push(self.menu_bar.access(&mut tree));
+        }
+        let names: Vec<(String, bool)> =
+            self.docs.iter().map(|d| (d.name(), d.modified())).collect();
+        let infos: Vec<TabInfo<'_>> = names
+            .iter()
+            .map(|(title, modified)| TabInfo {
+                title,
+                modified: *modified,
+            })
+            .collect();
+        children.push(
+            self.tabs
+                .access(&mut tree, &infos, self.active, Part::Editor.id()),
+        );
+        let label = self.doc().name();
+        let p = &mut self.painter;
+        children.push(self.docs[self.active].view.access(p, &mut tree, &label));
+        if self.find_state.open {
+            children.push(self.find.access(p, &mut tree));
+        }
+        let (status, rects) = &self.status_shown;
+        children.push(status_bar_access(
+            &mut tree,
+            rects,
+            &status.position,
+            status.message.as_ref(),
+            !status.loading,
+            &status.items,
+        ));
+        if self.focus == Focus::Palette {
+            children.push(self.palette.access(p, &mut tree));
+        }
+        // Its items have the ids of the menu bar's: only one is ever open.
+        if !self.menu_bar.is_open() {
+            children.extend(self.context_menu.access(&mut tree, "Context menu"));
+        }
+        if let Some((prompt, _)) = &self.prompt {
+            children.push(prompt.access(&mut tree));
+        }
+        let mut window = Node::new(Role::Window);
+        window.set_label(self.window_title());
+        window.set_bounds(fude_ui::bounds(self.window_area));
+        // Inherited by all text: needed for where characters are (magnifiers follow the
+        // caret by it).
+        window.set_text_direction(accesskit::TextDirection::LeftToRight);
+        window.set_children(children);
+        tree.push(Part::Window, window);
+        tree.finish(self.access_focus())
+    }
+
+    /// What has keyboard focus, as assistive technologies see it: a dialog's button, an
+    /// open menu's item, or the focused field.
+    fn access_focus(&self) -> Part {
+        if let Some((prompt, _)) = &self.prompt {
+            return prompt.access_focus();
+        }
+        if let Some(part) = self
+            .menu_bar
+            .access_focus()
+            .or(self.context_menu.access_focus())
+        {
+            return part;
+        }
+        match self.focus {
+            Focus::Editor => Part::Editor,
+            Focus::Find => Part::Field(match self.find.focus {
+                FindField::Find => Field::Find,
+                FindField::Replace => Field::Replace,
+            }),
+            Focus::Palette => Part::Field(Field::Palette),
+        }
+    }
+
+    /// Gives the document keyboard focus, from the find bar or the palette.
+    fn focus_editor(&mut self, now: Instant) {
+        match self.focus {
+            Focus::Palette => self.close_palette(true, now),
+            Focus::Find => {
+                self.focus = Focus::Editor;
+                self.find.blur(now);
+                self.doc_mut().view.set_focused(true, now);
+            }
+            Focus::Editor => {}
+        }
+    }
+
+    /// Does what an assistive technology asks of a node: focus it, click it, select text
+    /// in it. Returns whether to redraw.
+    fn access_action(&mut self, ctx: &mut Ctx<'_>, request: ActionRequest, now: Instant) -> bool {
+        let Some(part) = Part::of(request.target_node) else {
+            return false;
+        };
+        // A dialog takes nothing else, as it takes no other input.
+        if let Some((prompt, _)) = &mut self.prompt {
+            match prompt.access_action(part, &request) {
+                PromptInput::Chose(choice) => self.answer(ctx, choice),
+                PromptInput::Handled => {}
+                PromptInput::Ignored => return false,
+            }
+            return true;
+        }
+        match part {
+            Part::MenuTitle(_) => {
+                self.context_menu.close();
+                let event = self.menu_bar.access_action(part, &request);
+                self.menu_bar_event(ctx, event, now)
+            }
+            Part::MenuItem(_) if self.menu_bar.is_open() => {
+                let event = self.menu_bar.access_action(part, &request);
+                self.menu_bar_event(ctx, event, now)
+            }
+            Part::MenuItem(_) => {
+                if let Some(action) = self.context_menu.access_action(part, &request) {
+                    self.action(ctx, action, now);
+                }
+                true
+            }
+            Part::Tab(_) | Part::TabClose(_) => {
+                let event = self.tabs.access_action(part, &request);
+                let any = event.is_some();
+                self.tab_event(ctx, event);
+                any
+            }
+            Part::Editor | Part::Run(Text::Editor, _) => {
+                self.close_menus();
+                self.focus_editor(now);
+                if request.action == accesskit::Action::ShowContextMenu {
+                    if let Some((x, y)) = self.docs[self.active]
+                        .view
+                        .context_menu_position(&mut self.painter)
+                    {
+                        self.show_editor_context_menu(x, y, now);
+                    }
+                    return true;
+                }
+                let version = self.doc().view.editor.buffer().version();
+                self.doc_mut().view.access_action(&request, now);
+                if self.find_state.open && self.doc().view.editor.buffer().version() != version {
+                    self.restart_count();
+                }
+                true
+            }
+            Part::FindButton(_) | Part::Field(Field::Find | Field::Replace)
+                if self.find_state.open =>
+            {
+                self.close_menus();
+                if matches!(part, Part::Field(_)) && self.focus != Focus::Find {
+                    if self.focus == Focus::Palette {
+                        self.close_palette(true, now);
+                    }
+                    self.focus = Focus::Find;
+                    self.doc_mut().view.set_focused(false, now);
+                }
+                match self.find.access_action(part, &request, now) {
+                    Some(action) => {
+                        self.find_action(action, now);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            Part::PaletteItem(_) | Part::Field(Field::Palette) if self.focus == Focus::Palette => {
+                match self.palette.access_action(part, &request, now) {
+                    Some(action) => {
+                        self.palette_action(ctx, action, now);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
         }
     }
 
@@ -1488,6 +1676,28 @@ impl Fude {
     }
 }
 
+/// What the status bar says about a document: the cursor's position, a message (or
+/// loading progress), encoding, line endings and language.
+fn status(doc: &crate::doc::Doc, message: Option<&StatusMessage>) -> Status {
+    let editor = &doc.view.editor;
+    let format = editor.format();
+    let line_endings = if editor.text().line_ending_counts().is_mixed() {
+        "Mixed".to_owned()
+    } else {
+        format.line_ending.name().to_owned()
+    };
+    let loading = doc.loading.as_ref().map(|l| StatusMessage {
+        text: format!("Loading {}%…", l.percent()),
+        error: false,
+    });
+    Status {
+        position: doc.view.position_label(),
+        loading: loading.is_some(),
+        message: loading.or_else(|| message.cloned()),
+        items: vec![format.encoding_label(), line_endings, doc.language.clone()],
+    }
+}
+
 /// Applies settings and zoom to a view.
 fn configure_view(config: &Config, zoom: f32, view: &mut EditorView) {
     view.set_font_size(config.font_size + zoom);
@@ -1559,6 +1769,140 @@ mod tests {
             .find(|item| item.action == Some(action))
             .unwrap()
             .enabled
+    }
+
+    fn access(app: &mut Fude) -> accesskit_consumer::Tree {
+        draw(app);
+        // Panics if the tree isn't valid (a child twice, a missing node, focus outside).
+        accesskit_consumer::Tree::new(app.access_tree(), true)
+    }
+
+    fn node(tree: &accesskit_consumer::Tree, part: Part) -> accesskit_consumer::NodeRef<'_> {
+        tree.state()
+            .node_by_tree_local_id(part.id(), accesskit::TreeId::ROOT)
+            .unwrap_or_else(|| panic!("no {part:?}"))
+    }
+
+    fn focus(tree: &accesskit_consumer::Tree) -> Option<Part> {
+        Part::of(tree.state().focus()?.locate().0)
+    }
+
+    #[test]
+    fn the_tree_holds_the_document_and_its_selection() {
+        let mut app = Fude::new(Config::default());
+        let now = Instant::now();
+        let view = &mut app.doc_mut().view;
+        view.editor.insert("alpha beta\ngamma\n", now);
+        view.editor.select(2..8);
+        let tree = access(&mut app);
+        let editor = node(&tree, Part::Editor);
+        assert_eq!(editor.role(), Role::MultilineTextInput);
+        assert_eq!(editor.label().as_deref(), Some("Untitled"));
+        assert_eq!(editor.document_range().text(), "alpha beta\ngamma\n");
+        let selection = editor.text_selection().unwrap();
+        assert_eq!(selection.text(), "pha be");
+        // Where it is on screen, for magnifiers and highlight cursors.
+        let boxes = selection.bounding_boxes();
+        let caret = app.doc().view.caret_rect().unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert!(boxes[0].x1 > boxes[0].x0 + 20.0);
+        assert!(
+            (boxes[0].x1 - f64::from(caret.x)).abs() < 2.0,
+            "{boxes:?} {caret:?}"
+        );
+        assert_eq!(focus(&tree), Some(Part::Editor));
+        let tab = node(&tree, Part::Tab(0));
+        assert!(tab.is_selected() == Some(true));
+        assert_eq!(tab.description().as_deref(), Some("Unsaved changes"));
+
+        // A message is read out.
+        app.say("Saved", false);
+        let tree = access(&mut app);
+        let message = node(&tree, Part::StatusItem(1));
+        assert_eq!(message.value().as_deref(), Some("Saved"));
+        assert_eq!(message.live(), accesskit::Live::Polite);
+        assert_eq!(
+            node(&tree, Part::StatusItem(0)).value().as_deref(),
+            Some("Ln 1, Col 9 (6 selected)")
+        );
+    }
+
+    #[test]
+    fn only_the_rows_on_screen_are_described() {
+        let mut app = Fude::new(Config::default());
+        let now = Instant::now();
+        let text: String = (1..=100_000).map(|i| format!("line {i}\n")).collect();
+        app.doc_mut().view.editor.insert(&text, now);
+        app.go_to(50_000, None, now);
+        let tree = access(&mut app);
+        let editor = node(&tree, Part::Editor);
+        let runs = editor.children().count();
+        assert!((10..100).contains(&runs), "{runs} runs");
+        let shown = editor.document_range().text();
+        assert!(shown.contains("line 50000\n"), "{shown}");
+        let caret = editor.text_selection().unwrap();
+        assert!(caret.is_degenerate());
+        assert!(
+            caret
+                .start()
+                .inner_node()
+                .value()
+                .is_some_and(|v| v == "line 50000\n")
+        );
+    }
+
+    #[test]
+    fn focus_follows_the_find_bar_palette_menus_and_dialogs() {
+        let mut app = Fude::new(Config::default());
+        let now = Instant::now();
+        app.open_find(true, now);
+        let tree = access(&mut app);
+        assert_eq!(focus(&tree), Some(Part::Field(Field::Find)));
+        assert_eq!(
+            node(&tree, Part::Field(Field::Replace)).role(),
+            Role::TextInput
+        );
+        let case = node(&tree, Part::FindButton(1));
+        assert_eq!(case.label().as_deref(), Some("Match case"));
+        assert_eq!(case.toggled(), Some(accesskit::Toggled::False));
+        app.close_find(now);
+
+        app.open_palette("", now);
+        let tree = access(&mut app);
+        // The selected command reads as focused while typing goes to the field.
+        assert_eq!(focus(&tree), Some(Part::PaletteItem(0)));
+        assert!(node(&tree, Part::PaletteItem(0)).label().is_some());
+        app.close_palette(true, now);
+
+        if !NATIVE_MENU_BAR {
+            let f10 = KeyInput {
+                key: Key::F(10),
+                pressed: true,
+                repeat: false,
+                modifiers: fude_platform::Modifiers::default(),
+                text: None,
+                base: None,
+            };
+            assert_eq!(app.menu_bar.activation(&f10), MenuBarEvent::Open(0));
+            app.open_menu(0, now);
+            let tree = access(&mut app);
+            let title = node(&tree, Part::MenuTitle(0));
+            assert_eq!(title.label().as_deref(), Some("File"));
+            assert_eq!(title.data().is_expanded(), Some(true));
+            assert!(matches!(focus(&tree), Some(Part::MenuItem(0))));
+            app.close_menus();
+        }
+
+        app.about();
+        let tree = access(&mut app);
+        assert_eq!(focus(&tree), Some(Part::PromptButton(1)));
+        let dialog = node(&tree, Part::Prompt);
+        assert_eq!(dialog.role(), Role::AlertDialog);
+        assert_eq!(dialog.label().as_deref(), Some("fude 筆"));
+        assert_eq!(
+            tree.state().active_dialog().map(|d| d.id()),
+            Some(dialog.id())
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ A cross-platform text editor somewhere between Notepad and Notepad++: instant st
 - Hot exit: quitting never asks, and unsaved work comes back
 - Text tools, built in (sort, case, Base64, JSON, hashes…) or your own programs
 - Encodings, line endings and invalid bytes are kept exactly as they were
+- Screen readers and other assistive technologies see the whole UI, the text of documents included, through each OS's accessibility API
 
 ## Building
 

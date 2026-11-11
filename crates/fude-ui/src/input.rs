@@ -3,12 +3,14 @@
 
 use std::time::{Duration, Instant};
 
+use accesskit::{Action, ActionData, ActionRequest, Invalid, Node, NodeId, Role};
 use fude_buffer::{Format, Rope};
 use fude_editor::{Editor, MonoLayout, Motion, Selection, Selections, nearest, text as nav};
 use fude_platform::{Ime, Key, KeyInput, Modifiers};
 use fude_render::{Color, Rect};
 use fude_text::{LineLayout, TextStyle};
 
+use crate::access::{AccessTree, Field, Part, RowText, Text, TextRuns, bounds};
 use crate::painter::Painter;
 
 const BLINK: Duration = Duration::from_millis(530);
@@ -48,6 +50,8 @@ pub struct TextInput {
     preedit: Option<String>,
     dragging: bool,
     caret: Option<Rect>,
+    /// The text runs the field was last described with, for assistive technologies.
+    runs: TextRuns,
 }
 
 impl Default for TextInput {
@@ -69,6 +73,7 @@ impl TextInput {
             preedit: None,
             dragging: false,
             caret: None,
+            runs: TextRuns::default(),
         }
     }
 
@@ -385,6 +390,101 @@ impl TextInput {
             p.rect(caret, t.caret);
         }
         p.list.pop_clip();
+    }
+}
+
+impl TextInput {
+    /// Describes the field for assistive technologies: its text as it shows, and the
+    /// selection.
+    pub fn access(
+        &mut self,
+        p: &mut Painter,
+        tree: &mut AccessTree,
+        field: Field,
+        label: &str,
+        placeholder: &str,
+        invalid: bool,
+    ) -> NodeId {
+        let owner = Text::Field(field);
+        let text = self.text();
+        // Without the composition the last frame may have shown: it isn't text yet.
+        p.text.layout_line(&text, &self.style, &mut self.layout);
+        let origin = self.rect.x as f32 - self.scroll_x;
+        let layout = &self.layout;
+        let row = RowText {
+            bytes: text.as_bytes(),
+            start: 0,
+            line_break: b"",
+            before: None,
+            y: self.rect.y,
+            h: self.rect.h,
+        };
+        self.runs.clear();
+        let children = self.runs.push_row(tree, owner, &row, |at| {
+            origin
+                + layout
+                    .glyphs
+                    .iter()
+                    .find(|g| g.cluster as usize >= at)
+                    .map_or(layout.width, |g| g.x)
+        });
+        let mut node = Node::new(Role::TextInput);
+        node.set_label(label);
+        node.set_placeholder(placeholder);
+        node.set_value(text);
+        node.set_bounds(bounds(self.rect));
+        node.set_children(children);
+        node.set_clips_children();
+        if invalid {
+            node.set_invalid(Invalid::True);
+        }
+        for action in [
+            Action::Focus,
+            Action::SetTextSelection,
+            Action::ReplaceSelectedText,
+            Action::SetValue,
+        ] {
+            node.add_action(action);
+        }
+        let s = *self.editor.selections().primary();
+        if let Some(selection) = self.runs.selection(owner, s.anchor, s.head) {
+            node.set_text_selection(selection);
+        }
+        tree.push(Part::Field(field), node)
+    }
+
+    /// Does what an assistive technology asks of the field: selects text, types, or
+    /// replaces the text.
+    pub fn access_action(
+        &mut self,
+        field: Field,
+        request: &ActionRequest,
+        now: Instant,
+    ) -> InputKey {
+        let owner = Text::Field(field);
+        match (request.action, &request.data) {
+            (Action::SetTextSelection, Some(ActionData::SetTextSelection(selection))) => {
+                let anchor = self.runs.offset(owner, &selection.anchor);
+                let head = self.runs.offset(owner, &selection.focus);
+                let (Some(anchor), Some(head)) = (anchor, head) else {
+                    return InputKey::Ignored;
+                };
+                self.editor
+                    .set_selections(Selections::single(Selection::new(anchor, head)));
+                self.touched(now);
+                InputKey::Moved
+            }
+            (Action::ReplaceSelectedText, Some(ActionData::Value(text))) => {
+                self.paste(text, now);
+                InputKey::Changed
+            }
+            (Action::SetValue, Some(ActionData::Value(text))) => {
+                self.select_all();
+                self.paste(text, now);
+                InputKey::Changed
+            }
+            _ => InputKey::Ignored,
+        }
     }
 }
 

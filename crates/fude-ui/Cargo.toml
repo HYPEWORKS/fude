@@ -15,6 +15,8 @@ fude-text.workspace = true
 fude-platform.workspace = true
 fude-syntax.workspace = true
 fude-tools.workspace = true
+accesskit.workspace = true
+unicode-segmentation.workspace = true
 
 [lints]
 workspace = true

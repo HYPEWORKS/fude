@@ -6,11 +6,13 @@
 //! one; the arrows move through the items and across the menus, Enter runs, Escape
 //! closes.
 
+use accesskit::{Action as AkAction, ActionRequest, HasPopup, NodeId, Role};
 use fude_buffer::LineEnding;
 use fude_platform::{Key, KeyInput};
 use fude_render::Rect;
 use fude_tools::Tool;
 
+use crate::access::{self, AccessTree, Part};
 use crate::{Action, ContextMenu, ContextMenuItem, Painter};
 
 /// Logical height of the bar.
@@ -475,6 +477,64 @@ impl MenuBar {
 
     pub fn draw_menu(&mut self, p: &mut Painter) {
         self.menu.draw(p);
+    }
+
+    /// Describes the bar for assistive technologies: the titles, and under the open one,
+    /// its menu.
+    pub fn access(&self, tree: &mut AccessTree) -> NodeId {
+        let open = self.open_index();
+        let mut titles = Vec::new();
+        for (i, (title, rect)) in self.titles.iter().zip(&self.rects).enumerate() {
+            let mut node = access::clickable(Role::MenuItem, title, *rect);
+            node.set_has_popup(HasPopup::Menu);
+            node.set_expanded(open == Some(i));
+            if let Some(first) = title.chars().next() {
+                node.set_access_key(first.to_string());
+            }
+            if open == Some(i)
+                && let Some(menu) = self.menu.access(tree, title)
+            {
+                node.set_children(vec![menu]);
+            }
+            titles.push(tree.push(Part::MenuTitle(i), node));
+        }
+        let mut bar = access::labeled(Role::MenuBar, "Menu bar", self.area);
+        bar.set_children(titles);
+        tree.push(Part::MenuBar, bar)
+    }
+
+    /// What has focus in the bar: the open menu's selected item, or the menu.
+    pub fn access_focus(&self) -> Option<Part> {
+        self.open_index().and(self.menu.access_focus())
+    }
+
+    /// Does what an assistive technology asks: opens or closes a menu (as from the
+    /// keyboard, so its first item is selected), or runs or selects an item.
+    pub fn access_action(&mut self, part: Part, request: &ActionRequest) -> MenuBarEvent {
+        match part {
+            Part::MenuTitle(i) if i < self.titles.len() => match request.action {
+                AkAction::Click | AkAction::Expand if self.open_index() != Some(i) => {
+                    self.keyboard = true;
+                    MenuBarEvent::Open(i)
+                }
+                AkAction::Click | AkAction::Collapse if self.open_index() == Some(i) => {
+                    self.close();
+                    MenuBarEvent::Redraw
+                }
+                _ => MenuBarEvent::Ignored,
+            },
+            Part::MenuItem(_) if self.is_open() => {
+                let action = self.menu.access_action(part, request);
+                if !self.menu.is_open() {
+                    self.close();
+                }
+                match action {
+                    Some(action) => MenuBarEvent::Run(action),
+                    None => MenuBarEvent::Redraw,
+                }
+            }
+            _ => MenuBarEvent::Ignored,
+        }
     }
 }
 

@@ -4,9 +4,11 @@
 //! reorder, double-click the empty strip for a new tab, and use the wheel when there are
 //! more tabs than fit.
 
+use accesskit::{Action, ActionRequest, NodeId, Role};
 use fude_platform::MouseButton;
 use fude_render::Rect;
 
+use crate::access::{self, AccessTree, Part};
 use crate::painter::Painter;
 
 /// Logical height of the strip.
@@ -158,6 +160,50 @@ impl TabStrip {
         self.hover = None;
         self.hover_close = false;
         changed
+    }
+
+    /// Describes the strip for assistive technologies: a tab per document, with its
+    /// close button. The active tab controls `panel` (the editor).
+    pub fn access(
+        &self,
+        tree: &mut AccessTree,
+        tabs: &[TabInfo<'_>],
+        active: usize,
+        panel: NodeId,
+    ) -> NodeId {
+        let mut children = Vec::new();
+        for (i, (tab, r)) in tabs.iter().zip(&self.rects).enumerate() {
+            let close = tree.push(
+                Part::TabClose(i),
+                access::clickable(Role::Button, "Close", r.close),
+            );
+            let mut node = access::clickable(Role::Tab, tab.title, r.tab);
+            node.add_action(Action::Focus);
+            node.set_selected(i == active);
+            if tab.modified {
+                node.set_description("Unsaved changes");
+            }
+            if i == active {
+                node.set_controls(vec![panel]);
+            }
+            node.set_children(vec![close]);
+            children.push(tree.push(Part::Tab(i), node));
+        }
+        let mut list = access::labeled(Role::TabList, "Documents", self.area);
+        list.set_children(children);
+        list.set_clips_children();
+        tree.push(Part::Tabs, list)
+    }
+
+    /// Does what an assistive technology asks: switches to a tab, or closes one.
+    pub fn access_action(&self, part: Part, request: &ActionRequest) -> Option<TabEvent> {
+        match (part, request.action) {
+            (Part::Tab(i), Action::Click | Action::Focus) if i < self.rects.len() => {
+                Some(TabEvent::Activate(i))
+            }
+            (Part::TabClose(i), Action::Click) if i < self.rects.len() => Some(TabEvent::Close(i)),
+            _ => None,
+        }
     }
 
     /// Wheel over the strip scrolls it sideways.

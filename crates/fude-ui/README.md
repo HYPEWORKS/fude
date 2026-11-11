@@ -2,7 +2,7 @@
 
 The UI: the editor view, the window chrome (tabs, menus, status bar) and dialogs, drawn into a [fude-render](../fude-render/README.md) draw list with one theme. Everything is custom-drawn; the reasons are in [ARCHITECTURE.md](../../ARCHITECTURE.md#rendering).
 
-Dependencies: every library crate (`fude-buffer`, `fude-editor`, `fude-render`, `fude-text`, `fude-platform`, `fude-syntax`, `fude-tools`). Used by `fude`.
+Dependencies: every library crate (`fude-buffer`, `fude-editor`, `fude-render`, `fude-text`, `fude-platform`, `fude-syntax`, `fude-tools`); `accesskit` for the accessibility tree, `unicode-segmentation` for its characters. Used by `fude`.
 
 ## The editor view
 
@@ -18,7 +18,7 @@ Dependencies: every library crate (`fude-buffer`, `fude-editor`, `fude-render`, 
 
 ## Widgets
 
-- **One design system.** All UI draws with [`Theme`] color roles, never literal colors, and with shared sizes in logical pixels ([`Painter`]). Two themes: Sumi (墨, warm ink black) and Washi (和紙, warm paper white), with a vermilion accent; light and dark follow the OS by default.
+- **One design system.** All UI draws with [`Theme`] color roles, never literal colors, and with shared sizes in logical pixels ([`Painter`]). Two themes: Sumi (墨, warm ink black) and Washi (和紙, warm paper white), with a vermilion accent; light and dark follow the OS by default. Every text color meets WCAG AA contrast (4.5:1) on each background it's drawn on, code on selections aside; a test checks each pair.
 - **Every text input is an editor.** [`TextInput`] wraps a [fude-editor](../fude-editor/README.md) editor, so the find box, go to line and the command palette get IME, undo, selection, word motions and the clipboard like documents.
 - **Tabs** ([`TabStrip`]): click to switch, middle-click or × to close, drag to reorder, double-click the empty strip for a new tab, the wheel when there are more tabs than fit.
 - **Find bar** ([`FindBar`]), docked at the bottom of the editor so it never covers the text being searched. Enter / Shift+Enter (or F3 / Shift+F3) for next and previous, Alt+C / W / R for case, whole word and regex, Tab between the fields, Ctrl+Alt+Enter to replace all.
@@ -26,7 +26,18 @@ Dependencies: every library crate (`fude-buffer`, `fude-editor`, `fude-render`, 
 - **Prompts** ([`Prompt`]): modal questions ("Save changes?", About) are drawn in the window rather than native message boxes, so they look the same everywhere and need no helper programs. Keyboard first: Enter picks the default, Escape cancels, a button's first letter picks it, Tab and the arrows move focus.
 - **Context menu** ([`ContextMenu`]): a transient command menu at the pointer, kept inside the window.
 - **Status bar** (`chrome.rs`): line and column, encoding, line endings, language, and messages.
-- **Accessibility** *(planned, phase 6)*: widgets are to carry roles and labels so AccessKit can be wired up. Nothing does yet.
+- **Accessibility:** every widget describes itself for assistive technologies ([below](#accessibility)).
+
+## Accessibility
+
+Screen readers can't see a custom-drawn UI, so each widget describes itself as nodes of an [AccessKit](https://accesskit.dev) tree (`access.rs`): what it is, its name, its state (selected, toggled, expanded, disabled), its shortcut, and its bounds on screen. The app assembles the window's tree ([fude](../../fude/README.md)) and [fude-platform](../fude-platform/README.md#accessibility) hands it to the OS.
+
+- **From the last frame.** Widgets describe what they drew, with the rectangles they drew it in, so the tree never disagrees with the screen. It's built after a frame, and only while an assistive technology is listening.
+- **Ids say what a node is** ([`Part`]): a request from a screen reader ("click this", "select that text") names a node, and its id leads back to the widget, which handles it like the matching click or key.
+- **Text as on screen.** A text field's text is *text runs*, one or more per row: each character's bytes, position and width (so magnifiers can follow the caret), and where words start, the same places Ctrl+Right stops. A character is a grapheme cluster; control characters read as their Unicode symbols (␀), as they show as chips; invalid bytes as U+FFFD; a line break is a character at the end of its row. Runs hold at most 255 characters (AccessKit counts word starts in bytes), so a longer row is several runs on one line, split at a word.
+- **Documents describe the rows in view, not the file.** That's what keeps the tree's cost independent of file size (0.1 ms for a screenful of code; 5.5 ms for the worst case, a 1080p screen of 4 KB rows of minified JSON without wrap). The selection's ends are mapped to the runs; one that is off screen is clamped to the first or last row, and the view scrolls to the caret as it does when typing. Assistive technologies' "read to the end" stops at the bottom of the screen.
+- **Focus** is the field with keyboard focus, or a dialog's focused button, or an open menu's selected item. In the command palette the field keeps focus and the selected command is its *active descendant*, so arrowing through commands reads each while typing still filters.
+- **Read out as they change:** status bar messages (errors at once, others politely), the find bar's match count, and the palette's go-to-line hint. Loading progress isn't, as it changes too often.
 
 ## Commands and shortcuts
 
@@ -50,6 +61,7 @@ Dependencies: every library crate (`fude-buffer`, `fude-editor`, `fude-render`, 
 | `prompt.rs` | Modal questions |
 | `chrome.rs` | The status bar |
 | `keymap.rs` | Commands, their names and shortcuts |
+| `access.rs` | Accessibility: node ids, text as text runs, the tree being built |
 | `theme.rs` | Colors by role; the two themes |
 | `painter.rs` | Drawing helpers shared by every widget |
 
@@ -64,6 +76,9 @@ Dependencies: every library crate (`fude-buffer`, `fude-editor`, `fude-render`, 
 | 2026-11-08 | Long lines are laid out in pieces of about 4 KB, breaking near spaces, each starting a new row: without word wrap a long line shows as wide rows, like classic Notepad, rather than being cut off (VS Code stops drawing at 10,000 characters) or laid out whole. Breaks depend only on nearby bytes, so there's no index to keep up to date. |
 | 2026-11-08 | The scroll position is a byte anchor (piece, row, fraction): independent of what's above, exact at any line count (the old fractional line number lost precision past a few million lines), and stable while a file loads. |
 | 2026-11-08 | Shortcuts match a key's character without modifiers (winit's `key_without_modifiers`), so Ctrl+Shift+`\` matches whatever Shift turns the key into, and Option+letter shortcuts work on macOS. |
+| 2026-11-11 | Text colors raised to WCAG AA contrast, the least each needed: line numbers, comments, muted chrome text (Sumi's was 3.3:1 on a selected menu item), headings, and Sumi's primary button text. They had been 2.4 to 4.5:1. |
+| 2026-11-11 | Accessibility describes documents as the rows on screen, not the whole text: it keeps the tree's cost independent of file size, as drawing is. Screen readers' "say all" then stops at the bottom of the screen; VS Code exposes a similar window of text for the same reason. |
+| 2026-11-11 | Widgets describe themselves from their last frame, in a pass after drawing (only while an assistive technology listens) rather than while drawing: drawing stays as fast as it was, and a document's rows are laid out again only then. |
 | 2026-11-09 | The About dialog is a drawn prompt like the others (with a button that copies the version for bug reports), on macOS too, rather than the standard About panel. |
 
 [`EditorView`]: src/view.rs
@@ -71,6 +86,7 @@ Dependencies: every library crate (`fude-buffer`, `fude-editor`, `fude-render`, 
 [`PIECE`]: src/pieces.rs
 [`Theme`]: src/theme.rs
 [`Painter`]: src/painter.rs
+[`Part`]: src/access.rs
 [`TextInput`]: src/input.rs
 [`TabStrip`]: src/tabs.rs
 [`FindBar`]: src/find.rs

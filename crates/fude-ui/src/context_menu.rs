@@ -1,9 +1,11 @@
 //! A transient command menu, positioned at the pointer and kept inside the window. The
 //! menu bar's menus are these too.
 
+use accesskit::{ActionRequest, NodeId, Role};
 use fude_platform::{Key, KeyInput};
 use fude_render::Rect;
 
+use crate::access::{self, AccessTree, Part};
 use crate::{Action, Painter};
 
 const CHECK: &str = "✓";
@@ -243,6 +245,68 @@ impl ContextMenu {
     #[cfg(test)]
     pub(crate) fn row_area(&self, index: usize) -> Rect {
         self.row_rect(index)
+    }
+
+    /// Describes the open menu for assistive technologies (separators are left out).
+    pub fn access(&self, tree: &mut AccessTree, label: &str) -> Option<NodeId> {
+        if !self.open {
+            return None;
+        }
+        let mut children = Vec::new();
+        for (i, item) in self.items.iter().enumerate() {
+            if item.action.is_none() {
+                continue;
+            }
+            let role = if item.checked.is_some() {
+                Role::MenuItemCheckBox
+            } else {
+                Role::MenuItem
+            };
+            let mut node = access::clickable(role, &item.label, self.row_rect(i));
+            node.add_action(accesskit::Action::Focus);
+            if let Some(on) = item.checked {
+                node.set_toggled(on.into());
+            }
+            if !item.enabled {
+                node.set_disabled();
+            }
+            if !item.shortcut.is_empty() {
+                node.set_keyboard_shortcut(item.shortcut.as_str());
+            }
+            children.push(tree.push(Part::MenuItem(i), node));
+        }
+        let mut menu = access::labeled(Role::Menu, label, self.area);
+        menu.set_children(children);
+        menu.set_clips_children();
+        Some(tree.push(Part::Menu, menu))
+    }
+
+    /// What has focus in the open menu: the selected item, or the menu.
+    pub fn access_focus(&self) -> Option<Part> {
+        self.open
+            .then(|| self.selected.map_or(Part::Menu, Part::MenuItem))
+    }
+
+    /// Does what an assistive technology asks of an item: runs it (closing the menu), or
+    /// selects it.
+    pub fn access_action(&mut self, part: Part, request: &ActionRequest) -> Option<Action> {
+        let Part::MenuItem(i) = part else {
+            return None;
+        };
+        if !self.open || !self.items.get(i)?.selectable() {
+            return None;
+        }
+        match request.action {
+            accesskit::Action::Click => {
+                self.selected = Some(i);
+                self.activate()
+            }
+            accesskit::Action::Focus => {
+                self.select(i);
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Selects the first item that can run, as when a menu is opened from the keyboard.

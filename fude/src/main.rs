@@ -254,6 +254,21 @@ impl App for Window {
         }
     }
 
+    fn access_tree(&mut self) -> fude_platform::accesskit::TreeUpdate {
+        // As for drawing: a bug here costs the screen reader an update, not the text.
+        let app = &mut self.app;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.access_tree()));
+        result.unwrap_or_else(|payload| {
+            self.app.recover_draw(&panic_message(payload.as_ref()));
+            let mut tree = fude_ui::AccessTree::new();
+            let mut window =
+                fude_platform::accesskit::Node::new(fude_platform::accesskit::Role::Window);
+            window.set_label(self.app.window_title());
+            tree.push(fude_ui::Part::Window, window);
+            tree.finish(fude_ui::Part::Window)
+        })
+    }
+
     fn presented(&mut self, ctx: &mut Ctx<'_>) {
         self.app.presented(ctx);
         if let Some(b) = &mut self.bench {

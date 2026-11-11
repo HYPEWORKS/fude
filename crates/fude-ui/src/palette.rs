@@ -3,10 +3,12 @@
 
 use std::time::Instant;
 
+use accesskit::{Action, ActionRequest, Live, NodeId, Role};
 use fude_platform::{Ime, Key, KeyInput, Modifiers};
 use fude_render::Rect;
 use fude_text::LineLayout;
 
+use crate::access::{self, AccessTree, Field, Part};
 use crate::fuzzy;
 use crate::input::{ImeChange, InputKey, TextInput};
 use crate::painter::Painter;
@@ -53,6 +55,8 @@ pub struct Palette {
     area: Rect,
     hover: Option<usize>,
     layout: LineLayout,
+    /// What the list area says instead of commands (go to line, no matches), and where.
+    note: Option<(String, Rect)>,
 }
 
 impl Palette {
@@ -230,6 +234,88 @@ impl Palette {
         self.input.mouse_up();
     }
 
+    /// Describes the palette for assistive technologies: a dialog with the field, and
+    /// the commands on screen as a list whose selected item is the field's active
+    /// descendant (so moving through the list reads each item while typing stays in
+    /// the field).
+    pub fn access(&mut self, p: &mut Painter, tree: &mut AccessTree) -> NodeId {
+        let placeholder = "Type a command, or : and a line number";
+        let input = self
+            .input
+            .access(p, tree, Field::Palette, "Command", placeholder, false);
+        let mut children = vec![input];
+        if let Some((text, rect)) = &self.note {
+            let mut note = access::text_node(text, *rect);
+            note.set_live(Live::Polite);
+            children.push(tree.push(Part::PaletteList, note));
+        } else {
+            let mut items = Vec::new();
+            for (row, rect) in self.rows.iter().enumerate() {
+                let i = self.top + row;
+                let Some((item, _)) = self.matches.get(i) else {
+                    break;
+                };
+                let item = &self.items[*item];
+                let mut node = access::clickable(Role::ListBoxOption, &item.title, *rect);
+                node.add_action(Action::Focus);
+                node.set_selected(i == self.selected);
+                node.set_position_in_set(i);
+                if !item.detail.is_empty() {
+                    node.set_keyboard_shortcut(item.detail.as_str());
+                }
+                items.push(tree.push(Part::PaletteItem(i), node));
+            }
+            let area = match (self.rows.first(), self.rows.last()) {
+                (Some(a), Some(b)) => Rect::new(a.x, a.y, a.w, b.bottom() - a.y),
+                _ => Rect::default(),
+            };
+            let mut list = access::labeled(Role::ListBox, "Commands", area);
+            list.set_size_of_set(self.matches.len());
+            list.set_children(items);
+            let list = tree.push(Part::PaletteList, list);
+            children.push(list);
+            if let Some(field) = tree.node_mut(input) {
+                field.set_controls(vec![list]);
+                if self.matches.get(self.selected).is_some() {
+                    field.set_active_descendant(Part::PaletteItem(self.selected).id());
+                }
+            }
+        }
+        let mut dialog = access::labeled(Role::Dialog, "Command palette", self.area);
+        dialog.set_children(children);
+        tree.push(Part::Palette, dialog)
+    }
+
+    /// Does what an assistive technology asks of a part of the palette.
+    pub fn access_action(
+        &mut self,
+        part: Part,
+        request: &ActionRequest,
+        now: Instant,
+    ) -> Option<PaletteAction> {
+        match part {
+            Part::PaletteItem(i) => {
+                let &(item, _) = self.matches.get(i)?;
+                match request.action {
+                    Action::Click => Some(PaletteAction::Run(item)),
+                    Action::Focus | Action::ScrollIntoView => {
+                        self.select(i);
+                        Some(PaletteAction::Redraw)
+                    }
+                    _ => None,
+                }
+            }
+            Part::Field(Field::Palette) => {
+                match self.input.access_action(Field::Palette, request, now) {
+                    InputKey::Changed => Some(self.after_edit()),
+                    InputKey::Moved => Some(PaletteAction::Redraw),
+                    InputKey::Ignored => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn draw(&mut self, p: &mut Painter, window: Rect, top: i32, now: Instant) {
         let t = p.theme;
         let pad = p.px(8.0);
@@ -260,6 +346,8 @@ impl Palette {
         let style = p.style(13.0);
         let list_y = y + pad + input_h + pad;
         self.rows.clear();
+        self.note = None;
+        let note_rect = Rect::new(x + pad / 2, list_y, width - pad, row_h);
         if going_to_line {
             let hint = match self.line_target() {
                 Some((line, Some(col))) => format!("Go to line {line}, column {col}"),
@@ -274,17 +362,20 @@ impl Palette {
                 baseline,
                 t.chrome_text_muted,
             );
+            self.note = Some((hint, note_rect));
             return;
         }
         if self.matches.is_empty() {
             let baseline = p.center_baseline(list_y, row_h, &style);
+            let note = "No matching commands";
             p.text(
-                "No matching commands",
+                note,
                 &style,
                 (x + 2 * pad) as f32,
                 baseline,
                 t.chrome_text_muted,
             );
+            self.note = Some((note.to_owned(), note_rect));
             return;
         }
         let visible: Vec<(usize, (usize, Vec<usize>))> = self

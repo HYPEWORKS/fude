@@ -1,4 +1,7 @@
 //! Colors by role. Every piece of UI draws with these, never with literal colors.
+//!
+//! Text meets WCAG AA contrast (4.5:1) on every background it's drawn on, selections
+//! aside (tested below).
 
 use fude_render::Color;
 use fude_syntax::Style;
@@ -101,14 +104,14 @@ pub static SUMI: Theme = Theme {
     find_match: Color::rgb(0x4D4128),
     bracket_match: Color::rgba(0xE6E1D6, 0x60),
     caret: Color::rgb(0xE2553F),
-    gutter_text: Color::rgb(0x5E5A53),
+    gutter_text: Color::rgb(0x89857C),
     gutter_text_active: Color::rgb(0xA8A296),
     chrome_bg: Color::rgb(0x171614),
     chrome_text: Color::rgb(0xD6D1C6),
-    chrome_text_muted: Color::rgb(0x8A857B),
+    chrome_text_muted: Color::rgb(0xA49F94),
     border: Color::rgb(0x2C2A27),
     accent: Color::rgb(0xE2553F),
-    accent_text: Color::rgb(0x1E1D1B),
+    accent_text: Color::rgb(0x1A1918),
     chip_bg: Color::rgb(0x36332F),
     chip_text: Color::rgb(0xB5AFA3),
     invalid_bg: Color::rgb(0x5A2A22),
@@ -122,7 +125,7 @@ pub static SUMI: Theme = Theme {
     button_text: Color::rgb(0xE6E1D6),
     error: Color::rgb(0xF07A66),
     syntax: SyntaxColors {
-        comment: Color::rgb(0x857E72),
+        comment: Color::rgb(0x938C80),
         string: Color::rgb(0xA9BC8F),
         escape: Color::rgb(0xE6A26A),
         number: Color::rgb(0xDDA35E),
@@ -135,7 +138,7 @@ pub static SUMI: Theme = Theme {
         tag: Color::rgb(0xE07A62),
         attribute: Color::rgb(0xE5C67F),
         punctuation: Color::rgb(0xA8A296),
-        heading: Color::rgb(0xE2553F),
+        heading: Color::rgb(0xE26651),
         link: Color::rgb(0x94B9C4),
     },
 };
@@ -150,11 +153,11 @@ pub static WASHI: Theme = Theme {
     find_match: Color::rgb(0xF4E2B2),
     bracket_match: Color::rgba(0x2B2A27, 0x60),
     caret: Color::rgb(0xC8402A),
-    gutter_text: Color::rgb(0xA9A194),
+    gutter_text: Color::rgb(0x757067),
     gutter_text_active: Color::rgb(0x5E584E),
     chrome_bg: Color::rgb(0xF0EBE1),
     chrome_text: Color::rgb(0x3A3833),
-    chrome_text_muted: Color::rgb(0x6F695E),
+    chrome_text_muted: Color::rgb(0x656056),
     border: Color::rgb(0xDCD5C8),
     accent: Color::rgb(0xC8402A),
     accent_text: Color::rgb(0xFFFFFF),
@@ -171,7 +174,7 @@ pub static WASHI: Theme = Theme {
     button_text: Color::rgb(0x2B2A27),
     error: Color::rgb(0xB0301F),
     syntax: SyntaxColors {
-        comment: Color::rgb(0x8A8376),
+        comment: Color::rgb(0x6F6A60),
         string: Color::rgb(0x4E6E34),
         escape: Color::rgb(0x9A5410),
         number: Color::rgb(0x9A5410),
@@ -184,7 +187,92 @@ pub static WASHI: Theme = Theme {
         tag: Color::rgb(0xB23A25),
         attribute: Color::rgb(0x775610),
         punctuation: Color::rgb(0x6F695E),
-        heading: Color::rgb(0xC8402A),
+        heading: Color::rgb(0xBE3F2A),
         link: Color::rgb(0x2C6273),
     },
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG 2's contrast ratio of two opaque colors.
+    fn contrast(a: Color, b: Color) -> f64 {
+        let luminance = |c: Color| {
+            let channel = |shift: u32| {
+                let v = f64::from((c.0 >> shift) & 0xFF) / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Every text color against every background it's drawn on. Code on a selection or
+    /// a find match is left out, as is disabled text (WCAG exempts it).
+    #[test]
+    fn text_meets_wcag_aa_contrast() {
+        for (name, t) in [("Sumi", &SUMI), ("Washi", &WASHI)] {
+            let s = &t.syntax;
+            let editor = [t.editor_bg, t.line_highlight];
+            let chrome = [
+                t.chrome_bg,
+                t.dialog_bg,
+                t.editor_bg,
+                t.line_highlight,
+                t.selection,
+            ];
+            let code = [
+                s.comment,
+                s.string,
+                s.escape,
+                s.number,
+                s.constant,
+                s.keyword,
+                s.storage,
+                s.operator,
+                s.function,
+                s.type_name,
+                s.tag,
+                s.attribute,
+                s.punctuation,
+                s.heading,
+                s.link,
+                t.error,
+            ];
+            let mut checks: Vec<(&str, Color, Vec<Color>)> = vec![
+                (
+                    "text",
+                    t.text,
+                    vec![t.editor_bg, t.line_highlight, t.selection, t.find_match],
+                ),
+                ("line numbers", t.gutter_text, vec![t.editor_bg]),
+                ("current line number", t.gutter_text_active, editor.to_vec()),
+                ("chrome text", t.chrome_text, chrome.to_vec()),
+                ("muted chrome text", t.chrome_text_muted, chrome.to_vec()),
+                ("error", t.error, vec![t.chrome_bg, t.dialog_bg]),
+                ("button text", t.button_text, vec![t.button_bg]),
+                ("primary button text", t.accent_text, vec![t.accent]),
+                ("chip", t.chip_text, vec![t.chip_bg]),
+                ("invalid byte chip", t.invalid_text, vec![t.invalid_bg]),
+            ];
+            checks.extend(code.iter().map(|&c| ("code", c, editor.to_vec())));
+            for (what, fg, backgrounds) in checks {
+                for bg in backgrounds {
+                    let ratio = contrast(fg, bg);
+                    assert!(
+                        ratio >= 4.5,
+                        "{name}: {what} {:06X} on {:06X} is {ratio:.2}:1",
+                        fg.0 & 0xFF_FFFF,
+                        bg.0 & 0xFF_FFFF
+                    );
+                }
+            }
+        }
+    }
+}

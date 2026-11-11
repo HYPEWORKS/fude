@@ -9,6 +9,7 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use accesskit::{Action, ActionData, ActionRequest, Node, NodeId, Role};
 use fude_buffer::Rope;
 use fude_editor::{
     BRACKET_LIMIT, Editor, Layout, Motion, Searcher, Selection, Selections, nearest, text as nav,
@@ -19,6 +20,7 @@ use fude_text::{Chip, FontId, LineLayout, TextStyle, TextSystem};
 
 use fude_syntax::{Span, Style};
 
+use crate::access::{AccessTree, Part, RowText, Text, TextRuns, bounds};
 use crate::display::DisplayLine;
 use crate::pieces::{PIECE, Piece, first_piece, next_piece, piece_at, piece_of, prev_piece};
 
@@ -187,6 +189,33 @@ impl LineCtx<'_> {
             .glyphs
             .iter()
             .find(|g| g.cluster as usize >= display)
+            .map_or(self.s.layout.width, |g| g.x)
+    }
+
+    /// For finding many x positions in the prepared line: the largest cluster among the
+    /// glyphs up to each one. The first glyph whose cluster is at least an offset (what
+    /// [`LineCtx::x_at_display`] looks for) is the first whose running maximum is, and
+    /// the running maximum only grows, so each lookup is a binary search.
+    fn x_lookup(&self) -> Vec<u32> {
+        let mut max = 0;
+        self.s
+            .layout
+            .glyphs
+            .iter()
+            .map(|g| {
+                max = max.max(g.cluster);
+                max
+            })
+            .collect()
+    }
+
+    /// [`LineCtx::x_at_display`], with the table from [`LineCtx::x_lookup`].
+    fn x_at_display_in(&self, lookup: &[u32], display: usize) -> f32 {
+        let i = lookup.partition_point(|&c| (c as usize) < display);
+        self.s
+            .layout
+            .glyphs
+            .get(i)
             .map_or(self.s.layout.width, |g| g.x)
     }
 
@@ -416,6 +445,8 @@ pub struct EditorView {
     /// The primary caret in the last frame, for placing the IME window.
     caret: Option<Rect>,
     scratch: Scratch,
+    /// The text runs the view was last described with, for assistive technologies.
+    runs: TextRuns,
 }
 
 impl EditorView {
@@ -448,6 +479,7 @@ impl EditorView {
             max_width: 0.0,
             caret: None,
             scratch: Scratch::default(),
+            runs: TextRuns::default(),
         }
     }
 
@@ -1804,6 +1836,120 @@ impl EditorView {
         p.list.pop_clip();
     }
 
+    // --- Accessibility -----------------------------------------------------------------
+
+    /// Describes the view for assistive technologies: a multiline text field holding the
+    /// rows the last frame showed, as text runs, and the primary selection. Lays out only
+    /// those rows, so it costs the same at any file size.
+    pub fn access(&mut self, p: &mut Painter, tree: &mut AccessTree, label: &str) -> NodeId {
+        let g = self.geo;
+        let doc = self.editor.text().clone();
+        let style = self.style();
+        let space = p.metrics(&style).space_advance;
+        let wrap = self.wrap_width();
+        // As when drawing: without wrapping, a row is laid out only as far as it shows.
+        let layout_until = if wrap.is_none() {
+            self.scroll_x + g.text.w as f32 + 4.0 * space
+        } else {
+            f32::INFINITY
+        };
+        let origin = (g.text.x + g.text_pad) as f32 - self.scroll_x;
+        let (first, first_row, mut y) = self.top(&mut p.text, &doc);
+        self.runs.clear();
+        let mut children = Vec::new();
+        let (mut bytes, mut line_break) = (Vec::new(), Vec::new());
+        let (mut piece, mut skip) = (Some(first), first_row);
+        'pieces: while let Some(pc) = piece {
+            let mut ctx = LineCtx {
+                text: &mut p.text,
+                style,
+                s: &mut self.scratch,
+                wrap,
+                max_x: layout_until,
+            };
+            ctx.prepare(&doc, &pc, None);
+            let rows = ctx.rows();
+            let lookup = ctx.x_lookup();
+            for (r, row) in rows.iter().enumerate().skip(skip.min(rows.len() - 1)) {
+                if y >= g.text.bottom() {
+                    break 'pieces;
+                }
+                let start = pc.start + ctx.s.display.to_doc(row.start);
+                let end = pc.start + ctx.s.display.to_doc(row.end);
+                bytes.clear();
+                doc.copy_range(start..end, &mut bytes);
+                line_break.clear();
+                if r + 1 == rows.len() && pc.is_last() {
+                    doc.copy_range(pc.span.end..pc.span.next, &mut line_break);
+                }
+                let text = RowText {
+                    bytes: &bytes,
+                    start,
+                    line_break: &line_break,
+                    before: (start > pc.span.start).then(|| class_before(&doc, start)),
+                    y,
+                    h: g.line_h,
+                };
+                let ctx = &ctx;
+                children.extend(self.runs.push_row(tree, Text::Editor, &text, |at| {
+                    let d = ctx.s.display.to_display(at.min(pc.end) - pc.start);
+                    origin + row.place(ctx.x_at_display_in(&lookup, d))
+                }));
+                y += g.line_h;
+            }
+            skip = 0;
+            piece = next_piece(&doc, &pc);
+        }
+
+        let mut node = Node::new(Role::MultilineTextInput);
+        node.set_label(label);
+        node.set_bounds(bounds(g.text));
+        node.set_children(children);
+        node.set_clips_children();
+        node.add_action(Action::Focus);
+        node.add_action(Action::SetTextSelection);
+        node.add_action(Action::ScrollIntoView);
+        node.add_action(Action::ShowContextMenu);
+        if self.editor.is_read_only() {
+            node.set_read_only();
+        } else {
+            node.add_action(Action::ReplaceSelectedText);
+        }
+        let s = *self.editor.selections().primary();
+        if let Some(selection) = self.runs.selection(Text::Editor, s.anchor, s.head) {
+            node.set_text_selection(selection);
+        }
+        tree.push(Part::Editor, node)
+    }
+
+    /// Does what an assistive technology asks of the view: selects text, or types.
+    /// Returns whether anything changed.
+    pub fn access_action(&mut self, request: &ActionRequest, now: Instant) -> bool {
+        match (request.action, &request.data) {
+            (Action::SetTextSelection, Some(ActionData::SetTextSelection(selection))) => {
+                let anchor = self.runs.offset(Text::Editor, &selection.anchor);
+                let head = self.runs.offset(Text::Editor, &selection.focus);
+                let (Some(anchor), Some(head)) = (anchor, head) else {
+                    return false;
+                };
+                self.editor
+                    .set_selections(Selections::single(Selection::new(anchor, head)));
+                self.touched(now);
+                true
+            }
+            (Action::ReplaceSelectedText, Some(ActionData::Value(text))) => {
+                self.editor.insert(text, now);
+                self.changed(now);
+                true
+            }
+            (Action::ScrollIntoView, _) => {
+                self.reveal = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn draw_chips(
         p: &mut Painter,
         layout: &LineLayout,
@@ -1843,6 +1989,20 @@ impl EditorView {
 }
 
 /// The line containing `at`, with its line break: what a triple click selects.
+/// The word class of the character before `at` (a byte that isn't UTF-8 counts as one).
+fn class_before(doc: &Rope, at: usize) -> nav::Class {
+    let mut bytes = Vec::with_capacity(4);
+    doc.copy_range(at.saturating_sub(4)..at, &mut bytes);
+    let last = bytes.utf8_chunks().last();
+    nav::class_of(last.and_then(|c| {
+        if c.invalid().is_empty() {
+            c.valid().chars().next_back()
+        } else {
+            None
+        }
+    }))
+}
+
 fn line_range(doc: &Rope, at: usize) -> Range<usize> {
     let span = doc.line_span(doc.byte_to_line(at));
     span.start..span.next
@@ -1936,6 +2096,69 @@ mod tests {
         let x = (g.text.x + g.text_pad) as f32 + p.measure(prefix, &view.style());
         let y = (g.text.y + g.pad_top + g.line_h / 2) as f32;
         (x, y)
+    }
+
+    fn request(action: Action, target: Part, data: Option<ActionData>) -> ActionRequest {
+        ActionRequest {
+            action,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: target.id(),
+            data,
+        }
+    }
+
+    /// Assistive technologies select by positions in the runs they were given, and get
+    /// the selection back the same way, wrapped rows and long lines included.
+    #[test]
+    fn assistive_technologies_select_and_type_by_run_positions() {
+        let long = "word ".repeat(2000);
+        let text = format!("first line\n{long}\nlast");
+        for wrap in [false, true] {
+            let (mut view, mut p, area) = view_of(&text, wrap);
+            let mut tree = AccessTree::new();
+            view.access(&mut p, &mut tree, "doc");
+            // The long line is several rows of pieces, each several runs.
+            assert!(view.runs.runs.len() > 10);
+            // Select "line" on the first row by run positions.
+            let at = |k: usize, i: usize| accesskit::TextPosition {
+                node: Part::Run(Text::Editor, k).id(),
+                character_index: i,
+            };
+            let selection = accesskit::TextSelection {
+                anchor: at(0, 6),
+                focus: at(0, 10),
+            };
+            let set = request(
+                Action::SetTextSelection,
+                Part::Editor,
+                Some(ActionData::SetTextSelection(selection)),
+            );
+            assert!(view.access_action(&set, Instant::now()));
+            assert_eq!(view.editor.selections().primary().range(), 6..10);
+            // And back: the caret at the end of the line is on its line break.
+            view.editor.select(10..10);
+            draw(&mut view, &mut p, area);
+            let mut tree = AccessTree::new();
+            view.access(&mut p, &mut tree, "doc");
+            let caret = tree.get(Part::Editor).unwrap().text_selection().unwrap();
+            assert_eq!(caret.focus, at(0, 10));
+            // Somewhere in the long line, past the first run.
+            let k = 3;
+            let offset = view.runs.runs[k][5];
+            assert_eq!(
+                view.runs.position(Text::Editor, offset),
+                Some(at(k, 5)),
+                "wrap: {wrap}"
+            );
+
+            let typed = request(
+                Action::ReplaceSelectedText,
+                Part::Editor,
+                Some(ActionData::Value("!".into())),
+            );
+            assert!(view.access_action(&typed, Instant::now()));
+            assert!(view.editor.text().to_vec().starts_with(b"first line!\n"));
+        }
     }
 
     #[test]
