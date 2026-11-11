@@ -95,20 +95,21 @@ impl Fude {
         let _ = ctx;
     }
 
-    /// Quits. With hot exit, unsaved changes are kept for next time; otherwise asks about
-    /// each document with unsaved changes in turn.
+    /// Quits. With hot exit, unsaved changes are kept for next time; otherwise (or for a
+    /// document whose changes couldn't be written to its backup) asks about each document
+    /// with unsaved changes in turn.
     pub fn quit(&mut self, ctx: &mut Ctx<'_>) {
         let modified = self.docs.iter().position(Doc::modified);
-        match modified {
-            Some(i) if !self.config.hot_exit || self.state_dir.is_none() => {
+        let ask = match modified {
+            Some(i) if !self.config.hot_exit || self.state_dir.is_none() => Some(self.docs[i].id),
+            _ => self.save_session(true),
+        };
+        match ask.and_then(|id| Some((id, self.index_of(id)?))) {
+            Some((id, i)) => {
                 self.activate(i);
-                let id = self.docs[i].id;
                 self.ask_unsaved(id, Then::Quit);
             }
-            _ => {
-                self.save_session(true);
-                ctx.exit();
-            }
+            None => ctx.exit(),
         }
     }
 
@@ -216,8 +217,13 @@ impl Fude {
             let Some(job) = &self.docs[i].saving else {
                 continue;
             };
-            let Ok(result) = job.result.try_recv() else {
-                continue;
+            let result = match job.result.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => continue,
+                // The save's thread died without an answer: the save is over, not pending.
+                Err(mpsc::TryRecvError::Disconnected) => Err(SaveError::Io(std::io::Error::other(
+                    "the save stopped unexpectedly",
+                ))),
             };
             let job = self.docs[i].saving.take().expect("checked");
             self.saved(ctx, self.docs[i].id, job, result);

@@ -10,6 +10,8 @@ Options:
   -w, --wait             Stay in the terminal until the window closes, in a window of its
                          own (for git: core.editor = 'fude --wait')
   -n, --new-instance     Open a new window instead of handing the files to a running fude
+                         (like --wait, it keeps no session and asks before closing with
+                         unsaved changes)
   -h, --help             Print help
   -V, --version          Print version
 

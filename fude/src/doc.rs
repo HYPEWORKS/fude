@@ -84,8 +84,12 @@ impl Doc {
         self.view.editor.buffer().is_modified()
     }
 
-    /// An untouched new document, which opening a file may replace.
+    /// An untouched new document, which opening a file may replace. Not one that's still
+    /// loading: an untitled document coming back from its backup is empty until it's read.
     pub fn is_blank(&self) -> bool {
-        self.path.is_none() && !self.modified() && self.view.editor.text().is_empty()
+        self.path.is_none()
+            && self.loading.is_none()
+            && !self.modified()
+            && self.view.editor.text().is_empty()
     }
 }

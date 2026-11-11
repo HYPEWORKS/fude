@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
-use fude_buffer::Version;
+use fude_buffer::{Rope, RopeBuilder, Version};
 use fude_editor::{Query, Searcher};
 use fude_ui::{FindAction, FindStatus};
 
@@ -14,6 +14,53 @@ use crate::doc::DocId;
 
 /// Up to this many matches, the count keeps their positions to say "3 of 120".
 const KEEP_STARTS: usize = 200_000;
+
+/// Replace All with more matches than this builds the new text on the worker instead of
+/// editing the document match by match on the UI thread (about 2 µs each).
+const REBUILD_OVER: usize = 10_000;
+
+/// What Replace All worked out on its worker.
+#[derive(Debug, PartialEq)]
+pub enum Replaced {
+    /// Few matches: edits to apply, which share the rest of the text with the undo step.
+    Edits(Vec<(Range<usize>, Vec<u8>)>),
+    /// Many: the whole new text, and how many matches it replaced.
+    Text(Rope, usize),
+}
+
+/// Replaces every match in `text`. Past `rebuild_over` matches, the new text is built
+/// here, so applying it costs the same however many there were.
+fn replace_all_in(
+    searcher: &Searcher,
+    text: &Rope,
+    replacement: &str,
+    rebuild_over: usize,
+) -> Replaced {
+    let matches = searcher.matches_in(text, 0..text.len());
+    if matches.len() <= rebuild_over {
+        let edits = matches
+            .into_iter()
+            .map(|r| {
+                let bytes = searcher.replacement(text, r.clone(), replacement);
+                (r, bytes)
+            })
+            .collect();
+        return Replaced::Edits(edits);
+    }
+    let mut builder = RopeBuilder::new();
+    let mut at = 0;
+    for r in &matches {
+        for chunk in text.chunks_in(at..r.start) {
+            builder.push(chunk);
+        }
+        builder.push(&searcher.replacement(text, r.clone(), replacement));
+        at = r.end;
+    }
+    for chunk in text.chunks_in(at..text.len()) {
+        builder.push(chunk);
+    }
+    Replaced::Text(builder.finish(), matches.len())
+}
 
 /// A count of all matches, computed on a worker.
 pub struct Count {
@@ -39,7 +86,7 @@ impl Drop for CountJob {
 pub struct ReplaceAllJob {
     doc: DocId,
     version: Version,
-    rx: mpsc::Receiver<Vec<(Range<usize>, Vec<u8>)>>,
+    rx: mpsc::Receiver<Replaced>,
 }
 
 /// Find state shared by all documents.
@@ -195,16 +242,8 @@ impl Fude {
         let (tx, rx) = mpsc::channel();
         let waker = self.waker.clone();
         std::thread::spawn(move || {
-            let text = &snapshot.text;
-            let edits: Vec<(Range<usize>, Vec<u8>)> = searcher
-                .matches_in(text, 0..text.len())
-                .into_iter()
-                .map(|r| {
-                    let bytes = searcher.replacement(text, r.clone(), &replacement);
-                    (r, bytes)
-                })
-                .collect();
-            let _ = tx.send(edits);
+            let replaced = replace_all_in(&searcher, &snapshot.text, &replacement, REBUILD_OVER);
+            let _ = tx.send(replaced);
             if let Some(w) = waker {
                 w.wake();
             }
@@ -274,16 +313,25 @@ impl Fude {
             redraw = true;
         }
         if let Some(job) = &self.find_state.replace_job
-            && let Ok(edits) = job.rx.try_recv()
+            && let Ok(replaced) = job.rx.try_recv()
         {
             let (doc_id, version) = (job.doc, job.version);
             self.find_state.replace_job = None;
             redraw = true;
             match self.index_of(doc_id) {
                 Some(i) if self.docs[i].view.editor.buffer().version() == version => {
-                    let n = edits.len();
                     let view = &mut self.docs[i].view;
-                    view.editor.apply_edits(&edits);
+                    let n = match replaced {
+                        Replaced::Edits(edits) => {
+                            view.editor.apply_edits(&edits);
+                            edits.len()
+                        }
+                        Replaced::Text(text, n) => {
+                            let format = *view.editor.format();
+                            view.editor.replace_content(text, format);
+                            n
+                        }
+                    };
                     view.changed(now);
                     self.say(
                         format!("Replaced {n} {}", if n == 1 { "match" } else { "matches" }),
@@ -326,5 +374,47 @@ impl Fude {
             current,
             total: count.total,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_all_builds_the_same_text_either_way() {
+        let text = Rope::from("one two one\r\nthree one".repeat(500).as_str());
+        let query = Query {
+            text: "one".into(),
+            ..Query::default()
+        };
+        let searcher = Searcher::new(&query).unwrap().unwrap();
+        let Replaced::Edits(edits) = replace_all_in(&searcher, &text, "1", usize::MAX) else {
+            panic!("few matches are edits");
+        };
+        assert_eq!(edits.len(), 1500);
+        let mut edited = text.clone();
+        for (range, bytes) in edits.iter().rev() {
+            edited.replace(range.clone(), bytes);
+        }
+        let Replaced::Text(built, n) = replace_all_in(&searcher, &text, "1", 0) else {
+            panic!("many matches are a new text");
+        };
+        assert_eq!(n, 1500);
+        assert_eq!(built.to_vec(), edited.to_vec());
+        assert_eq!(
+            built.to_vec(),
+            "1 two 1\r\nthree 1".repeat(500).into_bytes()
+        );
+
+        let none = Query {
+            text: "absent".into(),
+            ..Query::default()
+        };
+        let searcher = Searcher::new(&none).unwrap().unwrap();
+        assert_eq!(
+            replace_all_in(&searcher, &text, "x", 0),
+            Replaced::Edits(Vec::new())
+        );
     }
 }

@@ -36,6 +36,9 @@ pub enum LoadKind {
     Backup {
         format: Format,
         path: Option<PathBuf>,
+        /// The file as fude last saw it, if it knew: a file that changed since is
+        /// noticed, not overwritten by the next save.
+        stamp: Option<FileStamp>,
     },
     /// The file changed on disk: its new text replaces the old as one undo step.
     Reload,
@@ -291,11 +294,15 @@ impl Fude {
                     self.say(note, false);
                 }
             }
-            LoadKind::Backup { format, path } => {
+            LoadKind::Backup {
+                format,
+                path,
+                stamp,
+            } => {
                 let unchanged = same_start(doc.view.editor.text(), &loaded.text, loading.preview);
                 doc.view.editor.load(loaded.text, *format, unchanged);
                 doc.view.editor.buffer_mut().mark_unsaved();
-                doc.stamp = path.as_deref().and_then(|p| FileStamp::of(p).ok());
+                doc.stamp = stamp.or_else(|| path.as_deref().and_then(|p| FileStamp::of(p).ok()));
             }
         }
         let doc = &mut self.docs[i];

@@ -10,7 +10,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use fude_buffer::{Encoding, Format, LineEnding, Rope};
+use std::time::{Duration, SystemTime};
+
+use fude_buffer::{Encoding, FileStamp, Format, LineEnding, Rope};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tab {
@@ -24,6 +26,20 @@ pub struct Tab {
     pub cursor: usize,
     /// First visible line (fractional).
     pub scroll: f64,
+    /// The file as fude last read or wrote it, so a restored document with unsaved
+    /// changes still notices that the file changed while fude wasn't running.
+    pub stamp: Option<FileStamp>,
+}
+
+/// What the state directory held.
+#[derive(Debug, PartialEq)]
+pub enum Stored {
+    /// No session file: a first launch.
+    Nothing,
+    Session(Session),
+    /// A session file that can't be read (cut short by a power cut, edited by hand).
+    /// The backups next to it are still good.
+    Unreadable,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -93,6 +109,31 @@ pub fn read_backup(state: &Path, name: &str) -> io::Result<Rope> {
     Ok(fude_buffer::load_with(&backup_dir(state).join(name), Some(encoding_utf8()))?.text)
 }
 
+/// The names of the backups on disk, oldest first.
+pub fn list_backups(state: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(backup_dir(state)) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(Option<SystemTime>, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+            name.ends_with(".txt").then_some((modified, name))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Moves a session file that couldn't be read out of the way, keeping it to look at.
+pub fn set_aside(state: &Path) {
+    let _ = std::fs::rename(
+        state.join("session.toml"),
+        state.join("session.unreadable.toml"),
+    );
+}
+
 /// Deletes backups no tab refers to any more.
 pub fn clean_backups(state: &Path, keep: &[&str]) {
     let Ok(entries) = std::fs::read_dir(backup_dir(state)) else {
@@ -108,12 +149,28 @@ pub fn clean_backups(state: &Path, keep: &[&str]) {
 }
 
 impl Session {
-    pub fn read(state: &Path) -> Option<Session> {
-        let text = std::fs::read_to_string(state.join("session.toml")).ok()?;
+    pub fn read(state: &Path) -> Stored {
+        match std::fs::read(state.join("session.toml")) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .ok()
+                .and_then(|text| Session::parse(&text))
+                .map_or(Stored::Unreadable, Stored::Session),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Stored::Nothing,
+            Err(_) => Stored::Unreadable,
+        }
+    }
+
+    /// `None` unless `text` is a whole session file: every one has `active`, so an empty
+    /// or cut-off file isn't taken for a session without tabs.
+    fn parse(text: &str) -> Option<Session> {
         let table: toml::Table = text.parse().ok()?;
-        let tabs = table
-            .get("tab")?
-            .as_array()?
+        let active = table.get("active")?.as_integer()?.max(0) as usize;
+        let no_tabs = Vec::new();
+        let tabs = match table.get("tab") {
+            Some(tabs) => tabs.as_array()?,
+            None => &no_tabs,
+        };
+        let tabs = tabs
             .iter()
             .filter_map(|t| {
                 let t = t.as_table()?;
@@ -138,14 +195,10 @@ impl Session {
                         .and_then(|v| v.as_float())
                         .unwrap_or(0.0)
                         .max(0.0),
+                    stamp: read_stamp(t),
                 })
             })
             .collect();
-        let active = table
-            .get("active")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(0)
-            .max(0) as usize;
         Some(Session { active, tabs })
     }
 
@@ -167,12 +220,32 @@ impl Session {
             out.push_str(&format!("line_ending = \"{}\"\n", tab.line_ending.name()));
             out.push_str(&format!("cursor = {}\n", tab.cursor));
             out.push_str(&format!("scroll = {:.3}\n", tab.scroll));
+            if let Some(stamp) = &tab.stamp {
+                out.push_str(&format!("file_len = {}\n", stamp.len));
+                let since = stamp
+                    .modified
+                    .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok());
+                if let Some(since) = since {
+                    out.push_str(&format!("file_secs = {}\n", since.as_secs()));
+                    out.push_str(&format!("file_nanos = {}\n", since.subsec_nanos()));
+                }
+            }
         }
         write_replacing(&state.join("session.toml"), |w| {
             use std::io::Write;
             w.write_all(out.as_bytes())
         })
     }
+}
+
+fn read_stamp(tab: &toml::Table) -> Option<FileStamp> {
+    let int = |k: &str| tab.get(k).and_then(|v| v.as_integer());
+    let len = u64::try_from(int("file_len")?).ok()?;
+    let modified = int("file_secs").and_then(|secs| {
+        let nanos = u32::try_from(int("file_nanos").unwrap_or(0)).ok()?;
+        SystemTime::UNIX_EPOCH.checked_add(Duration::new(u64::try_from(secs).ok()?, nanos))
+    });
+    Some(FileStamp { len, modified })
 }
 
 /// A TOML basic string.
@@ -213,6 +286,10 @@ mod tests {
                     line_ending: LineEnding::CrLf,
                     cursor: 42,
                     scroll: 3.5,
+                    stamp: Some(FileStamp {
+                        len: 7,
+                        modified: Some(SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 5)),
+                    }),
                 },
                 Tab {
                     path: None,
@@ -222,11 +299,12 @@ mod tests {
                     line_ending: LineEnding::Lf,
                     cursor: 0,
                     scroll: 0.0,
+                    stamp: None,
                 },
             ],
         };
         session.write(&dir).unwrap();
-        assert_eq!(Session::read(&dir), Some(session));
+        assert_eq!(Session::read(&dir), Stored::Session(session));
 
         let text = Rope::from(&b"raw \xff bytes\r\n"[..]);
         write_backup(&dir, "abc.txt", &text).unwrap();
@@ -235,6 +313,23 @@ mod tests {
         clean_backups(&dir, &["abc.txt"]);
         assert!(read_backup(&dir, "old.txt").is_err());
         assert!(read_backup(&dir, "abc.txt").is_ok());
+        assert_eq!(list_backups(&dir), ["abc.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cut_off_session_is_unreadable_not_empty() {
+        let dir = std::env::temp_dir().join(format!("fude-session-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(Session::read(&dir), Stored::Nothing);
+        Session::default().write(&dir).unwrap();
+        assert_eq!(Session::read(&dir), Stored::Session(Session::default()));
+        for broken in ["", "active = ", "[[tab]]\npath = \"/x\"\n", "\u{0}\u{0}"] {
+            std::fs::write(dir.join("session.toml"), broken).unwrap();
+            assert_eq!(Session::read(&dir), Stored::Unreadable, "{broken:?}");
+        }
+        set_aside(&dir);
+        assert_eq!(Session::read(&dir), Stored::Nothing);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

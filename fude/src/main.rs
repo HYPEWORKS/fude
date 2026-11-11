@@ -11,6 +11,7 @@ mod config;
 mod doc;
 mod files;
 mod find;
+mod hot_exit;
 mod instance;
 mod loading;
 mod session;
@@ -62,8 +63,9 @@ fn main() -> ExitCode {
 }
 
 /// The app with the files given open (a path that doesn't exist yet opens as a new
-/// document), or an empty document. `demo` shows the welcome text when no file is given.
-fn initial_app(args: &Args, demo: bool) -> Result<Fude, String> {
+/// document), or an empty document. `demo` shows the welcome text when no file is given
+/// and keeps no session; `session` restores the last one and keeps it up to date.
+fn initial_app(args: &Args, demo: bool, session: bool) -> Result<Fude, String> {
     let (config, problems) = config::Config::load();
     let mut app = Fude::new(config);
     if let Some(problem) = problems.first() {
@@ -74,8 +76,10 @@ fn initial_app(args: &Args, demo: bool) -> Result<Fude, String> {
             return Err(format!("{} is a directory", path.display()));
         }
     }
-    // The window keeps a session; the modes without one, and benchmarks, don't touch it.
-    if !demo && !args.bench_startup {
+    // The single instance keeps a session. The modes without a window, benchmarks, and
+    // windows of their own (--new-instance, --wait) don't touch it: two processes writing
+    // one session would delete each other's backups.
+    if session && !demo {
         app.state_dir = config::state_dir();
         app.restore_session();
     }
@@ -189,7 +193,7 @@ fn run_window(args: &Args, started: Instant) -> Result<(), String> {
     if !args.wait && !args.detached && !args.bench_startup && detach(args, state.as_deref()) {
         return Ok(());
     }
-    let mut app = initial_app(args, false)?;
+    let mut app = initial_app(args, false, single)?;
     if single && let Some(state) = &state {
         app.instance = instance::serve(state);
     }
@@ -222,17 +226,19 @@ impl App for Window {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.event(ctx, event)));
         if let Err(payload) = result {
-            let message = payload
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown error".to_owned());
-            self.app.recover(ctx, &message);
+            self.app.recover(ctx, &panic_message(payload.as_ref()));
         }
     }
 
     fn draw(&mut self, canvas: &mut Canvas<'_>, scale: f32) {
-        self.app.draw(canvas, scale, Instant::now());
+        // As for events: a bug in drawing costs a frame, not the unsaved text.
+        let app = &mut self.app;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            app.draw(canvas, scale, Instant::now());
+        }));
+        if let Err(payload) = result {
+            self.app.recover_draw(&panic_message(payload.as_ref()));
+        }
         if let Some(b) = &mut self.bench {
             b.mark("first-draw");
         }
@@ -248,8 +254,17 @@ impl App for Window {
     }
 }
 
+/// What a panic said.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown error".to_owned())
+}
+
 fn screenshot(args: &Args, path: &Path) -> Result<(), String> {
-    let mut app = initial_app(args, true)?;
+    let mut app = initial_app(args, true, false)?;
     // Without a window, wait for files to load: the frames are what's measured or shown.
     app.finish_loading();
     let (w, h) = args.size;
@@ -292,7 +307,7 @@ fn summary(times: &mut [Duration]) -> String {
 /// Full-frame redraws without a window: what the CPU renderer costs per frame, worst case
 /// (no damage tracking, every pixel drawn).
 fn bench_render(args: &Args) -> Result<(), String> {
-    let mut app = initial_app(args, true)?;
+    let mut app = initial_app(args, true, false)?;
     // Without a window, wait for files to load: the frames are what's measured or shown.
     app.finish_loading();
     let (w, h) = args.size;
@@ -331,7 +346,7 @@ fn bench_render(args: &Args) -> Result<(), String> {
 /// Keystroke latency without a window: each step is an edit (or move) followed by a full
 /// frame, so it measures fude's whole share of "key pressed → frame ready".
 fn bench_typing(args: &Args) -> Result<(), String> {
-    let mut app = initial_app(args, true)?;
+    let mut app = initial_app(args, true, false)?;
     // Without a window, wait for files to load: the frames are what's measured or shown.
     app.finish_loading();
     let (w, h) = args.size;

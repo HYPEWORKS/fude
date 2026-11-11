@@ -4,7 +4,9 @@
 
 A cross-platform text editor that sits between Notepad and Notepad++. It should start instantly, respond instantly at any file size, use little memory, and look and feel polished on every platform.
 
-> Status: phase 5 (power features) done, plus a context menu and the application menus. Next: phase 6, release. Last updated 2026-11-09.
+> Status: phase 5 (power features) done, plus a context menu and the application menus. Next: phase 6, release. Last updated 2026-11-10.
+>
+> This document describes the design, and some of it isn't built yet. Those parts are marked *(planned)*.
 
 ---
 
@@ -140,14 +142,14 @@ Most of an editor's UI is the text view, and no general-purpose toolkit has a te
 | Native widgets per OS | Three copies of the UI code |
 
 - **Windowing and input:** `winit` (Windows, macOS, X11, Wayland, BSD; DPI; IME). It lives in `fude-platform` and is translated into fude's own event types, so it can be replaced with per-OS code if it ever becomes a limitation.
-- **Renderer:** draws into a CPU framebuffer shown with `softbuffer`. Only damaged regions are redrawn; scrolling moves existing pixels and draws only the exposed strip. GPU device setup often costs 100 ms or more and tens of MB of driver memory, which by itself breaks the budgets. CPU output is also deterministic, so the renderer can have pixel snapshot tests.
+- **Renderer:** draws into a CPU framebuffer shown with `softbuffer`. Every frame is a full redraw for now (0.6 ms at 1080p, §3); the rasterizer already takes a damage rectangle, and redrawing only damaged regions and moving pixels on scroll are *planned* for when something needs them. GPU device setup often costs 100 ms or more and tens of MB of driver memory, which by itself breaks the budgets. CPU output is also deterministic, so the renderer can have pixel snapshot tests *(planned)*.
 - **Draw list:** the UI produces a flat list of rectangles and glyph instances from an atlas, which is also what a GPU backend would consume. If CPU rendering can't keep up (most likely on 5K Retina at 120 Hz), a Metal or Direct3D 11 backend can be added behind the same interface without touching the UI.
 - **Native pieces:** file dialogs (`rfd`, using the XDG portal on Linux, so no GTK) and the macOS menu bar. Questions like "Save changes?" are drawn in the window, like menus on other platforms, so they look the same everywhere and need no helper programs.
 - **Menus:** one description of the menus (`fude_ui::menus`: File, Edit, Selection, View, Go, Tools, Help) drives both the menu bar drawn in the window (Windows, Linux, BSD) and the macOS menu bar, and each item shows its command's shortcut from the same table as the command palette, so the three can't disagree. The drawn bar's menus are the context menu widget; F10 or Alt and a menu's first letter open them from the keyboard. On macOS, `fude-platform` builds the menu bar with `muda`, moving About, Settings and Quit to the application menu and adding the standard items (Services, Hide, the Window menu); Quit is fude's own command, not `terminate:`, so quitting keeps hot exit. Items are enabled from the same state as the drawn menus, updated after each event.
 - **Every text input is an editor.** The find box, go-to-line and the command palette reuse `fude-editor`, so they get IME, undo, selection and clipboard for free.
 - **Lines in pieces.** The view lays out *pieces*: a line up to 4 KB is one; a longer one (minified code, a CSV row, a single-line JSON file) is cut into pieces of about 4 KB, each laid out on its own and starting a new row, so no frame lays out more than a screenful of pieces however long a line is. The k-th break of a line falls near `start + k × 4 KB`, moved back to just after a space or punctuation if one is within 256 bytes, and never inside a character or grapheme, so pieces need no index and nothing to update when text changes. Without word wrap, a long line shows as rows of one piece each (classic Notepad also wrapped long lines when wrap was off, at 1024 columns); with it, each piece wraps at the window's edge. A row that is wider than the window is laid out only as far as it shows.
 - **The scroll position is a byte anchor:** the piece at the top, a row in it and a fraction of a row. Scrolling lays out only the pieces it passes, keeping the cursor in view counts rows only between the top and the cursor, and the position stays put while a file loads. The scrollbar shows lines, and within a long line, bytes.
-- **Accessibility:** the widget tree carries roles and labels from the start, so AccessKit can be wired up in v1.x without restructuring.
+- **Accessibility** *(planned)*: widgets are to carry roles and labels so AccessKit can be wired up in v1.x. Nothing does yet; it's part of phase 6.
 
 ## 7. Text stack (`fude-text`)
 
@@ -171,7 +173,7 @@ A custom persistent B-tree rope. No existing crate gives us exact byte preservat
 - **Shape:** leaves hold 1–4 KB of raw bytes (filled to 3.5 KB on load, leaving room to type); internal nodes have 8–16 children. All leaves are at the same depth.
 - **Summaries:** parents store a summary per child, inline, so a descent reads one array per level: byte length, LF / CRLF / CR counts, and whether the bytes start with `\n` or end with `\r`. Joining two summaries pairs a `\r` at the end of one with a `\n` at the start of the next, so a CRLF split across leaves still counts as one break, and the status bar's line ending counts are O(1). Byte ↔ line conversion is O(log n), plus a SIMD scan of one leaf.
 - **Shared, copy-on-write nodes.** A snapshot is a clone of the root pointer, O(1). This is what makes the threading model (§10) work: the highlighter, search and save each work from an immutable snapshot and never take a lock. A small edit inside one leaf mutates the path in place (copying only nodes a snapshot still shares); anything else splits the tree and concatenates the pieces, O(log n).
-- **Undo** is a list of previous trees plus the caller's state (selections). Every state has a version number; undo returns to an earlier number, so "modified?" is "is the current version the saved one?", and work done on a snapshot is valid exactly when the versions match. Measured cost: 7.6 KB per undo step in a 500 MB file. Typing merges into the open step until the editor seals it (pause, word boundary, cursor move); undo, redo and saving seal it too.
+- **Undo** is a list of previous trees plus the caller's state (selections). Every state has a version number; undo returns to an earlier number, so "modified?" is "is the current version the saved one?", and work done on a snapshot is valid exactly when the versions match. Measured cost: 7.6 KB per undo step in a 500 MB file. Typing merges into the open step until the editor seals it (pause, word boundary, cursor move); undo, redo and saving seal it too. The history has no limit yet: a step that rewrites the whole document (sorting, a large Replace All, converting line endings) keeps the old text alive, so several on a very large file add up. A memory cap is *planned*.
 - **Transactions:** a list of non-overlapping range replacements in the coordinates of the text before it, applied atomically as one step. `map_offset` moves other positions (other cursors, bookmarks) through it.
 - **Positions are byte offsets.** Line and column are derived from them. Leaf boundaries may fall inside a UTF-8 sequence or a CRLF pair (the builder avoids it, but nothing relies on it).
 - **Line endings:** LF, CRLF and CR are stored as-is. The dominant style is detected and used for new lines; conversion is a whole-document edit (one undo step).
@@ -214,16 +216,16 @@ When a rename would change what the file is (it has other hard links, or its own
 
 ### External changes
 
-fude checks mtime and size when the window gains focus and through file watching. A clean document reloads automatically (configurable); a modified one prompts.
+fude checks mtime and size when the window gains focus. A clean document reloads automatically; a modified one prompts. A document restored with unsaved changes keeps the stamp of the file as fude last saw it (it's in the session), so a file that changed while fude wasn't running prompts too instead of being overwritten by the next save. Watching files while the window has focus, and making the automatic reload configurable, are *planned*.
 
 ## 10. Threads
 
 ```
-UI thread (winit event loop)                         Worker pool
+UI thread (winit event loop)                         Worker threads
  input → command → edit rope (new root) ─snapshot─▶ highlighter
  lay out visible lines only             ─snapshot─▶ search / replace all
  build draw list → rasterize damage     ─snapshot─▶ save, session backup
- present                                            loader, file watcher
+ present                                            loader
    ▲                                                      │
    └──── results tagged with document version ◀───────────┘
          (results for an older version are dropped; EventLoopProxy wakes the UI)
@@ -243,8 +245,12 @@ UI thread (winit event loop)                         Worker pool
 - **Comments:** Ctrl+/ toggles line comments at the selection's common indentation (all commented → uncomment), Shift+Alt+A block comments, with markers per language (`#` for plain text, which covers most config files without a grammar). Languages with only block comments (HTML, CSS) wrap each line.
 - **Motions follow the platform:** Ctrl+Right moves to the start of the next word on Windows and Linux, Option+Right to the end of the word on macOS; Cmd+arrows go to line and document ends on macOS. Home toggles between the first non-blank character and the line start. Enter keeps the line's indentation.
 - **Everything is a named command** (`edit.duplicate_line`, `view.toggle_wrap`, …). Keybindings, menus and the command palette are front-ends that invoke commands with arguments.
-- **Fault isolation:** event handling runs inside `catch_unwind`. A bug in a feature shows an error in the status bar instead of losing unsaved text.
+- **Fault isolation:** event handling and drawing run inside `catch_unwind`. A bug in a feature shows an error in the status bar (or costs a frame) instead of losing unsaved text.
 - **Hot exit and crash recovery:** two seconds after anything changes, a worker writes the session (`session.toml`: tabs, files, cursors, scroll positions, formats) to the state directory, plus the text of each document with unsaved changes (`backups/`, only those whose version changed, with the same safe save as documents). With hot exit on (the default), quitting writes it right away and exits without asking; the next launch restores everything, unsaved changes included. After a crash, the last write (at most two seconds old) is restored the same way. Unsaved text over 32 MB is backed up at most every 30 seconds while typing (and always on quit), so a huge document doesn't keep the disk busy; a crash can lose that much more in it.
+  - *A document counts as backed up only once its write succeeded.* A failed write (full disk, unwritable state directory) says so in the status bar and is tried again 30 seconds later; quitting then asks about that document like quitting without hot exit does.
+  - *One writer at a time.* Quitting waits for a background write before doing its own, so an older write never has the last word.
+  - *Backups outlive the session file.* A `session.toml` that can't be read (cut short by a power cut) is set aside as `session.unreadable.toml`, and every backup no tab names comes back as an untitled document. Backups are only deleted after a session that no longer names them has been written.
+  - *Only the single instance keeps a session.* A window opened with `--new-instance` or `--wait` has none (two processes writing one session would delete each other's backups), so it asks about unsaved changes when it closes.
 - **Unicode:** cursor movement steps over grapheme clusters; an invalid byte is one step.
 
 ## 12. Syntax highlighting (`fude-syntax`)
@@ -259,7 +265,7 @@ UI thread (winit event loop)                         Worker pool
 ## 13. Search
 
 - **Engine:** the `regex` crate (linear time, so no pathological pattern can hang the editor), run over the rope through `regex-cursor`. The engine needs chunks that never split a UTF-8 character, which rope leaves don't promise, so the cursor serves 64 KB windows whose edges move back onto character starts. Queries are literal unless regex is on, case-insensitive unless asked, with `^`/`$` at line breaks (CRLF-aware). Whole word adds `\b` at word-character edges. Replace expands `$1`-style groups for regex queries.
-- **Incremental:** typing in the find bar jumps to the first match from where the search started, and the visible matches are highlighted every frame (searching only the visible range). Counting all matches ("3 of 120") runs on a worker over a snapshot; a new query cancels it at its next window, and edits recount, one count at a time. Replace All computes every replacement on a worker and applies them as one undo step if the document hasn't changed meanwhile.
+- **Incremental:** typing in the find bar jumps to the first match from where the search started, and the visible matches are highlighted every frame (searching only the visible range). Counting all matches ("3 of 120") runs on a worker over a snapshot; a new query cancels it at its next window, and edits recount, one count at a time. Replace All computes every replacement on a worker and applies them as one undo step if the document hasn't changed meanwhile: up to 10,000 matches as edits (which share the rest of the text with the undo step), beyond that as a new text built on the worker, so applying it doesn't freeze the window. Find Next and selecting every occurrence still search on the UI thread (about 10 GB/s for a literal, so tens of ms in a 500 MB file; a slow regex with no match takes longer): moving them to a worker is *planned*.
 - **Find in files (v1.x):** ripgrep's `ignore` and `grep-searcher` crates.
 
 ## 14. Extensibility
@@ -267,7 +273,7 @@ UI thread (winit event loop)                         Worker pool
 No plugin API in v1. Extensibility comes in three layers:
 
 1. **Built-in tools** (`fude-tools`, pure functions over bytes, written out rather than pulled in as dependencies). Features people commonly install plugins for are bundled as commands: sort lines (A–Z, Z–A, ignoring case, by number), remove duplicates, reverse, trim trailing whitespace, indentation tabs ↔ spaces, UPPER / lower / Title case, Base64 / URL / HTML encode and decode, SHA-256 / SHA-1 / MD5 (copied to the clipboard), JSON format and minify (token by token: numbers, escapes and key order are kept; JSON Lines work), XML format, and line-ending conversion. They work on the selections, or the whole document if nothing is selected, as one undo step, and live in the command palette ("Tools: …"). Up to 256 KB they run at once; beyond that on a worker over a snapshot, applied only if the document hasn't changed meanwhile.
-2. **Data, not code.** Syntax definitions (`.sublime-syntax`), color themes (`.tmTheme` or a fude theme file) and keymaps can be dropped into the config directory.
+2. **Data, not code** *(planned)*. Syntax definitions (`.sublime-syntax`), color themes (`.tmTheme` or a fude theme file) and keymaps can be dropped into the config directory.
 3. **External tools.** Any program can be run as a fude command, taking the selection or document on stdin and replacing it, inserting the output, or showing it in a panel. This covers formatters (`jq`, `prettier`, `black`, `rustfmt`), linters and personal scripts in any language:
 
    ```toml
@@ -300,12 +306,12 @@ Launching from a terminal (stdin is one, on Unix) starts the window as a backgro
 
 File drops: winit handles them on X11, Windows and macOS but not on Wayland, so fude listens itself there: it opens its own event queue on winit's Wayland connection, binds the seat's data device, accepts drags offering `text/uri-list` as copies, and reads the list on a helper thread. It's the one place fude shares a pointer with winit (`unsafe`, in one module).
 
-Single instance: opening a file while fude is running sends it to the existing window as a new tab, and the new process exits before creating a window. The running instance listens on a loopback port and writes the port and a random token to a file in the state directory that only the user can read; a launch connects, sends the token and its files' absolute paths (as hex of their native bytes, so any path survives), and exits on the acknowledgement. If nothing answers, it becomes the instance. One mechanism, standard library only, on every platform. `--new-instance` opts out.
+Single instance: opening a file while fude is running sends it to the existing window as a new tab, and the new process exits before creating a window. The running instance listens on a loopback port and writes the port and a random token to a file in the state directory that only the user can read; a launch connects, sends the token and its files' absolute paths (as hex of their native bytes, so any path survives), and exits on the acknowledgement. If nothing answers, it becomes the instance. One mechanism, standard library only, on every platform. `--new-instance` opts out, and such a window (like a `--wait` one) keeps no session (§11).
 
 ## 16. Testing and benchmarks
 
 - **Unit and property tests** for buffer, editor and syntax crates; `cargo-fuzz` targets for the buffer.
-- **Pixel snapshot tests** for the renderer and widgets.
+- **Pixel snapshot tests** for the renderer and widgets *(planned; CI uploads a screenshot per platform, nothing compares them yet)*.
 - **Startup:** a `--bench-startup` flag exits right after the first frame is presented and prints timings; measured with `hyperfine`.
 - **RAM:** peak and idle RSS measured for an empty document and for the large-file corpus.
 - **Large-file corpus,** generated rather than committed (`cargo xtask corpus`, about 1 GB in `target/corpus`; `--small` makes a tenth of that): a 500 MB log, 100 MB of JSON on one line, a CSV of 50 KB lines, Japanese text in UTF-8 and Shift_JIS, UTF-16LE, UTF-8 with stray bytes, mixed line endings, and 20 MB of Rust. `cargo xtask bench-large` opens each with `fude --bench-file` (no window) and measures the first screen, loading, memory, and keystrokes, scrolling and paging at the start, middle and end, with and without word wrap, against the budgets in §3. CI runs it on the small corpus and fails a missed budget on Linux.
@@ -426,6 +432,8 @@ Each is evaluated for startup, RAM and binary size when introduced, and pinned t
 | 2026-11-08 | A legacy encoding is decided from the first megabyte when it's clear, so the file decodes as it's read (with a streaming exactness check) instead of being held raw and decoded at the end: half the memory for a Shift_JIS file, and a bit faster. |
 | 2026-11-08 | harfrust shaping plans are cached per font and segment properties (building one compiles the font's features: 11× slower CJK layout without the cache), and glyphs and advances for characters below U+0300 are cached per face. |
 | 2026-11-09 | Application menus: drawn in the window on Windows, Linux and BSD, below which the tabs move down 28 px; the native menu bar on macOS through `muda` (Tauri's menu crate, macOS-only dependency) rather than hand-written AppKit code, which would be the workspace's second `unsafe` module. Shortcuts become key equivalents there, so a menu item and its key always do the same thing; a shortcut an external tool takes over is left off its built-in item. |
+| 2026-11-10 | Hot exit hardened after a review: backups are recorded only once written, quitting asks when one fails and waits for a background write, backups survive an unreadable session file, and only the single instance keeps a session. The bookkeeping moved out of the application into `hot_exit.rs`, with tests. |
+| 2026-11-10 | Replace All past 10,000 matches builds the new text on the worker rather than editing match by match on the UI thread (2 µs each: 2 s for a million). |
 | 2026-11-09 | The About dialog is a drawn prompt like the others (with a button that copies the version for bug reports), on macOS too, rather than the standard About panel. |
 | 2026-11-08 | Hot-exit backups of documents over 32 MB are written at most every 30 seconds while typing. |
 | 2026-11-08 | Multiple-cursor and line commands follow VS Code and Sublime (Ctrl+D, Ctrl+Shift+L, Alt+↑/↓, Ctrl+Shift+D/K, Ctrl+/); column selection follows Notepad++ (Alt+drag, Shift+Alt+arrows). |
