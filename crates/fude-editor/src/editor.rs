@@ -8,7 +8,7 @@ use fude_buffer::{Bias, Buffer, Edit, Format, LineEnding, Rope, Version, map_off
 mod cursors;
 mod lines;
 
-pub use cursors::MAX_CURSORS;
+pub use cursors::{MAX_CURSORS, Occurrences};
 
 use crate::layout::Layout;
 use crate::selection::{Selection, Selections};

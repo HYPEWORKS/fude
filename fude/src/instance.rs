@@ -7,6 +7,13 @@
 //! acknowledgement and exits, all before creating a window. If nothing answers (no
 //! instance, or a stale file), the new launch becomes the instance. The same code works on
 //! every platform, using only the standard library.
+//!
+//! Becoming the instance means holding a lock on `instance.lock` in the state directory
+//! for as long as the process lives (the OS lets go of it when the process ends, however
+//! it ends, so it can't go stale). Two launches at the same moment therefore can't both
+//! become the instance: the one that doesn't get the lock waits for the other to start
+//! listening and hands its files over. The instance is also the one process that keeps
+//! the session (see `hot_exit`).
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -15,12 +22,16 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fude_platform::Waker;
 
 const MAGIC: &str = "fude-open 1";
 const TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a launch waits for whoever holds the lock to start listening, before it
+/// opens a window of its own.
+const CLAIM_FOR: Duration = Duration::from_secs(3);
+const CLAIM_RETRY: Duration = Duration::from_millis(25);
 
 /// What another launch asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -34,6 +45,66 @@ pub struct Server {
     waker: Arc<Mutex<Option<Waker>>>,
     lock: PathBuf,
     token: String,
+    /// The lock that makes this process the instance, held until it ends.
+    _held: Option<std::fs::File>,
+}
+
+/// How a launch that wants to be (or reach) the single instance came out.
+pub enum Launch {
+    /// A running instance took the files: this launch is done.
+    HandedOff,
+    /// This process is the instance now.
+    Instance(Server),
+    /// Another process holds the lock but didn't answer in time: this launch opens a
+    /// window of its own, without the session, like `--new-instance`.
+    Extra,
+}
+
+/// Hands `files` to the running instance, or becomes it.
+pub fn claim(state_dir: &Path, files: &[PathBuf]) -> Launch {
+    claim_within(state_dir, files, CLAIM_FOR)
+}
+
+fn claim_within(state_dir: &Path, files: &[PathBuf], patience: Duration) -> Launch {
+    let deadline = Instant::now() + patience;
+    loop {
+        if hand_off(state_dir, files) {
+            return Launch::HandedOff;
+        }
+        match lock(state_dir) {
+            Lock::Held(file) => return Launch::Instance(serve(state_dir, Some(file))),
+            // No locks here (some network file systems): as good as it gets without.
+            Lock::Unavailable => return Launch::Instance(serve(state_dir, None)),
+            // Someone else is the instance and isn't listening yet (or any more).
+            Lock::Taken if Instant::now() >= deadline => return Launch::Extra,
+            Lock::Taken => std::thread::sleep(CLAIM_RETRY),
+        }
+    }
+}
+
+enum Lock {
+    Held(std::fs::File),
+    Taken,
+    Unavailable,
+}
+
+/// Tries to take the instance lock, without waiting for it.
+fn lock(state_dir: &Path) -> Lock {
+    if std::fs::create_dir_all(state_dir).is_err() {
+        return Lock::Unavailable;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let Ok(file) = options.open(state_dir.join("instance.lock")) else {
+        return Lock::Unavailable;
+    };
+    match file.try_lock() {
+        Ok(()) => Lock::Held(file),
+        Err(std::fs::TryLockError::WouldBlock) => Lock::Taken,
+        Err(std::fs::TryLockError::Error(_)) => Lock::Unavailable,
+    }
 }
 
 impl Server {
@@ -92,20 +163,35 @@ pub fn hand_off(state_dir: &Path, files: &[PathBuf]) -> bool {
     reply.trim() == "ok"
 }
 
-/// Becomes the instance: listens for other launches. `None` if listening fails (fude
-/// still works, just without handing files over).
-pub fn serve(state_dir: &Path) -> Option<Server> {
-    std::fs::create_dir_all(state_dir).ok()?;
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
-    let port = listener.local_addr().ok()?.port();
+/// Becomes the instance, holding the lock `held`: listens for other launches. If
+/// listening fails, fude still works, just without files being handed over.
+fn serve(state_dir: &Path, held: Option<std::fs::File>) -> Server {
     let token = random_token();
     let lock = state_dir.join("instance");
-    write_private(&lock, &format!("{port} {token}\n")).ok()?;
-
     let (tx, rx) = mpsc::channel();
     let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
-    let wake = waker.clone();
-    let expected = token.clone();
+    let _ = listen(&lock, &token, tx, waker.clone());
+    Server {
+        rx,
+        waker,
+        lock,
+        token,
+        _held: held,
+    }
+}
+
+/// Starts the thread that takes requests, and writes where it listens to `lock`.
+fn listen(
+    lock: &Path,
+    token: &str,
+    tx: mpsc::Sender<OpenRequest>,
+    waker: Arc<Mutex<Option<Waker>>>,
+) -> Option<()> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+    let port = listener.local_addr().ok()?.port();
+    write_private(lock, &format!("{port} {token}\n")).ok()?;
+    let wake = waker;
+    let expected = token.to_owned();
     std::thread::Builder::new()
         .name("fude-instance".into())
         .spawn(move || {
@@ -124,12 +210,7 @@ pub fn serve(state_dir: &Path) -> Option<Server> {
             }
         })
         .ok()?;
-    Some(Server {
-        rx,
-        waker,
-        lock,
-        token,
-    })
+    Some(())
 }
 
 fn read_request(mut stream: TcpStream, token: &str) -> Option<OpenRequest> {
@@ -235,7 +316,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fude-instance-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!hand_off(&dir, &[]), "nobody running yet");
-        let server = serve(&dir).expect("listening");
+        let Launch::Instance(server) = claim(&dir, &[]) else {
+            panic!("the first launch is the instance");
+        };
         let files = vec![
             PathBuf::from("/tmp/a b.txt"),
             PathBuf::from("/tmp/日本.txt"),
@@ -270,13 +353,84 @@ mod tests {
     fn wrong_token_is_ignored() {
         let dir = std::env::temp_dir().join(format!("fude-instance-token-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let server = serve(&dir).expect("listening");
+        let Launch::Instance(server) = claim(&dir, &[]) else {
+            panic!("the first launch is the instance");
+        };
         let lock = std::fs::read_to_string(dir.join("instance")).unwrap();
         let port = lock.split_whitespace().next().unwrap();
         std::fs::write(dir.join("instance"), format!("{port} not-the-token\n")).unwrap();
         assert!(!hand_off(&dir, &[PathBuf::from("/x")]));
         std::thread::sleep(Duration::from_millis(50));
         assert!(server.try_recv().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn state(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fude-instance-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn only_one_launch_becomes_the_instance() {
+        let dir = state("one");
+        let Launch::Instance(server) = claim(&dir, &[]) else {
+            panic!("the first launch is the instance");
+        };
+        let file = PathBuf::from("/tmp/later.txt");
+        assert!(matches!(claim(&dir, &[file]), Launch::HandedOff));
+        drop(server);
+        // The lock goes with the instance: the next launch takes over.
+        assert!(matches!(claim(&dir, &[]), Launch::Instance(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launches_at_the_same_moment_make_one_instance() {
+        let dir = state("race");
+        let launches: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || claim(&dir, &[]))
+            })
+            .collect();
+        let launches: Vec<Launch> = launches.into_iter().map(|t| t.join().unwrap()).collect();
+        let instances = launches
+            .iter()
+            .filter(|l| matches!(l, Launch::Instance(_)))
+            .count();
+        let handed = launches
+            .iter()
+            .filter(|l| matches!(l, Launch::HandedOff))
+            .count();
+        assert_eq!((instances, handed), (1, 7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_launch_waits_for_the_lock_holder_to_listen() {
+        let dir = state("wait");
+        // Another launch has the lock but isn't listening yet.
+        let Lock::Held(held) = lock(&dir) else {
+            panic!("free at first");
+        };
+        // Out of patience: a window of its own, without the session.
+        assert!(matches!(
+            claim_within(&dir, &[], Duration::from_millis(60)),
+            Launch::Extra
+        ));
+        let starting = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                serve(&dir, Some(held))
+            })
+        };
+        assert!(matches!(
+            claim_within(&dir, &[], Duration::from_secs(10)),
+            Launch::HandedOff
+        ));
+        drop(starting.join().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

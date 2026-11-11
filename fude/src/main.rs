@@ -193,10 +193,20 @@ fn run_window(args: &Args, started: Instant) -> Result<(), String> {
     if !args.wait && !args.detached && !args.bench_startup && detach(args, state.as_deref()) {
         return Ok(());
     }
-    let mut app = initial_app(args, false, single)?;
-    if single && let Some(state) = &state {
-        app.instance = instance::serve(state);
-    }
+    // This process is the window. Become the instance (the one process that takes other
+    // launches' files and keeps the session), unless another launch got there first:
+    // then it takes the files, or failing that, this is a window of its own.
+    let server = match &state {
+        Some(state) if single => match instance::claim(state, &args.files) {
+            instance::Launch::HandedOff => return Ok(()),
+            instance::Launch::Instance(server) => Some(server),
+            instance::Launch::Extra => None,
+        },
+        _ => None,
+    };
+    // Other launches' files queue up in the server until the event loop runs.
+    let mut app = initial_app(args, false, server.is_some())?;
+    app.instance = server;
     if let Some(b) = &mut bench {
         b.mark("view-ready");
     }

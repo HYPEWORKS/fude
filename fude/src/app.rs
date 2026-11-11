@@ -1300,17 +1300,9 @@ impl Fude {
             Action::ToggleComment | Action::ToggleBlockComment => {
                 self.toggle_comment(action == Action::ToggleBlockComment, now);
             }
-            Action::SelectAllOccurrences => {
-                let n = self.doc_mut().view.editor.select_all_occurrences();
-                self.doc_mut().view.changed(now);
-                if n >= fude_editor::MAX_CURSORS {
-                    self.say(format!("Selected the first {n} occurrences"), false);
-                } else if n > 1 {
-                    self.say(format!("{n} occurrences"), false);
-                }
-            }
-            Action::SelectNextOccurrence
-            | Action::SplitIntoLines
+            Action::SelectAllOccurrences => self.select_occurrences(true, now),
+            Action::SelectNextOccurrence => self.select_occurrences(false, now),
+            Action::SplitIntoLines
             | Action::DuplicateLine
             | Action::MoveLineUp
             | Action::MoveLineDown
@@ -1323,9 +1315,6 @@ impl Fude {
                 let view = &mut self.doc_mut().view;
                 let e = &mut view.editor;
                 match action {
-                    Action::SelectNextOccurrence => {
-                        e.select_next_occurrence();
-                    }
                     Action::SplitIntoLines => e.split_into_lines(),
                     Action::DuplicateLine => e.duplicate(),
                     Action::MoveLineUp => e.move_lines(false),

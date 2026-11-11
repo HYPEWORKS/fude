@@ -1,8 +1,10 @@
 //! Find and replace over a rope, with the `regex` engine (linear time, so no pattern can
 //! hang the editor) running directly over the text through `regex-cursor`.
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use fude_buffer::Rope;
 use regex_cursor::engines::meta::Regex;
@@ -19,6 +21,64 @@ pub struct Query {
     pub case_sensitive: bool,
     /// Only matches that start and end at word boundaries.
     pub whole_word: bool,
+}
+
+/// When a search should give up before the end of the text: it was cancelled, or it has
+/// had its time (the UI thread searches for a few milliseconds, then hands over to a
+/// worker). Checked once per 64 KB window.
+#[derive(Debug, Default)]
+pub struct Stop<'a> {
+    cancel: Option<&'a AtomicBool>,
+    deadline: Option<Instant>,
+    /// Set when the search was cut short, which makes its result meaningless.
+    hit: Cell<bool>,
+}
+
+/// A search gave up before it knew the answer (see [`Stop`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stopped;
+
+impl<'a> Stop<'a> {
+    /// Never: the search runs to the end.
+    pub fn never() -> Stop<'static> {
+        Stop::default()
+    }
+
+    /// Once `cancel` is set.
+    pub fn when(cancel: &'a AtomicBool) -> Stop<'a> {
+        Stop {
+            cancel: Some(cancel),
+            ..Stop::default()
+        }
+    }
+
+    /// At `deadline`.
+    pub fn at(deadline: Instant) -> Stop<'static> {
+        Stop {
+            deadline: Some(deadline),
+            ..Stop::default()
+        }
+    }
+
+    /// Whether to stop now; remembers having said yes.
+    fn now(&self) -> bool {
+        let stop = self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+            || self.deadline.is_some_and(|d| Instant::now() >= d);
+        if stop {
+            self.hit.set(true);
+        }
+        stop
+    }
+
+    /// `result`, unless the search behind it was cut short: the engine took the cut for
+    /// the end of the text, so even a match it reported may be wrong.
+    fn check<T>(&self, result: T) -> Result<T, Stopped> {
+        if self.hit.get() {
+            Err(Stopped)
+        } else {
+            Ok(result)
+        }
+    }
 }
 
 /// A compiled query.
@@ -75,25 +135,51 @@ impl Searcher {
 
     /// The first non-empty match starting at or after `from`.
     pub fn find_from(&self, text: &Rope, from: usize) -> Option<Range<usize>> {
-        let input = Input::new(RopeCursor::at(text, from)).range(from..);
-        self.regex
+        self.find_from_until(text, from, &Stop::never())
+            .unwrap_or(None)
+    }
+
+    /// [`Searcher::find_from`], giving up when `stop` says.
+    pub fn find_from_until(
+        &self,
+        text: &Rope,
+        from: usize,
+        stop: &Stop<'_>,
+    ) -> Result<Option<Range<usize>>, Stopped> {
+        let mut cursor = RopeCursor::at(text, from);
+        cursor.stop = Some(stop);
+        let input = Input::new(cursor).range(from..);
+        let found = self
+            .regex
             .find_iter(input)
             .map(|m| m.range())
-            .find(|r| !r.is_empty())
+            .find(|r| !r.is_empty());
+        stop.check(found)
     }
 
     /// The last non-empty match starting before `before`.
     pub fn find_before(&self, text: &Rope, before: usize) -> Option<Range<usize>> {
+        self.find_before_until(text, before, &Stop::never())
+            .unwrap_or(None)
+    }
+
+    /// [`Searcher::find_before`], giving up when `stop` says.
+    pub fn find_before_until(
+        &self,
+        text: &Rope,
+        before: usize,
+        stop: &Stop<'_>,
+    ) -> Result<Option<Range<usize>>, Stopped> {
         let mut window = BACK_WINDOW;
         loop {
             let start = before.saturating_sub(window);
             let found = self
-                .matches_in(text, start..before)
+                .matches_in_until(text, start..before, stop)?
                 .into_iter()
                 .rev()
                 .find(|r| r.start < before);
             if found.is_some() || start == 0 {
-                return found;
+                return Ok(found);
             }
             window *= 2;
         }
@@ -101,19 +187,57 @@ impl Searcher {
 
     /// The next match after `from`, wrapping around to the start.
     pub fn next(&self, text: &Rope, from: usize) -> Option<Range<usize>> {
-        self.find_from(text, from)
-            .or_else(|| self.find_from(text, 0))
+        self.next_until(text, from, &Stop::never()).unwrap_or(None)
+    }
+
+    /// [`Searcher::next`], giving up when `stop` says.
+    pub fn next_until(
+        &self,
+        text: &Rope,
+        from: usize,
+        stop: &Stop<'_>,
+    ) -> Result<Option<Range<usize>>, Stopped> {
+        match self.find_from_until(text, from, stop)? {
+            Some(found) => Ok(Some(found)),
+            None => self.find_from_until(text, 0, stop),
+        }
     }
 
     /// The match before `before`, wrapping around to the end.
     pub fn previous(&self, text: &Rope, before: usize) -> Option<Range<usize>> {
-        self.find_before(text, before)
-            .or_else(|| self.find_before(text, text.len()))
+        self.previous_until(text, before, &Stop::never())
+            .unwrap_or(None)
+    }
+
+    /// [`Searcher::previous`], giving up when `stop` says.
+    pub fn previous_until(
+        &self,
+        text: &Rope,
+        before: usize,
+        stop: &Stop<'_>,
+    ) -> Result<Option<Range<usize>>, Stopped> {
+        match self.find_before_until(text, before, stop)? {
+            Some(found) => Ok(Some(found)),
+            None => self.find_before_until(text, text.len(), stop),
+        }
     }
 
     /// Non-empty matches that start within `range` (they may end after it).
     pub fn matches_in(&self, text: &Rope, range: Range<usize>) -> Vec<Range<usize>> {
-        let input = Input::new(RopeCursor::at(text, range.start)).range(range.start..);
+        self.matches_in_until(text, range, &Stop::never())
+            .unwrap_or_default()
+    }
+
+    /// [`Searcher::matches_in`], giving up when `stop` says.
+    pub fn matches_in_until(
+        &self,
+        text: &Rope,
+        range: Range<usize>,
+        stop: &Stop<'_>,
+    ) -> Result<Vec<Range<usize>>, Stopped> {
+        let mut cursor = RopeCursor::at(text, range.start);
+        cursor.stop = Some(stop);
+        let input = Input::new(cursor).range(range.start..);
         let mut out = Vec::new();
         for m in self.regex.find_iter(input) {
             if m.start() >= range.end {
@@ -123,7 +247,7 @@ impl Searcher {
                 out.push(m.range());
             }
         }
-        out
+        stop.check(out)
     }
 
     /// Counts matches in the whole text: the total, and their starts if there are at most
@@ -141,8 +265,9 @@ impl Searcher {
     ) -> (usize, Option<Vec<usize>>) {
         let mut starts = Some(Vec::new());
         let mut total = 0;
+        let stop = Stop::when(cancel);
         let mut cursor = RopeCursor::at(text, 0);
-        cursor.cancel = Some(cancel);
+        cursor.stop = Some(&stop);
         for m in self.regex.find_iter(Input::new(cursor)) {
             if m.is_empty() {
                 continue;
@@ -197,8 +322,11 @@ struct RopeCursor<'a> {
     index: usize,
     start: usize,
     buf: Vec<u8>,
-    /// When set, the cursor ends early, which ends the search.
-    cancel: Option<&'a AtomicBool>,
+    /// When it says so, the cursor ends early, which ends the search.
+    stop: Option<&'a Stop<'a>>,
+    /// The furthest window served. Only going past it can stop the search: the engine
+    /// also steps back a window for context and forward again, which is no progress.
+    reached: usize,
 }
 
 const WINDOW: usize = 64 * 1024;
@@ -211,11 +339,13 @@ impl<'a> RopeCursor<'a> {
             index: at / WINDOW,
             start: 0,
             buf: Vec::new(),
-            cancel: None,
+            stop: None,
+            reached: 0,
         };
         if c.index > 0 && c.boundary(c.index) > at {
             c.index -= 1;
         }
+        c.reached = c.index;
         c.load();
         c
     }
@@ -247,11 +377,12 @@ impl Cursor for RopeCursor<'_> {
 
     fn advance(&mut self) -> bool {
         if self.start + self.buf.len() >= self.text.len()
-            || self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+            || (self.index >= self.reached && self.stop.is_some_and(Stop::now))
         {
             return false;
         }
         self.index += 1;
+        self.reached = self.reached.max(self.index);
         self.load();
         true
     }
@@ -389,5 +520,40 @@ mod tests {
         let far = text.len() - 10;
         let before_far = expected.iter().rev().find(|&&s| s < far).unwrap();
         assert_eq!(s.find_before(&text, far).unwrap().start, *before_far);
+    }
+
+    #[test]
+    fn a_stopped_search_says_so_instead_of_answering() {
+        // The only match is far past the first window.
+        let mut bytes = vec![b'a'; 4 * WINDOW];
+        bytes.extend_from_slice(b"needle");
+        let text = Rope::from(&bytes[..]);
+        let s = searcher(q("needle"));
+        let at = 4 * WINDOW..4 * WINDOW + 6;
+
+        let cancelled = AtomicBool::new(true);
+        let stop = Stop::when(&cancelled);
+        assert_eq!(s.find_from_until(&text, 0, &stop), Err(Stopped));
+        let past = Stop::at(Instant::now());
+        assert_eq!(s.next_until(&text, 0, &past), Err(Stopped));
+        let past = Stop::at(Instant::now());
+        assert_eq!(s.previous_until(&text, 10, &past), Err(Stopped));
+        let past = Stop::at(Instant::now());
+        assert_eq!(
+            s.matches_in_until(&text, 0..text.len(), &past),
+            Err(Stopped)
+        );
+
+        // A match in the window the search starts in needs no further window.
+        let past = Stop::at(Instant::now());
+        assert_eq!(
+            s.find_from_until(&text, at.start, &past),
+            Ok(Some(at.clone()))
+        );
+        // Left alone, they all find it.
+        let never = Stop::never();
+        assert_eq!(s.next_until(&text, 0, &never), Ok(Some(at.clone())));
+        assert_eq!(s.previous_until(&text, 10, &never), Ok(Some(at.clone())));
+        assert_eq!(s.next_until(&Rope::from("aaa"), 0, &never), Ok(None));
     }
 }

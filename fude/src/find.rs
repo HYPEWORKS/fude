@@ -3,10 +3,10 @@
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fude_buffer::{Rope, RopeBuilder, Version};
-use fude_editor::{Query, Searcher};
+use fude_editor::{Occurrences, Query, Searcher, Stop, Stopped};
 use fude_ui::{FindAction, FindStatus};
 
 use crate::app::{Focus, Fude};
@@ -14,6 +14,40 @@ use crate::doc::DocId;
 
 /// Up to this many matches, the count keeps their positions to say "3 of 120".
 const KEEP_STARTS: usize = 200_000;
+
+/// How long looking for a match (Find Next, typing in the find bar, Ctrl+D, Ctrl+Shift+L)
+/// may hold the UI thread. A search that needs longer carries on on a worker, and the
+/// match is selected when it's found: nearly every search finishes well inside this, so
+/// they stay instant, and none can freeze the window in a huge file.
+const UI_SEARCH: Duration = Duration::from_millis(10);
+
+/// What a search that moved to a worker found.
+enum Sought {
+    /// A match for the find bar: after typing (`typed`), or Find Next / Previous.
+    Match {
+        typed: bool,
+        found: Option<Range<usize>>,
+    },
+    /// Ctrl+D: the next occurrence of the selection.
+    Occurrence(Occurrences, Option<Range<usize>>),
+    /// Ctrl+Shift+L: every occurrence.
+    Occurrences(Occurrences, Vec<Range<usize>>),
+}
+
+/// A search for a match running on a worker.
+pub struct SeekJob {
+    doc: DocId,
+    version: Version,
+    rx: mpsc::Receiver<Sought>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for SeekJob {
+    /// A search nobody waits for (a newer one replaced it) stops at its next window.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Replace All with more matches than this builds the new text on the worker instead of
 /// editing the document match by match on the UI thread (about 2 µs each).
@@ -101,6 +135,10 @@ pub struct FindState {
     /// The document changed while a count ran: count again when it finishes.
     pub recount: bool,
     pub replace_job: Option<ReplaceAllJob>,
+    /// A search for one match that took too long for the UI thread. One at a time.
+    pub seek: Option<SeekJob>,
+    /// For tests: how long a search may hold the UI thread, instead of [`UI_SEARCH`].
+    pub ui_search: Option<Duration>,
 }
 
 impl Fude {
@@ -146,6 +184,7 @@ impl Fude {
         let query = self.find.query();
         self.find_state.count = None;
         self.find_state.count_job = None;
+        self.find_state.seek = None;
         match Searcher::new(&query) {
             Err(e) => {
                 self.find_state.searcher = None;
@@ -157,21 +196,178 @@ impl Fude {
                 self.find.status = FindStatus::Empty;
             }
             Ok(Some(searcher)) => {
-                let origin = self.find_state.origin.unwrap_or(0);
-                let found = searcher.next(self.doc().view.editor.text(), origin);
-                match found {
-                    Some(range) => {
-                        let view = &mut self.doc_mut().view;
-                        view.editor.select(range);
-                        view.changed(now);
-                        self.find.status = FindStatus::Counting;
-                        self.start_count(&searcher, query);
-                    }
-                    None => self.find.status = FindStatus::NoMatches,
-                }
                 self.find_state.searcher = Some(searcher);
+                let origin = self.find_state.origin.unwrap_or(0);
+                self.seek_match(false, origin, true, now);
             }
         }
+    }
+
+    /// Looks for the match after `from` (before it, if `backwards`), wrapping around,
+    /// and selects it: at once if it's found within [`UI_SEARCH`], otherwise when a
+    /// worker finds it. `typed`: the query just changed, so the count starts over.
+    fn seek_match(&mut self, backwards: bool, from: usize, typed: bool, now: Instant) {
+        let Some(searcher) = self.find_state.searcher.clone() else {
+            return;
+        };
+        let seek = move |text: &Rope, stop: &Stop<'_>| {
+            if backwards {
+                searcher.previous_until(text, from, stop)
+            } else {
+                searcher.next_until(text, from, stop)
+            }
+        };
+        self.find_state.seek = None;
+        let stop = self.ui_stop();
+        match seek(self.doc().view.editor.text(), &stop) {
+            Ok(found) => self.sought_match(typed, found, now),
+            Err(Stopped) => {
+                self.find.status = FindStatus::Counting;
+                self.spawn_seek(move |text, stop| {
+                    let found = seek(text, stop)?;
+                    Ok(Sought::Match { typed, found })
+                });
+            }
+        }
+    }
+
+    /// Selects the match a search found, or says there is none.
+    fn sought_match(&mut self, typed: bool, found: Option<Range<usize>>, now: Instant) {
+        let Some(range) = found else {
+            self.find.status = FindStatus::NoMatches;
+            return;
+        };
+        if !typed {
+            self.find_state.origin = Some(range.start);
+        }
+        let view = &mut self.doc_mut().view;
+        view.editor.select(range);
+        view.changed(now);
+        if !typed {
+            self.update_find_status();
+        } else if let Some(searcher) = self.find_state.searcher.clone() {
+            self.find.status = FindStatus::Counting;
+            let query = self.find.query();
+            self.start_count(&searcher, query);
+        }
+    }
+
+    /// When a search on the UI thread gives up, for a worker to carry on.
+    fn ui_stop(&self) -> Stop<'static> {
+        Stop::at(Instant::now() + self.find_state.ui_search.unwrap_or(UI_SEARCH))
+    }
+
+    /// Runs `search` over a snapshot of the document on a worker; [`Fude::poll_find`]
+    /// takes in what it finds. It replaces a search already running.
+    fn spawn_seek(
+        &mut self,
+        search: impl FnOnce(&Rope, &Stop<'_>) -> Result<Sought, Stopped> + Send + 'static,
+    ) {
+        let doc = self.doc();
+        let snapshot = doc.view.editor.buffer().snapshot();
+        let (tx, rx) = mpsc::channel();
+        let waker = self.waker.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancelled = cancel.clone();
+        self.find_state.seek = Some(SeekJob {
+            doc: doc.id,
+            version: snapshot.version,
+            rx,
+            cancel,
+        });
+        std::thread::spawn(move || {
+            let Ok(sought) = search(&snapshot.text, &Stop::when(&cancelled)) else {
+                return;
+            };
+            let _ = tx.send(sought);
+            if let Some(w) = waker {
+                w.wake();
+            }
+        });
+        self.say("Searching…", false);
+    }
+
+    /// Ctrl+D (the next occurrence of the selection) or, with `all`, Ctrl+Shift+L (every
+    /// occurrence): at once if they're found within [`UI_SEARCH`], otherwise when a
+    /// worker has found them, if the selection is still the same by then.
+    pub fn select_occurrences(&mut self, all: bool, now: Instant) {
+        self.find_state.seek = None;
+        let stop = self.ui_stop();
+        let view = &mut self.doc_mut().view;
+        let result = if all {
+            view.editor.select_all_occurrences_until(&stop).map(Some)
+        } else {
+            view.editor
+                .select_next_occurrence_until(&stop)
+                .map(|_| None)
+        };
+        view.changed(now);
+        match result {
+            Ok(Some(n)) => self.say_occurrences(n),
+            Ok(None) => {}
+            Err(Stopped) => {
+                let Some(search) = self.doc().view.editor.occurrences() else {
+                    return;
+                };
+                self.spawn_seek(move |text, stop| {
+                    Ok(if all {
+                        let found = search.all(text, stop)?;
+                        Sought::Occurrences(search, found)
+                    } else {
+                        let found = search.next(text, stop)?;
+                        Sought::Occurrence(search, found)
+                    })
+                });
+            }
+        }
+    }
+
+    fn say_occurrences(&mut self, n: usize) {
+        if n >= fude_editor::MAX_CURSORS {
+            self.say(format!("Selected the first {n} occurrences"), false);
+        } else if n > 1 {
+            self.say(format!("{n} occurrences"), false);
+        }
+    }
+
+    /// Takes in what a search on a worker found, if it's still wanted: the document is
+    /// the one in front and hasn't changed.
+    fn poll_seek(&mut self, now: Instant) -> bool {
+        let Some(job) = &self.find_state.seek else {
+            return false;
+        };
+        let sought = match job.rx.try_recv() {
+            Ok(sought) => sought,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.find_state.seek = None;
+                return false;
+            }
+        };
+        let (doc, version) = (job.doc, job.version);
+        self.find_state.seek = None;
+        self.message = None;
+        let current = self.doc();
+        if current.id != doc || current.view.editor.buffer().version() != version {
+            return true;
+        }
+        match sought {
+            Sought::Match { typed, found } => self.sought_match(typed, found, now),
+            Sought::Occurrence(search, found) => {
+                if let Some(range) = found {
+                    let view = &mut self.doc_mut().view;
+                    view.editor.add_occurrence(&search, range);
+                    view.changed(now);
+                }
+            }
+            Sought::Occurrences(search, found) => {
+                let view = &mut self.doc_mut().view;
+                let n = view.editor.set_occurrences(&search, found);
+                view.changed(now);
+                self.say_occurrences(n);
+            }
+        }
+        true
     }
 
     /// F3, Enter: selects the next (or previous) match.
@@ -185,29 +381,13 @@ impl Fude {
                 return;
             }
         }
-        let Some(searcher) = &self.find_state.searcher else {
-            return;
-        };
-        let editor = &self.doc().view.editor;
-        let sel = *editor.selections().primary();
-        let found = if backwards {
-            searcher.previous(editor.text(), sel.start())
+        let sel = *self.doc().view.editor.selections().primary();
+        let from = if backwards {
+            sel.start()
         } else {
-            searcher.next(
-                editor.text(),
-                sel.end().max(sel.start() + usize::from(sel.is_empty())),
-            )
+            sel.end().max(sel.start() + usize::from(sel.is_empty()))
         };
-        match found {
-            Some(range) => {
-                self.find_state.origin = Some(range.start);
-                let view = &mut self.doc_mut().view;
-                view.editor.select(range);
-                view.changed(now);
-                self.update_find_status();
-            }
-            None => self.find.status = FindStatus::NoMatches,
-        }
+        self.seek_match(backwards, from, false, now);
     }
 
     /// Replaces the selected match (if the selection is one) and moves to the next.
@@ -299,7 +479,7 @@ impl Fude {
 
     /// Picks up finished counts and replacements. Returns whether to redraw.
     pub fn poll_find(&mut self, now: Instant) -> bool {
-        let mut redraw = false;
+        let mut redraw = self.poll_seek(now);
         if let Some(job) = &self.find_state.count_job
             && let Ok(count) = job.rx.try_recv()
         {
@@ -378,8 +558,104 @@ impl Fude {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+
+    /// A document whose two "needle"s are several search windows apart, and an app that
+    /// gives searches no time at all on the UI thread.
+    fn far_apart() -> (Fude, usize) {
+        let mut app = Fude::new(Config::default());
+        app.find_state.ui_search = Some(Duration::ZERO);
+        let text = format!("needle {} needle", "hay ".repeat(100_000));
+        let second = text.len() - "needle".len();
+        let editor = &mut app.doc_mut().view.editor;
+        editor.insert(&text, Instant::now());
+        editor.select(0..6);
+        (app, second)
+    }
+
+    /// Waits for the worker's answer, as the event loop's wake-up would.
+    fn finish_seek(app: &mut Fude) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.find_state.seek.is_some() && Instant::now() < deadline {
+            app.poll_find(Instant::now());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.find_state.seek.is_none(), "the search finished");
+    }
+
+    fn selected(app: &Fude) -> Vec<Range<usize>> {
+        let selections = app.doc().view.editor.selections();
+        selections.iter().map(|s| s.range()).collect()
+    }
+
+    #[test]
+    fn find_next_carries_on_on_a_worker() {
+        let (mut app, second) = far_apart();
+        let now = Instant::now();
+        // The first match is where the search starts: no worker needed.
+        app.open_find(false, now);
+        assert!(app.find_state.seek.is_none());
+        assert_eq!(selected(&app), [0..6]);
+
+        app.find_next(false, now);
+        assert!(app.find_state.seek.is_some(), "too far for the UI thread");
+        assert_eq!(selected(&app), [0..6], "nothing moves until it's found");
+        finish_seek(&mut app);
+        assert_eq!(selected(&app), [second..second + 6]);
+
+        // Backwards from the first match wraps around to the second, a long way off.
+        app.doc_mut().view.editor.select(0..6);
+        app.find_next(true, now);
+        finish_seek(&mut app);
+        assert_eq!(selected(&app), [second..second + 6]);
+    }
+
+    #[test]
+    fn a_search_is_dropped_when_the_text_changes_or_a_newer_one_starts() {
+        let (mut app, second) = far_apart();
+        let now = Instant::now();
+        app.open_find(false, now);
+        app.find_next(false, now);
+        // Typing while it searches: its answer is for text that's gone.
+        app.doc_mut().view.editor.select(3..3);
+        app.doc_mut().view.editor.insert("!", now);
+        finish_seek(&mut app);
+        assert_eq!(selected(&app), [4..4]);
+
+        // A newer search cancels the one before it.
+        app.doc_mut().view.editor.select(0..0);
+        app.find_next(false, now);
+        let first = app.find_state.seek.as_ref().unwrap().cancel.clone();
+        app.find_next(false, now);
+        assert!(first.load(Ordering::Relaxed));
+        finish_seek(&mut app);
+        assert_eq!(selected(&app), [second + 1..second + 7]);
+    }
+
+    #[test]
+    fn occurrences_carry_on_on_a_worker() {
+        let (mut app, second) = far_apart();
+        let now = Instant::now();
+        app.select_occurrences(false, now);
+        assert!(app.find_state.seek.is_some());
+        finish_seek(&mut app);
+        assert_eq!(selected(&app), [0..6, second..second + 6]);
+
+        app.doc_mut().view.editor.select(0..6);
+        app.select_occurrences(true, now);
+        finish_seek(&mut app);
+        assert_eq!(selected(&app), [0..6, second..second + 6]);
+
+        // Moving the cursor while it searches: the answer was for another selection.
+        app.doc_mut().view.editor.select(0..6);
+        app.select_occurrences(true, now);
+        app.doc_mut().view.editor.select(2..2);
+        finish_seek(&mut app);
+        assert_eq!(selected(&app), [2..2]);
+    }
 
     #[test]
     fn replace_all_builds_the_same_text_either_way() {

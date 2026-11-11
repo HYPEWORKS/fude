@@ -8,9 +8,9 @@ pub mod search;
 mod selection;
 pub mod text;
 
-pub use editor::{BRACKET_LIMIT, Editor, MAX_CURSORS, Motion, Settings};
+pub use editor::{BRACKET_LIMIT, Editor, MAX_CURSORS, Motion, Occurrences, Settings};
 pub use layout::{Layout, MonoLayout, nearest};
-pub use search::{Query, Searcher};
+pub use search::{Query, Searcher, Stop, Stopped};
 pub use selection::{Selection, Selections};
 pub use text::WordStop;
 
