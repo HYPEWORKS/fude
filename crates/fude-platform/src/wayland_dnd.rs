@@ -259,7 +259,7 @@ impl Dispatch<WlDataDevice, ()> for State {
 /// encoding.
 pub(crate) fn parse_uri_list(list: &[u8]) -> Vec<PathBuf> {
     list.split(|&b| b == b'\n')
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .map(|line| line.trim_suffix(b"\r"))
         .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
         .filter_map(|line| line.strip_prefix(b"file://"))
         .filter_map(|rest| {

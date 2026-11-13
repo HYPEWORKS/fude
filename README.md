@@ -32,7 +32,7 @@ A cross-platform text editor somewhere between Notepad and Notepad++: instant st
 
 ## Building
 
-Requires stable Rust (2024 edition).
+Requires Rust 1.100 or later.
 
 ```sh
 cargo run --release                 # welcome view

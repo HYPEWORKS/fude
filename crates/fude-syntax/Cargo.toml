@@ -3,6 +3,7 @@ name = "fude-syntax"
 description = "Syntax highlighting on a worker thread"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -347,8 +347,8 @@ impl Editor {
             let new = if unwrap {
                 let lead = b.len() - b.trim_ascii_start().len();
                 let inner = &b.trim_ascii()[open.len()..b.trim_ascii().len() - close.len()];
-                let inner = inner.strip_prefix(b" ").unwrap_or(inner);
-                let inner = inner.strip_suffix(b" ").unwrap_or(inner);
+                let inner = inner.trim_prefix(b" ");
+                let inner = inner.trim_suffix(b" ");
                 let trail = b.len() - b.trim_ascii_end().len();
                 [&b[..lead], inner, &b[b.len() - trail..]].concat()
             } else {

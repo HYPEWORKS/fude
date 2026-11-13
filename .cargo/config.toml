@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# Don't resolve to crate versions published less than 3 days ago: most compromised or
+# broken releases are yanked before then. To take a newer one sooner (a security fix):
+#   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update <crate> --precise <version>
+[registry]
+global-min-publish-age = "3 days"
